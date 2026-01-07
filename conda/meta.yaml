@@ -1,0 +1,49 @@
+{% set name = "hodgkin-huxley" %}
+{% set version = "0.1.0" %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  path: ..
+
+build:
+  number: 0
+  script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+
+requirements:
+  build:
+    - {{ compiler('cxx') }}
+    - cmake >=3.15
+    - ninja
+  host:
+    - python
+    - pip
+    - scikit-build-core >=0.5
+    - pybind11 >=2.11
+    - numpy >=1.20
+  run:
+    - python
+    - numpy >=1.20
+
+test:
+  imports:
+    - hodgkin_huxley
+  commands:
+    - python -c "from hodgkin_huxley import HHNeuron; n = HHNeuron(); print(n)"
+
+about:
+  home: https://github.com/yourusername/hodgkin-huxley
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: Fast Hodgkin-Huxley neuron simulation with C++ backend
+  description: |
+    A high-performance implementation of the Hodgkin-Huxley neuron model
+    using C++ with Python bindings via pybind11.
+  dev_url: https://github.com/yourusername/hodgkin-huxley
+
+extra:
+  recipe-maintainers:
+    - yourusername
