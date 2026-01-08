@@ -4,7 +4,6 @@
 
 #include "hodgkin_huxley/neuron.hpp"
 #include "hodgkin_huxley/network.hpp"
-#include "hodgkin_huxley/solver.hpp"
 
 namespace py = pybind11;
 using namespace hodgkin_huxley;
@@ -47,10 +46,16 @@ PYBIND11_MODULE(_core, m) {
         .def(py::init<>(), "Create a Hodgkin-Huxley neuron with default parameters")
         .def(py::init<const HHNeuron::Parameters&>(), "Create a neuron with custom parameters",
              py::arg("parameters"))
+        .def(py::init<const HHNeuron::Parameters&, IntegrationMethod>(),
+             "Create a neuron with custom parameters and integration method",
+             py::arg("parameters"), py::arg("method"))
         .def_property_readonly("state", &HHNeuron::state, "Current state of the neuron")
         .def_property_readonly("parameters", &HHNeuron::parameters, "Neuron parameters")
         .def_property("V", &HHNeuron::membrane_potential, &HHNeuron::set_membrane_potential,
                       "Membrane potential (mV)")
+        .def_property("integration_method",
+                      &HHNeuron::integration_method, &HHNeuron::set_integration_method,
+                      "Integration method (EULER, RK4, or RK45_ADAPTIVE)")
         .def("set_state", &HHNeuron::set_state, "Set the neuron state", py::arg("state"))
         .def("set_parameters", &HHNeuron::set_parameters, "Set the neuron parameters",
              py::arg("parameters"))

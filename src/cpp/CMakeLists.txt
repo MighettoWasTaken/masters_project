@@ -2,7 +2,6 @@
 add_library(hodgkin_huxley_core STATIC
     src/neuron.cpp
     src/network.cpp
-    src/solver.cpp
 )
 
 target_include_directories(hodgkin_huxley_core PUBLIC

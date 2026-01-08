@@ -5,11 +5,16 @@
 
 namespace hodgkin_huxley {
 
-HHNeuron::HHNeuron() : params_(), state_() {
+HHNeuron::HHNeuron() : params_(), state_(), method_(IntegrationMethod::RK4) {
     reset();
 }
 
-HHNeuron::HHNeuron(const Parameters& params) : params_(params), state_() {
+HHNeuron::HHNeuron(const Parameters& params) : params_(params), state_(), method_(IntegrationMethod::RK4) {
+    reset();
+}
+
+HHNeuron::HHNeuron(const Parameters& params, IntegrationMethod method)
+    : params_(params), state_(), method_(method) {
     reset();
 }
 
@@ -91,8 +96,22 @@ void HHNeuron::compute_derivatives(double I_ext, double& dV, double& dm, double&
     dn = alpha_n(V) * (1.0 - n) - beta_n(V) * n;
 }
 
-void HHNeuron::step(double dt, double I_ext) {
-    // RK4 integration for accuracy
+void HHNeuron::euler_step(double dt, double I_ext) {
+    double dV, dm, dh, dn;
+    compute_derivatives(I_ext, dV, dm, dh, dn);
+
+    state_.V += dt * dV;
+    state_.m += dt * dm;
+    state_.h += dt * dh;
+    state_.n += dt * dn;
+
+    // Clamp gating variables to [0, 1]
+    state_.m = std::max(0.0, std::min(1.0, state_.m));
+    state_.h = std::max(0.0, std::min(1.0, state_.h));
+    state_.n = std::max(0.0, std::min(1.0, state_.n));
+}
+
+void HHNeuron::rk4_step(double dt, double I_ext) {
     double dV1, dm1, dh1, dn1;
     double dV2, dm2, dh2, dn2;
     double dV3, dm3, dh3, dn3;
@@ -134,6 +153,19 @@ void HHNeuron::step(double dt, double I_ext) {
     state_.m = std::max(0.0, std::min(1.0, state_.m));
     state_.h = std::max(0.0, std::min(1.0, state_.h));
     state_.n = std::max(0.0, std::min(1.0, state_.n));
+}
+
+void HHNeuron::step(double dt, double I_ext) {
+    switch (method_) {
+        case IntegrationMethod::EULER:
+            euler_step(dt, I_ext);
+            break;
+        case IntegrationMethod::RK4:
+        case IntegrationMethod::RK45_ADAPTIVE:
+            // RK45_ADAPTIVE falls back to RK4 (same as solver)
+            rk4_step(dt, I_ext);
+            break;
+    }
 }
 
 std::vector<double> HHNeuron::simulate(double duration, double dt, double I_ext) {
