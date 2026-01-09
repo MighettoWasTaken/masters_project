@@ -47,11 +47,19 @@ class HHNeuron:
     >>> print(f"Max voltage: {max(trace):.1f} mV")
     """
 
-    def __init__(self, parameters: Parameters | None = None):
-        if parameters is not None:
+    def __init__(
+        self,
+        parameters: Parameters | None = None,
+        method: IntegrationMethod | None = None,
+    ):
+        if parameters is not None and method is not None:
+            self._neuron = _HHNeuron(parameters, method)
+        elif parameters is not None:
             self._neuron = _HHNeuron(parameters)
         else:
             self._neuron = _HHNeuron()
+            if method is not None:
+                self._neuron.integration_method = method
 
     @property
     def V(self) -> float:
@@ -71,6 +79,15 @@ class HHNeuron:
     def parameters(self) -> Parameters:
         """Neuron parameters."""
         return self._neuron.parameters
+
+    @property
+    def integration_method(self) -> IntegrationMethod:
+        """Integration method (EULER, RK4, or RK45_ADAPTIVE)."""
+        return self._neuron.integration_method
+
+    @integration_method.setter
+    def integration_method(self, method: IntegrationMethod) -> None:
+        self._neuron.integration_method = method
 
     def reset(self) -> None:
         """Reset the neuron to resting state."""
