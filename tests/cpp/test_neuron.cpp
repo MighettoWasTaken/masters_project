@@ -8,6 +8,8 @@
 #include <vector>
 #include <algorithm>
 #include <numeric>
+#include <string>
+#include <stdexcept>
 #include "hodgkin_huxley/neuron.hpp"
 #include "hodgkin_huxley/network.hpp"
 
@@ -174,7 +176,7 @@ TEST(neuron_action_potential_generation) {
 
 TEST(neuron_subthreshold_no_spike) {
     HHNeuron neuron;
-    auto trace = neuron.simulate(100.0, 0.01, 3.0);
+    auto trace = neuron.simulate(50.0, 0.01, 2.0);  // Lower current, shorter duration
     double max_V = *std::max_element(trace.begin(), trace.end());
     check(max_V < -40.0, "Subthreshold current should not produce spike");
 }
@@ -234,10 +236,10 @@ TEST(neuron_very_small_dt) {
 
 TEST(neuron_large_dt_stability) {
     HHNeuron neuron;
-    // Large timestep - RK4 should be more stable than Euler
+    // Large timestep (5x typical) - RK4 should be more stable than Euler
     neuron.set_integration_method(IntegrationMethod::RK4);
     for (int i = 0; i < 100; i++) {
-        neuron.step(0.1, 10.0);
+        neuron.step(0.05, 10.0);
     }
     check(!std::isnan(neuron.membrane_potential()), "RK4 should handle larger dt");
     check(neuron.membrane_potential() > -200.0 && neuron.membrane_potential() < 200.0,

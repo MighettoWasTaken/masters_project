@@ -1,6 +1,7 @@
 #include "hodgkin_huxley/neuron.hpp"
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <stdexcept>
 
 namespace hodgkin_huxley {
@@ -27,25 +28,38 @@ void HHNeuron::reset() {
 
 // Rate functions for the gating variables
 // These follow the original Hodgkin-Huxley formulation
+// With safeguards against numerical overflow for extreme voltages
+
+namespace {
+    // Safe exponential that prevents overflow
+    inline double safe_exp(double x) {
+        constexpr double MAX_EXP_ARG = 700.0;  // exp(700) ~ 1e304, near double max
+        if (x > MAX_EXP_ARG) return std::exp(MAX_EXP_ARG);
+        if (x < -MAX_EXP_ARG) return 0.0;
+        return std::exp(x);
+    }
+}
 
 double HHNeuron::alpha_m(double V) {
     double dV = V + 40.0;
     if (std::abs(dV) < 1e-7) {
         return 1.0;  // L'Hopital's rule limit
     }
-    return 0.1 * dV / (1.0 - std::exp(-dV / 10.0));
+    double exp_term = safe_exp(-dV / 10.0);
+    if (exp_term == 1.0) return 0.1 * 10.0;  // Limit as dV -> 0 from numerical issues
+    return 0.1 * dV / (1.0 - exp_term);
 }
 
 double HHNeuron::beta_m(double V) {
-    return 4.0 * std::exp(-(V + 65.0) / 18.0);
+    return 4.0 * safe_exp(-(V + 65.0) / 18.0);
 }
 
 double HHNeuron::alpha_h(double V) {
-    return 0.07 * std::exp(-(V + 65.0) / 20.0);
+    return 0.07 * safe_exp(-(V + 65.0) / 20.0);
 }
 
 double HHNeuron::beta_h(double V) {
-    return 1.0 / (1.0 + std::exp(-(V + 35.0) / 10.0));
+    return 1.0 / (1.0 + safe_exp(-(V + 35.0) / 10.0));
 }
 
 double HHNeuron::alpha_n(double V) {
@@ -53,11 +67,13 @@ double HHNeuron::alpha_n(double V) {
     if (std::abs(dV) < 1e-7) {
         return 0.1;  // L'Hopital's rule limit
     }
-    return 0.01 * dV / (1.0 - std::exp(-dV / 10.0));
+    double exp_term = safe_exp(-dV / 10.0);
+    if (exp_term == 1.0) return 0.01 * 10.0;  // Limit as dV -> 0 from numerical issues
+    return 0.01 * dV / (1.0 - exp_term);
 }
 
 double HHNeuron::beta_n(double V) {
-    return 0.125 * std::exp(-(V + 65.0) / 80.0);
+    return 0.125 * safe_exp(-(V + 65.0) / 80.0);
 }
 
 // Steady-state activation functions
@@ -117,6 +133,13 @@ void HHNeuron::rk4_step(double dt, double I_ext) {
     double dV3, dm3, dh3, dn3;
     double dV4, dm4, dh4, dn4;
 
+    // Helper to clamp gating variables
+    auto clamp_gates = [this]() {
+        state_.m = std::max(0.0, std::min(1.0, state_.m));
+        state_.h = std::max(0.0, std::min(1.0, state_.h));
+        state_.n = std::max(0.0, std::min(1.0, state_.n));
+    };
+
     State orig = state_;
 
     // k1
@@ -127,6 +150,7 @@ void HHNeuron::rk4_step(double dt, double I_ext) {
     state_.m = orig.m + 0.5 * dt * dm1;
     state_.h = orig.h + 0.5 * dt * dh1;
     state_.n = orig.n + 0.5 * dt * dn1;
+    clamp_gates();
     compute_derivatives(I_ext, dV2, dm2, dh2, dn2);
 
     // k3
@@ -134,6 +158,7 @@ void HHNeuron::rk4_step(double dt, double I_ext) {
     state_.m = orig.m + 0.5 * dt * dm2;
     state_.h = orig.h + 0.5 * dt * dh2;
     state_.n = orig.n + 0.5 * dt * dn2;
+    clamp_gates();
     compute_derivatives(I_ext, dV3, dm3, dh3, dn3);
 
     // k4
@@ -141,6 +166,7 @@ void HHNeuron::rk4_step(double dt, double I_ext) {
     state_.m = orig.m + dt * dm3;
     state_.h = orig.h + dt * dh3;
     state_.n = orig.n + dt * dn3;
+    clamp_gates();
     compute_derivatives(I_ext, dV4, dm4, dh4, dn4);
 
     // Combine
@@ -149,20 +175,31 @@ void HHNeuron::rk4_step(double dt, double I_ext) {
     state_.h = orig.h + (dt / 6.0) * (dh1 + 2.0 * dh2 + 2.0 * dh3 + dh4);
     state_.n = orig.n + (dt / 6.0) * (dn1 + 2.0 * dn2 + 2.0 * dn3 + dn4);
 
-    // Clamp gating variables to [0, 1]
-    state_.m = std::max(0.0, std::min(1.0, state_.m));
-    state_.h = std::max(0.0, std::min(1.0, state_.h));
-    state_.n = std::max(0.0, std::min(1.0, state_.n));
+    // Final clamp
+    clamp_gates();
 }
 
 void HHNeuron::step(double dt, double I_ext) {
+    // Warn about potentially unstable timesteps
+    static bool warned_euler = false;
+    static bool warned_rk4 = false;
+
+    if (method_ == IntegrationMethod::EULER && dt > 0.01 && !warned_euler) {
+        std::cerr << "Warning: dt=" << dt << "ms may be unstable for Euler integration. "
+                  << "Consider dt <= 0.01ms or use RK4.\n";
+        warned_euler = true;
+    } else if (method_ != IntegrationMethod::EULER && dt > 0.05 && !warned_rk4) {
+        std::cerr << "Warning: dt=" << dt << "ms may be unstable for RK4 integration. "
+                  << "Consider dt <= 0.05ms.\n";
+        warned_rk4 = true;
+    }
+
     switch (method_) {
         case IntegrationMethod::EULER:
             euler_step(dt, I_ext);
             break;
         case IntegrationMethod::RK4:
         case IntegrationMethod::RK45_ADAPTIVE:
-            // RK45_ADAPTIVE falls back to RK4 (same as solver)
             rk4_step(dt, I_ext);
             break;
     }
