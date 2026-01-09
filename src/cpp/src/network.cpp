@@ -34,6 +34,7 @@ void Network::add_synapse(size_t pre_idx, size_t post_idx, double weight,
     syn.E_syn = E_syn;
     syn.tau = tau;
     syn.g = 0.0;
+    syn.V_pre_prev = neurons_[pre_idx].membrane_potential();
 
     synapses_.push_back(syn);
 }
@@ -53,6 +54,7 @@ void Network::reset() {
     }
     for (auto& synapse : synapses_) {
         synapse.g = 0.0;
+        synapse.V_pre_prev = neurons_[synapse.pre_idx].membrane_potential();
     }
 }
 
@@ -70,7 +72,7 @@ std::vector<double> Network::compute_synaptic_currents() const {
 
 void Network::update_synapses(double dt) {
     // Simple exponential synapse model
-    // When pre-synaptic neuron spikes, g increases by weight
+    // When pre-synaptic neuron spikes (crosses threshold), g increases by weight
     // Then decays exponentially with time constant tau
 
     const double spike_threshold = 0.0;  // mV
@@ -78,11 +80,14 @@ void Network::update_synapses(double dt) {
     for (auto& syn : synapses_) {
         double V_pre = neurons_[syn.pre_idx].membrane_potential();
 
-        // Check for spike (simple threshold crossing)
-        // A more sophisticated implementation would track the derivative
-        if (V_pre > spike_threshold) {
+        // Detect spike as upward threshold crossing (rising edge only)
+        // This ensures we only trigger once per action potential
+        if (V_pre > spike_threshold && syn.V_pre_prev <= spike_threshold) {
             syn.g += syn.weight;
         }
+
+        // Update previous voltage for next iteration
+        syn.V_pre_prev = V_pre;
 
         // Exponential decay
         syn.g *= std::exp(-dt / syn.tau);

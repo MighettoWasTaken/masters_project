@@ -2,13 +2,16 @@
 """
 Basic Hodgkin-Huxley Neuron Simulation Example
 
-This example demonstrates:
-1. Creating a single HH neuron
-2. Running a simulation with constant current
-3. Visualizing the action potential
+This example demonstrates basic usage of the library:
+1. Creating neurons and networks
+2. Running simulations
+3. Analyzing results
+
+For comprehensive neuron verification plots, see verify_neuron.py instead.
 """
 
 import numpy as np
+from pathlib import Path
 
 # Optional: matplotlib for visualization
 try:
@@ -19,6 +22,13 @@ except ImportError:
     print("matplotlib not installed - skipping visualization")
 
 from hodgkin_huxley import HHNeuron, Network, Parameters
+
+
+def get_figs_dir():
+    """Get the figs directory, creating it if needed."""
+    figs_dir = Path(__file__).parent / "figs"
+    figs_dir.mkdir(exist_ok=True)
+    return figs_dir
 
 
 def single_neuron_example():
@@ -40,7 +50,6 @@ def single_neuron_example():
     trace = neuron.simulate(duration=duration, dt=dt, I_ext=I_ext)
 
     # Analyze results
-    time = np.arange(0, duration, dt)
     print(f"Simulation complete. {len(trace)} time points recorded.")
     print(f"Voltage range: [{trace.min():.2f}, {trace.max():.2f}] mV")
 
@@ -50,17 +59,7 @@ def single_neuron_example():
     num_spikes = len(crossings) // 2
     print(f"Number of action potentials: {num_spikes}")
 
-    if HAS_MATPLOTLIB:
-        plt.figure(figsize=(10, 4))
-        plt.plot(time, trace, 'b-', linewidth=0.8)
-        plt.xlabel('Time (ms)')
-        plt.ylabel('Membrane Potential (mV)')
-        plt.title(f'Hodgkin-Huxley Neuron (I_ext = {I_ext} uA/cm²)')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('single_neuron.png', dpi=150)
-        print("Plot saved to 'single_neuron.png'")
-
+    # No plot here - see verify_neuron.py for comprehensive plots
     return trace
 
 
@@ -98,8 +97,8 @@ def network_example():
     print(f"Created network: {net}")
 
     # Add excitatory connections: 0 -> 1, 1 -> 2
-    net.add_synapse(pre_idx=0, post_idx=1, weight=0.5, E_syn=0.0, tau=2.0)
-    net.add_synapse(pre_idx=1, post_idx=2, weight=0.5, E_syn=0.0, tau=2.0)
+    net.add_synapse(pre_idx=0, post_idx=1, weight=0.1, E_syn=0.0, tau=2.0)
+    net.add_synapse(pre_idx=1, post_idx=2, weight=0.1, E_syn=0.0, tau=2.0)
     print(f"Added synapses: {net.num_synapses}")
 
     # Simulation parameters
@@ -109,7 +108,8 @@ def network_example():
 
     # Create input currents - only stimulate neuron 0
     I_ext = np.zeros((3, num_steps))
-    I_ext[0, :] = 12.0  # Constant current to neuron 0
+    I_ext[0, :] = 10.0  # Constant current to neuron 0
+    print(I_ext)
 
     print(f"\nRunning network simulation for {duration} ms...")
     traces = net.simulate(duration=duration, dt=dt, I_ext=I_ext)
@@ -119,6 +119,7 @@ def network_example():
         print(f"  Neuron {i}: V range = [{traces[i].min():.1f}, {traces[i].max():.1f}] mV")
 
     if HAS_MATPLOTLIB:
+        figs_dir = get_figs_dir()
         time = np.arange(0, duration, dt)
         fig, axes = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
 
@@ -129,11 +130,12 @@ def network_example():
             ax.grid(True, alpha=0.3)
 
         axes[-1].set_xlabel('Time (ms)')
-        axes[0].set_title('Network Simulation (Chain: 0 → 1 → 2)')
+        axes[0].set_title('Network Simulation (Chain: 0 -> 1 -> 2)')
 
         plt.tight_layout()
-        plt.savefig('network.png', dpi=150)
-        print("Plot saved to 'network.png'")
+        fig.savefig(figs_dir / 'network_example.png', dpi=150)
+        plt.close(fig)
+        print(f"Plot saved to '{figs_dir / 'network_example.png'}'")
 
     return traces
 

@@ -18,6 +18,7 @@ struct Synapse {
 
     // Synapse state
     double g = 0.0;         // Current synaptic conductance
+    double V_pre_prev = -65.0;  // Previous presynaptic voltage (for spike detection)
 };
 
 /**
