@@ -1,7 +1,8 @@
 """
-Hodgkin-Huxley Neuron Simulation Library
+Neural Simulation Library
 
-A fast C++ implementation of Hodgkin-Huxley neurons with Python bindings.
+A fast C++ implementation of various neuron models with Python bindings.
+Supports Hodgkin-Huxley, Izhikevich, and extensible to other models.
 """
 
 from __future__ import annotations
@@ -10,21 +11,47 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from ._core import (
+    # Base class
+    NeuronBase as _NeuronBase,
+    # HH neuron
     HHNeuron as _HHNeuron,
+    HHParameters,
+    HHState,
+    # Izhikevich neuron
+    IzhikevichNeuron as _IzhikevichNeuron,
+    IzhikevichParameters,
+    IzhikevichState,
+    IzhikevichType,
+    # Network
     Network as _Network,
+    # Enums
+    IntegrationMethod,
+    # Version
+    __version__,
+    # Backwards compatibility
     Parameters,
     State,
-    IntegrationMethod,
-    __version__,
 )
 
 __all__ = [
+    # Neuron classes
     "HHNeuron",
+    "IzhikevichNeuron",
+    # Parameter/State classes
+    "HHParameters",
+    "HHState",
+    "IzhikevichParameters",
+    "IzhikevichState",
+    "IzhikevichType",
+    # Network
     "Network",
+    # Enums
+    "IntegrationMethod",
+    # Version
+    "__version__",
+    # Backwards compatibility
     "Parameters",
     "State",
-    "IntegrationMethod",
-    "__version__",
 ]
 
 
@@ -36,9 +63,11 @@ class HHNeuron:
 
     Parameters
     ----------
-    parameters : Parameters, optional
+    parameters : HHParameters, optional
         Custom parameters for the neuron. If not provided, uses default
         squid giant axon parameters.
+    method : IntegrationMethod, optional
+        Integration method (EULER, RK4, RK45_ADAPTIVE). Default is RK4.
 
     Examples
     --------
@@ -49,7 +78,7 @@ class HHNeuron:
 
     def __init__(
         self,
-        parameters: Parameters | None = None,
+        parameters: HHParameters | None = None,
         method: IntegrationMethod | None = None,
     ):
         if parameters is not None and method is not None:
@@ -71,12 +100,12 @@ class HHNeuron:
         self._neuron.V = value
 
     @property
-    def state(self) -> State:
+    def state(self) -> HHState:
         """Current state of the neuron (V, m, h, n)."""
         return self._neuron.state
 
     @property
-    def parameters(self) -> Parameters:
+    def parameters(self) -> HHParameters:
         """Neuron parameters."""
         return self._neuron.parameters
 
@@ -142,14 +171,139 @@ class HHNeuron:
         return f"<HHNeuron V={self.V:.2f} mV>"
 
 
+class IzhikevichNeuron:
+    """
+    Izhikevich neuron model.
+
+    A computationally efficient model that can reproduce many biologically
+    realistic spiking patterns with only 2 state variables.
+
+    Parameters
+    ----------
+    neuron_type : IzhikevichType, optional
+        Preset neuron type (REGULAR_SPIKING, FAST_SPIKING, etc.).
+    parameters : IzhikevichParameters, optional
+        Custom parameters. Overrides neuron_type if both provided.
+
+    Examples
+    --------
+    >>> # Regular spiking cortical neuron
+    >>> neuron = IzhikevichNeuron(IzhikevichType.REGULAR_SPIKING)
+    >>> trace = neuron.simulate(duration=100, dt=0.1, I_ext=10)
+
+    >>> # Fast spiking interneuron
+    >>> neuron = IzhikevichNeuron(IzhikevichType.FAST_SPIKING)
+    """
+
+    def __init__(
+        self,
+        neuron_type: IzhikevichType | None = None,
+        parameters: IzhikevichParameters | None = None,
+    ):
+        if parameters is not None:
+            self._neuron = _IzhikevichNeuron(parameters)
+        elif neuron_type is not None:
+            self._neuron = _IzhikevichNeuron(neuron_type)
+        else:
+            self._neuron = _IzhikevichNeuron()
+
+    @property
+    def V(self) -> float:
+        """Membrane potential in mV."""
+        return self._neuron.V
+
+    @V.setter
+    def V(self, value: float) -> None:
+        self._neuron.V = value
+
+    @property
+    def u(self) -> float:
+        """Recovery variable."""
+        return self._neuron.u
+
+    @property
+    def state(self) -> IzhikevichState:
+        """Current state of the neuron (v, u)."""
+        return self._neuron.state
+
+    @property
+    def parameters(self) -> IzhikevichParameters:
+        """Neuron parameters (a, b, c, d)."""
+        return self._neuron.parameters
+
+    @property
+    def spiked(self) -> bool:
+        """True if neuron spiked in the last step."""
+        return self._neuron.spiked
+
+    def reset(self) -> None:
+        """Reset the neuron to resting state."""
+        self._neuron.reset()
+
+    def step(self, dt: float, I_ext: float) -> None:
+        """
+        Advance the simulation by dt milliseconds.
+
+        Parameters
+        ----------
+        dt : float
+            Time step in milliseconds.
+        I_ext : float
+            External current.
+        """
+        self._neuron.step(dt, I_ext)
+
+    def simulate(
+        self,
+        duration: float,
+        dt: float = 0.1,
+        I_ext: float | ArrayLike = 0.0,
+    ) -> NDArray[np.float64]:
+        """
+        Run a simulation and return the voltage trace.
+
+        Parameters
+        ----------
+        duration : float
+            Simulation duration in milliseconds.
+        dt : float, optional
+            Time step in milliseconds. Default is 0.1 ms.
+        I_ext : float or array-like, optional
+            External current. Can be a constant value or a time series.
+
+        Returns
+        -------
+        NDArray[np.float64]
+            Membrane potential trace in mV.
+        """
+        if np.isscalar(I_ext):
+            trace = self._neuron.simulate(duration, dt, float(I_ext))
+        else:
+            I_ext = np.asarray(I_ext, dtype=np.float64)
+            trace = self._neuron.simulate(duration, dt, I_ext.tolist())
+
+        return np.array(trace, dtype=np.float64)
+
+    @staticmethod
+    def get_preset(neuron_type: IzhikevichType) -> IzhikevichParameters:
+        """Get parameters for a preset neuron type."""
+        return _IzhikevichNeuron.get_preset(neuron_type)
+
+    def __repr__(self) -> str:
+        return f"<IzhikevichNeuron v={self.V:.2f} mV>"
+
+
 class Network:
     """
-    Network of interconnected Hodgkin-Huxley neurons.
+    Network of interconnected neurons.
+
+    Currently supports HH neurons. Future versions will support
+    mixed neuron types.
 
     Parameters
     ----------
     num_neurons : int, optional
-        Number of neurons to create. Default is 0.
+        Number of HH neurons to create. Default is 0.
 
     Examples
     --------
@@ -161,13 +315,13 @@ class Network:
     def __init__(self, num_neurons: int = 0):
         self._network = _Network(num_neurons)
 
-    def add_neuron(self, parameters: Parameters | None = None) -> int:
+    def add_neuron(self, parameters: HHParameters | None = None) -> int:
         """
-        Add a neuron to the network.
+        Add an HH neuron to the network.
 
         Parameters
         ----------
-        parameters : Parameters, optional
+        parameters : HHParameters, optional
             Custom parameters for the neuron.
 
         Returns

@@ -1,5 +1,6 @@
 /**
- * Comprehensive C++ tests for the Hodgkin-Huxley neuron model.
+ * Comprehensive C++ tests for neuron models.
+ * Tests both Hodgkin-Huxley and Izhikevich neuron models.
  */
 
 #include <iostream>
@@ -10,7 +11,9 @@
 #include <numeric>
 #include <string>
 #include <stdexcept>
+#include "hodgkin_huxley/neuron_base.hpp"
 #include "hodgkin_huxley/neuron.hpp"
+#include "hodgkin_huxley/izhikevich.hpp"
 #include "hodgkin_huxley/network.hpp"
 
 using namespace hodgkin_huxley;
@@ -516,11 +519,321 @@ TEST(numerical_conservation_at_rest) {
 }
 
 // =============================================================================
+// Izhikevich Neuron Basic Tests
+// =============================================================================
+
+TEST(izhikevich_default_creation) {
+    IzhikevichNeuron neuron;  // Default is RS with c=-65
+    // V is initialized to params.c
+    check_approx(neuron.membrane_potential(), neuron.parameters().c, 1.0, "Default V should equal c");
+    // Izhikevich always uses Euler due to discontinuous reset
+    check(neuron.integration_method() == IntegrationMethod::EULER, "Should use Euler integration");
+}
+
+TEST(izhikevich_preset_types) {
+    // Test all preset types can be created
+    // Initial V is set to params.c (after-spike reset value) which varies by type
+    IzhikevichNeuron rs(IzhikevichNeuron::Type::REGULAR_SPIKING);
+    IzhikevichNeuron fs(IzhikevichNeuron::Type::FAST_SPIKING);
+    IzhikevichNeuron ib(IzhikevichNeuron::Type::INTRINSICALLY_BURSTING);
+    IzhikevichNeuron ch(IzhikevichNeuron::Type::CHATTERING);
+    IzhikevichNeuron lts(IzhikevichNeuron::Type::LOW_THRESHOLD_SPIKING);
+
+    // Initial V should match the c parameter for each type
+    check_approx(rs.membrane_potential(), rs.parameters().c, 1.0, "RS initial V should match c");
+    check_approx(fs.membrane_potential(), fs.parameters().c, 1.0, "FS initial V should match c");
+    check_approx(ib.membrane_potential(), ib.parameters().c, 1.0, "IB initial V should match c");
+    check_approx(ch.membrane_potential(), ch.parameters().c, 1.0, "CH initial V should match c");
+    check_approx(lts.membrane_potential(), lts.parameters().c, 1.0, "LTS initial V should match c");
+
+    // Verify the expected c values
+    check_approx(rs.parameters().c, -65.0, 0.1, "RS c incorrect");
+    check_approx(fs.parameters().c, -65.0, 0.1, "FS c incorrect");
+    check_approx(ib.parameters().c, -55.0, 0.1, "IB c incorrect");
+    check_approx(ch.parameters().c, -50.0, 0.1, "CH c incorrect");
+    check_approx(lts.parameters().c, -65.0, 0.1, "LTS c incorrect");
+}
+
+TEST(izhikevich_custom_parameters) {
+    IzhikevichNeuron::Parameters params;
+    params.a = 0.05;
+    params.b = 0.25;
+    params.c = -60.0;
+    params.d = 4.0;
+    IzhikevichNeuron neuron(params);
+
+    check_approx(neuron.parameters().a, 0.05, 0.001, "Custom a not set");
+    check_approx(neuron.parameters().b, 0.25, 0.001, "Custom b not set");
+    check_approx(neuron.parameters().c, -60.0, 0.001, "Custom c not set");
+    check_approx(neuron.parameters().d, 4.0, 0.001, "Custom d not set");
+}
+
+TEST(izhikevich_get_preset) {
+    auto rs = IzhikevichNeuron::get_preset(IzhikevichNeuron::Type::REGULAR_SPIKING);
+    check_approx(rs.a, 0.02, 0.001, "RS preset a incorrect");
+    check_approx(rs.b, 0.2, 0.001, "RS preset b incorrect");
+    check_approx(rs.c, -65.0, 0.001, "RS preset c incorrect");
+    check_approx(rs.d, 8.0, 0.001, "RS preset d incorrect");
+
+    auto fs = IzhikevichNeuron::get_preset(IzhikevichNeuron::Type::FAST_SPIKING);
+    check_approx(fs.a, 0.1, 0.001, "FS preset a incorrect");
+    check_approx(fs.d, 2.0, 0.001, "FS preset d incorrect");
+}
+
+TEST(izhikevich_reset) {
+    IzhikevichNeuron neuron;  // Default is RS with c=-65
+    neuron.set_membrane_potential(0.0);
+    check_approx(neuron.membrane_potential(), 0.0, 0.001, "set_membrane_potential failed");
+    neuron.reset();
+    // Reset sets V to params.c
+    check_approx(neuron.membrane_potential(), neuron.parameters().c, 1.0, "reset failed");
+}
+
+TEST(izhikevich_state_access) {
+    IzhikevichNeuron neuron;  // Default RS: c=-65, b=0.2
+    const auto& state = neuron.state();
+    const auto& params = neuron.parameters();
+    // v is initialized to c, u is initialized to b*v
+    check_approx(state.v, params.c, 1.0, "State v should equal c");
+    check_approx(state.u, params.b * params.c, 1.0, "State u should equal b*c");
+}
+
+TEST(izhikevich_recovery_variable) {
+    IzhikevichNeuron neuron;  // Default RS: c=-65, b=0.2
+    // u is initialized to b*v = b*c
+    double expected_u = neuron.parameters().b * neuron.parameters().c;
+    check_approx(neuron.recovery_variable(), expected_u, 1.0, "Recovery variable should be b*c");
+}
+
+// =============================================================================
+// Izhikevich Neuron Step Tests
+// =============================================================================
+
+TEST(izhikevich_step_positive_current) {
+    IzhikevichNeuron neuron;
+    double initial_V = neuron.membrane_potential();
+    neuron.step(0.1, 10.0);
+    check(neuron.membrane_potential() > initial_V, "Positive current should increase voltage");
+}
+
+TEST(izhikevich_step_negative_current) {
+    IzhikevichNeuron neuron;
+    double initial_V = neuron.membrane_potential();
+    neuron.step(0.1, -10.0);
+    check(neuron.membrane_potential() < initial_V, "Negative current should decrease voltage");
+}
+
+TEST(izhikevich_spike_detection) {
+    IzhikevichNeuron neuron;
+    bool spiked = false;
+    for (int i = 0; i < 1000; i++) {
+        neuron.step(0.1, 15.0);
+        if (neuron.spiked()) {
+            spiked = true;
+            break;
+        }
+    }
+    check(spiked, "Neuron should spike with sufficient current");
+}
+
+TEST(izhikevich_spike_reset) {
+    IzhikevichNeuron neuron;
+    for (int i = 0; i < 1000; i++) {
+        neuron.step(0.1, 15.0);
+        if (neuron.spiked()) {
+            // After spike, V should be reset to c
+            check_approx(neuron.membrane_potential(), neuron.parameters().c, 5.0,
+                        "Voltage should reset to c after spike");
+            break;
+        }
+    }
+}
+
+// =============================================================================
+// Izhikevich Neuron Simulation Tests
+// =============================================================================
+
+TEST(izhikevich_simulate_length) {
+    IzhikevichNeuron neuron;
+    auto trace = neuron.simulate(100.0, 0.1, 10.0);
+    check(trace.size() == 1000, "Trace length incorrect");
+}
+
+TEST(izhikevich_simulate_varying_current) {
+    IzhikevichNeuron neuron;
+    std::vector<double> I_ext(1000, 10.0);
+    auto trace = neuron.simulate(100.0, 0.1, I_ext);
+    check(trace.size() == 1000, "Trace length incorrect for varying current");
+}
+
+TEST(izhikevich_spike_generation) {
+    IzhikevichNeuron neuron;
+    auto trace = neuron.simulate(100.0, 0.1, 15.0);
+    double max_V = *std::max_element(trace.begin(), trace.end());
+    check(max_V > 0.0, "Should produce spikes exceeding 0 mV");
+}
+
+TEST(izhikevich_subthreshold_no_spike) {
+    IzhikevichNeuron neuron;
+    auto trace = neuron.simulate(100.0, 0.1, 1.0);
+    double max_V = *std::max_element(trace.begin(), trace.end());
+    check(max_V < 0.0, "Subthreshold current should not produce spike");
+}
+
+TEST(izhikevich_spike_count_increases_with_current) {
+    auto count_spikes = [](const std::vector<double>& trace, double threshold = 0.0) {
+        int count = 0;
+        for (size_t i = 1; i < trace.size(); i++) {
+            if (trace[i-1] < threshold && trace[i] >= threshold) {
+                count++;
+            }
+        }
+        return count;
+    };
+
+    IzhikevichNeuron neuron1, neuron2;
+    auto trace1 = neuron1.simulate(500.0, 0.1, 8.0);
+    auto trace2 = neuron2.simulate(500.0, 0.1, 20.0);
+
+    int spikes1 = count_spikes(trace1);
+    int spikes2 = count_spikes(trace2);
+
+    check(spikes2 > spikes1, "Higher current should produce more spikes");
+}
+
+// =============================================================================
+// Izhikevich Spiking Pattern Tests
+// =============================================================================
+
+TEST(izhikevich_fs_faster_than_rs) {
+    auto count_spikes = [](const std::vector<double>& trace, double threshold = 0.0) {
+        int count = 0;
+        for (size_t i = 1; i < trace.size(); i++) {
+            if (trace[i-1] < threshold && trace[i] >= threshold) {
+                count++;
+            }
+        }
+        return count;
+    };
+
+    IzhikevichNeuron rs(IzhikevichNeuron::Type::REGULAR_SPIKING);
+    IzhikevichNeuron fs(IzhikevichNeuron::Type::FAST_SPIKING);
+
+    auto trace_rs = rs.simulate(500.0, 0.1, 15.0);
+    auto trace_fs = fs.simulate(500.0, 0.1, 15.0);
+
+    int spikes_rs = count_spikes(trace_rs);
+    int spikes_fs = count_spikes(trace_fs);
+
+    check(spikes_fs > spikes_rs, "Fast spiking should produce more spikes than regular spiking");
+}
+
+// =============================================================================
+// Izhikevich Edge Cases
+// =============================================================================
+
+TEST(izhikevich_extreme_positive_current) {
+    IzhikevichNeuron neuron;
+    auto trace = neuron.simulate(100.0, 0.1, 100.0);
+    for (double v : trace) {
+        check(!std::isnan(v), "Voltage should not be NaN");
+        check(!std::isinf(v), "Voltage should not be infinite");
+    }
+}
+
+TEST(izhikevich_extreme_negative_current) {
+    IzhikevichNeuron neuron;
+    auto trace = neuron.simulate(100.0, 0.1, -100.0);
+    for (double v : trace) {
+        check(!std::isnan(v), "Voltage should not be NaN");
+        check(!std::isinf(v), "Voltage should not be infinite");
+    }
+}
+
+TEST(izhikevich_voltage_bounded) {
+    IzhikevichNeuron neuron;
+    auto trace = neuron.simulate(1000.0, 0.1, 20.0);
+    double max_V = *std::max_element(trace.begin(), trace.end());
+    double min_V = *std::min_element(trace.begin(), trace.end());
+    check(max_V <= 100.0, "Voltage should be bounded at 100 mV");
+    check(min_V > -200.0, "Voltage should not go too negative");
+}
+
+TEST(izhikevich_long_simulation_stability) {
+    IzhikevichNeuron neuron;
+    auto trace = neuron.simulate(10000.0, 0.1, 10.0);
+    for (double v : trace) {
+        check(!std::isnan(v), "Long simulation should not produce NaN");
+        check(!std::isinf(v), "Long simulation should not produce infinity");
+    }
+}
+
+TEST(izhikevich_multiple_resets) {
+    IzhikevichNeuron neuron;  // Default is RS with c=-65
+    double reset_V = neuron.parameters().c;
+    for (int i = 0; i < 10; i++) {
+        neuron.simulate(50.0, 0.1, 20.0);
+        neuron.reset();
+        check_approx(neuron.membrane_potential(), reset_V, 1.0, "Reset should restore to c");
+    }
+}
+
+// =============================================================================
+// NeuronBase Polymorphism Tests
+// =============================================================================
+
+TEST(neuron_base_polymorphism) {
+    // Test that both neuron types work through base class pointer
+    // Note: HH rests at -65, Izhikevich RS also rests at -65 (c=-65)
+    HHNeuron hh;
+    IzhikevichNeuron iz;  // Default RS with c=-65
+
+    std::vector<NeuronBase*> neurons = {&hh, &iz};
+
+    // Both should support the common interface
+    for (auto* neuron : neurons) {
+        double initial_V = neuron->membrane_potential();
+        // Both should be near -65 for default parameters
+        check(initial_V < -50.0, "Initial potential should be negative");
+
+        neuron->step(0.1, 10.0);
+        check(neuron->membrane_potential() > initial_V, "Voltage should increase with positive current");
+
+        neuron->reset();
+        check_approx(neuron->membrane_potential(), initial_V, 1.0, "Reset should restore initial potential");
+    }
+}
+
+TEST(neuron_base_simulate_polymorphism) {
+    // Test that simulate works through base class
+    HHNeuron hh;
+    IzhikevichNeuron iz;
+
+    NeuronBase* neurons[] = {&hh, &iz};
+    std::string names[] = {"HH", "Izhikevich"};
+
+    for (int i = 0; i < 2; i++) {
+        auto trace = neurons[i]->simulate(100.0, 0.1, 15.0);
+        check(trace.size() == 1000, (names[i] + " trace length incorrect").c_str());
+        double max_V = *std::max_element(trace.begin(), trace.end());
+        check(max_V > 0.0, (names[i] + " should produce spikes").c_str());
+    }
+}
+
+TEST(neuron_type_names) {
+    HHNeuron hh;
+    IzhikevichNeuron iz;
+
+    check(hh.type_name() == "HH", "HH type name incorrect");
+    check(iz.type_name() == "Izhikevich", "Izhikevich type name incorrect");
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
 int main() {
-    std::cout << "=== Hodgkin-Huxley Comprehensive C++ Tests ===\n\n";
+    std::cout << "=== Neural Simulation Library C++ Tests ===\n\n";
 
     std::cout << "--- HHNeuron Basic Tests ---\n";
     RUN_TEST(neuron_default_creation);
@@ -551,6 +864,43 @@ int main() {
     RUN_TEST(neuron_gating_variables_bounded);
     RUN_TEST(neuron_zero_conductance);
     RUN_TEST(neuron_multiple_resets);
+
+    std::cout << "\n--- Izhikevich Neuron Basic Tests ---\n";
+    RUN_TEST(izhikevich_default_creation);
+    RUN_TEST(izhikevich_preset_types);
+    RUN_TEST(izhikevich_custom_parameters);
+    RUN_TEST(izhikevich_get_preset);
+    RUN_TEST(izhikevich_reset);
+    RUN_TEST(izhikevich_state_access);
+    RUN_TEST(izhikevich_recovery_variable);
+
+    std::cout << "\n--- Izhikevich Neuron Step Tests ---\n";
+    RUN_TEST(izhikevich_step_positive_current);
+    RUN_TEST(izhikevich_step_negative_current);
+    RUN_TEST(izhikevich_spike_detection);
+    RUN_TEST(izhikevich_spike_reset);
+
+    std::cout << "\n--- Izhikevich Neuron Simulation Tests ---\n";
+    RUN_TEST(izhikevich_simulate_length);
+    RUN_TEST(izhikevich_simulate_varying_current);
+    RUN_TEST(izhikevich_spike_generation);
+    RUN_TEST(izhikevich_subthreshold_no_spike);
+    RUN_TEST(izhikevich_spike_count_increases_with_current);
+
+    std::cout << "\n--- Izhikevich Spiking Patterns ---\n";
+    RUN_TEST(izhikevich_fs_faster_than_rs);
+
+    std::cout << "\n--- Izhikevich Edge Cases ---\n";
+    RUN_TEST(izhikevich_extreme_positive_current);
+    RUN_TEST(izhikevich_extreme_negative_current);
+    RUN_TEST(izhikevich_voltage_bounded);
+    RUN_TEST(izhikevich_long_simulation_stability);
+    RUN_TEST(izhikevich_multiple_resets);
+
+    std::cout << "\n--- NeuronBase Polymorphism Tests ---\n";
+    RUN_TEST(neuron_base_polymorphism);
+    RUN_TEST(neuron_base_simulate_polymorphism);
+    RUN_TEST(neuron_type_names);
 
     std::cout << "\n--- Network Basic Tests ---\n";
     RUN_TEST(network_empty_creation);

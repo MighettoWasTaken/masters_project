@@ -6,16 +6,19 @@
 
 namespace hodgkin_huxley {
 
-HHNeuron::HHNeuron() : params_(), state_(), method_(IntegrationMethod::RK4) {
+HHNeuron::HHNeuron() : params_(), state_() {
+    method_ = IntegrationMethod::RK4;
     reset();
 }
 
-HHNeuron::HHNeuron(const Parameters& params) : params_(params), state_(), method_(IntegrationMethod::RK4) {
+HHNeuron::HHNeuron(const Parameters& params) : params_(params), state_() {
+    method_ = IntegrationMethod::RK4;
     reset();
 }
 
 HHNeuron::HHNeuron(const Parameters& params, IntegrationMethod method)
-    : params_(params), state_(), method_(method) {
+    : params_(params), state_() {
+    method_ = method;
     reset();
 }
 
@@ -205,34 +208,6 @@ void HHNeuron::step(double dt, double I_ext) {
     }
 }
 
-std::vector<double> HHNeuron::simulate(double duration, double dt, double I_ext) {
-    size_t num_steps = static_cast<size_t>(duration / dt);
-    std::vector<double> trace;
-    trace.reserve(num_steps);
-
-    for (size_t i = 0; i < num_steps; ++i) {
-        trace.push_back(state_.V);
-        step(dt, I_ext);
-    }
-
-    return trace;
-}
-
-std::vector<double> HHNeuron::simulate(double duration, double dt, const std::vector<double>& I_ext) {
-    size_t num_steps = static_cast<size_t>(duration / dt);
-    if (I_ext.size() < num_steps) {
-        throw std::invalid_argument("I_ext vector too short for simulation duration");
-    }
-
-    std::vector<double> trace;
-    trace.reserve(num_steps);
-
-    for (size_t i = 0; i < num_steps; ++i) {
-        trace.push_back(state_.V);
-        step(dt, I_ext[i]);
-    }
-
-    return trace;
-}
+// simulate() methods are inherited from NeuronBase
 
 } // namespace hodgkin_huxley

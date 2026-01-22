@@ -1,18 +1,10 @@
 #pragma once
 
+#include "neuron_base.hpp"
 #include <vector>
 #include <cmath>
 
 namespace hodgkin_huxley {
-
-/**
- * @brief Numerical integration methods for ODE solving
- */
-enum class IntegrationMethod {
-    EULER,          // Forward Euler (1st order, fast but less accurate)
-    RK4,            // Classic Runge-Kutta 4th order (good balance)
-    RK45_ADAPTIVE   // Adaptive step size RK45 (Dormand-Prince)
-};
 
 /**
  * @brief Hodgkin-Huxley neuron model
@@ -20,7 +12,7 @@ enum class IntegrationMethod {
  * Implements the classic Hodgkin-Huxley model with Na+, K+, and leak channels.
  * All units are in standard SI: mV, ms, uA/cm^2, mS/cm^2, uF/cm^2
  */
-class HHNeuron {
+class HHNeuron : public NeuronBase {
 public:
     // Default HH parameters (squid giant axon at 6.3°C)
     struct Parameters {
@@ -45,35 +37,35 @@ public:
     explicit HHNeuron(const Parameters& params);
     HHNeuron(const Parameters& params, IntegrationMethod method);
 
-    // Getters
+    // =========================================================================
+    // NeuronBase interface implementation
+    // =========================================================================
+
+    [[nodiscard]] double membrane_potential() const override { return state_.V; }
+    void set_membrane_potential(double V) override { state_.V = V; }
+    void reset() override;
+    void step(double dt, double I_ext) override;
+    [[nodiscard]] std::string type_name() const override { return "HH"; }
+
+    [[nodiscard]] IntegrationMethod integration_method() const override { return method_; }
+    void set_integration_method(IntegrationMethod method) override { method_ = method; }
+
+    // =========================================================================
+    // HH-specific interface
+    // =========================================================================
+
     [[nodiscard]] const State& state() const { return state_; }
     [[nodiscard]] const Parameters& parameters() const { return params_; }
-    [[nodiscard]] double membrane_potential() const { return state_.V; }
-    [[nodiscard]] IntegrationMethod integration_method() const { return method_; }
 
-    // Setters
     void set_state(const State& state) { state_ = state; }
     void set_parameters(const Parameters& params) { params_ = params; }
-    void set_membrane_potential(double V) { state_.V = V; }
-    void set_integration_method(IntegrationMethod method) { method_ = method; }
-
-    // Reset to resting state
-    void reset();
 
     // Compute derivatives for the state variables
     void compute_derivatives(double I_ext, double& dV, double& dm, double& dh, double& dn) const;
 
-    // Step the simulation forward by dt milliseconds
-    void step(double dt, double I_ext);
-
-    // Run simulation for duration ms, returning voltage trace
-    std::vector<double> simulate(double duration, double dt, double I_ext);
-    std::vector<double> simulate(double duration, double dt, const std::vector<double>& I_ext);
-
 private:
     Parameters params_;
     State state_;
-    IntegrationMethod method_ = IntegrationMethod::RK4;
 
     // Integration step implementations
     void euler_step(double dt, double I_ext);

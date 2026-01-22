@@ -3,7 +3,16 @@
 import numpy as np
 import pytest
 
-from hodgkin_huxley import HHNeuron, Network, Parameters, State, IntegrationMethod
+from hodgkin_huxley import (
+    HHNeuron,
+    Network,
+    HHParameters,
+    HHState,
+    IntegrationMethod,
+    # Backward compatibility aliases
+    Parameters,
+    State,
+)
 
 
 class TestHHNeuronBasic:

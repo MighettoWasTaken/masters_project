@@ -21,7 +21,7 @@ except ImportError:
     HAS_MATPLOTLIB = False
     print("matplotlib not installed - skipping visualization")
 
-from hodgkin_huxley import HHNeuron, Network, Parameters
+from hodgkin_huxley import HHNeuron, Network, HHParameters
 
 
 def get_figs_dir():
@@ -145,7 +145,7 @@ def custom_parameters_example():
     print("\n=== Custom Parameters Example ===\n")
 
     # Create custom parameters
-    params = Parameters()
+    params = HHParameters()
     print("Default parameters:")
     print(f"  g_Na = {params.g_Na} mS/cm²")
     print(f"  g_K  = {params.g_K} mS/cm²")

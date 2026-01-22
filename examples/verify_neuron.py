@@ -16,7 +16,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from hodgkin_huxley import HHNeuron, IntegrationMethod, Parameters
+from hodgkin_huxley import HHNeuron, IntegrationMethod, HHParameters
 
 
 def setup_output_dir():
@@ -297,7 +297,7 @@ def plot_parameter_sensitivity(figs_dir):
     # Vary g_Na
     ax = axes[0, 0]
     for g_Na in [60, 90, 120, 150, 180]:
-        params = Parameters()
+        params = HHParameters()
         params.g_Na = g_Na
         neuron = HHNeuron(params)
         trace = neuron.simulate(duration, dt, I_ext)
@@ -312,7 +312,7 @@ def plot_parameter_sensitivity(figs_dir):
     # Vary g_K
     ax = axes[0, 1]
     for g_K in [18, 27, 36, 45, 54]:
-        params = Parameters()
+        params = HHParameters()
         params.g_K = g_K
         neuron = HHNeuron(params)
         trace = neuron.simulate(duration, dt, I_ext)
@@ -327,7 +327,7 @@ def plot_parameter_sensitivity(figs_dir):
     # Vary g_L
     ax = axes[1, 0]
     for g_L in [0.1, 0.2, 0.3, 0.5, 1.0]:
-        params = Parameters()
+        params = HHParameters()
         params.g_L = g_L
         neuron = HHNeuron(params)
         trace = neuron.simulate(duration, dt, I_ext)
@@ -342,7 +342,7 @@ def plot_parameter_sensitivity(figs_dir):
     # Vary C_m
     ax = axes[1, 1]
     for C_m in [0.5, 0.75, 1.0, 1.5, 2.0]:
-        params = Parameters()
+        params = HHParameters()
         params.C_m = C_m
         neuron = HHNeuron(params)
         trace = neuron.simulate(duration, dt, I_ext)

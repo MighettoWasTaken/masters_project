@@ -1,6 +1,8 @@
 # Core C++ library
 add_library(hodgkin_huxley_core STATIC
+    src/neuron_base.cpp
     src/neuron.cpp
+    src/izhikevich.cpp
     src/network.cpp
 )
 
