@@ -159,9 +159,26 @@ PYBIND11_MODULE(_core, m) {
     // =========================================================================
     // Network
     // =========================================================================
+
+    // Network::NeuronType enum
+    py::enum_<Network::NeuronType>(m, "NetworkNeuronType")
+        .value("HH", Network::NeuronType::HH)
+        .value("IZHIKEVICH_RS", Network::NeuronType::IZHIKEVICH_RS)
+        .value("IZHIKEVICH_FS", Network::NeuronType::IZHIKEVICH_FS)
+        .value("IZHIKEVICH_IB", Network::NeuronType::IZHIKEVICH_IB)
+        .value("IZHIKEVICH_CH", Network::NeuronType::IZHIKEVICH_CH)
+        .value("IZHIKEVICH_LTS", Network::NeuronType::IZHIKEVICH_LTS)
+        .value("IZHIKEVICH_CUSTOM", Network::NeuronType::IZHIKEVICH_CUSTOM)
+        .export_values();
+
     py::class_<Network>(m, "Network")
         .def(py::init<>(), "Create an empty network")
         .def(py::init<size_t>(), "Create a network with n HH neurons", py::arg("num_neurons"))
+        .def(py::init<size_t, Network::NeuronType>(),
+             "Create a network with n neurons of specified type",
+             py::arg("num_neurons"), py::arg("neuron_type"))
+
+        // Add neurons - various overloads
         .def("add_neuron",
              py::overload_cast<>(&Network::add_neuron),
              "Add a HH neuron with default parameters, returns index")
@@ -169,15 +186,58 @@ PYBIND11_MODULE(_core, m) {
              py::overload_cast<const HHNeuron::Parameters&>(&Network::add_neuron),
              "Add a HH neuron with custom parameters, returns index",
              py::arg("parameters"))
+        .def("add_neuron",
+             py::overload_cast<Network::NeuronType>(&Network::add_neuron),
+             "Add a neuron of specified type, returns index",
+             py::arg("neuron_type"))
+        .def("add_neuron",
+             py::overload_cast<const IzhikevichNeuron::Parameters&>(&Network::add_neuron),
+             "Add an Izhikevich neuron with custom parameters, returns index",
+             py::arg("parameters"))
+
+        // Explicit typed add methods
+        .def("add_hh_neuron",
+             py::overload_cast<>(&Network::add_hh_neuron),
+             "Add a HH neuron with default parameters")
+        .def("add_hh_neuron",
+             py::overload_cast<const HHNeuron::Parameters&>(&Network::add_hh_neuron),
+             "Add a HH neuron with custom parameters",
+             py::arg("parameters"))
+        .def("add_izhikevich_neuron",
+             py::overload_cast<IzhikevichNeuron::Type>(&Network::add_izhikevich_neuron),
+             "Add an Izhikevich neuron with preset type",
+             py::arg("type") = IzhikevichNeuron::Type::REGULAR_SPIKING)
+        .def("add_izhikevich_neuron",
+             py::overload_cast<const IzhikevichNeuron::Parameters&>(&Network::add_izhikevich_neuron),
+             "Add an Izhikevich neuron with custom parameters",
+             py::arg("parameters"))
+
+        // Synapse
         .def("add_synapse", &Network::add_synapse,
              "Add a synaptic connection between neurons",
              py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
              py::arg("E_syn") = 0.0, py::arg("tau") = 2.0)
+
+        // Properties
         .def_property_readonly("num_neurons", &Network::num_neurons)
         .def_property_readonly("num_synapses", &Network::num_synapses)
-        .def("neuron", py::overload_cast<size_t>(&Network::neuron),
+
+        // Neuron access
+        .def("neuron", [](Network& net, size_t idx) -> NeuronBase& {
+                return net.neuron(idx);
+             },
              py::return_value_policy::reference_internal,
-             "Get neuron by index", py::arg("idx"))
+             "Get neuron by index (polymorphic)", py::arg("idx"))
+        .def("hh_neuron", py::overload_cast<size_t>(&Network::hh_neuron),
+             py::return_value_policy::reference_internal,
+             "Get HH neuron by index (throws if wrong type)", py::arg("idx"))
+        .def("iz_neuron", py::overload_cast<size_t>(&Network::iz_neuron),
+             py::return_value_policy::reference_internal,
+             "Get Izhikevich neuron by index (throws if wrong type)", py::arg("idx"))
+        .def("neuron_type", &Network::neuron_type,
+             "Get neuron type name at index", py::arg("idx"))
+
+        // Simulation
         .def("get_potentials", &Network::get_potentials,
              "Get membrane potentials of all neurons")
         .def("reset", &Network::reset, "Reset all neurons to resting state")
@@ -186,6 +246,8 @@ PYBIND11_MODULE(_core, m) {
         .def("simulate", &Network::simulate,
              "Run network simulation",
              py::arg("duration"), py::arg("dt"), py::arg("I_ext"))
+
+        // Python special methods
         .def("__repr__", [](const Network& net) {
             return "<Network neurons=" + std::to_string(net.num_neurons()) +
                    " synapses=" + std::to_string(net.num_synapses()) + ">";
@@ -199,5 +261,5 @@ PYBIND11_MODULE(_core, m) {
     m.attr("State") = m.attr("HHState");
 
     // Module version
-    m.attr("__version__") = "0.2.0";
+    m.attr("__version__") = "0.3.0";
 }

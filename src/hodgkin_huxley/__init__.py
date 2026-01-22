@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from typing import Union
 
 from ._core import (
     # Base class
@@ -24,6 +25,7 @@ from ._core import (
     IzhikevichType,
     # Network
     Network as _Network,
+    NetworkNeuronType,
     # Enums
     IntegrationMethod,
     # Version
@@ -45,6 +47,7 @@ __all__ = [
     "IzhikevichType",
     # Network
     "Network",
+    "NetworkNeuronType",
     # Enums
     "IntegrationMethod",
     # Version
@@ -297,25 +300,66 @@ class Network:
     """
     Network of interconnected neurons.
 
-    Currently supports HH neurons. Future versions will support
-    mixed neuron types.
+    Supports mixed networks with HH and Izhikevich neurons.
 
     Parameters
     ----------
     num_neurons : int, optional
         Number of HH neurons to create. Default is 0.
+    neuron_type : NetworkNeuronType, optional
+        Type of neurons to create when using num_neurons.
 
     Examples
     --------
+    >>> # Create HH network
     >>> net = Network(2)
     >>> net.add_synapse(0, 1, weight=0.5)
     >>> traces = net.simulate(duration=100, dt=0.01, I_ext=[[10]*10000, [0]*10000])
+
+    >>> # Create mixed network
+    >>> net = Network()
+    >>> net.add_hh_neuron()
+    >>> net.add_izhikevich_neuron(IzhikevichType.FAST_SPIKING)
+    >>> net.add_synapse(0, 1, weight=1.0)
     """
 
-    def __init__(self, num_neurons: int = 0):
-        self._network = _Network(num_neurons)
+    def __init__(
+        self,
+        num_neurons: int = 0,
+        neuron_type: NetworkNeuronType | None = None,
+    ):
+        if neuron_type is not None:
+            self._network = _Network(num_neurons, neuron_type)
+        else:
+            self._network = _Network(num_neurons)
 
-    def add_neuron(self, parameters: HHParameters | None = None) -> int:
+    def add_neuron(
+        self,
+        parameters: Union[HHParameters, IzhikevichParameters, None] = None,
+        neuron_type: NetworkNeuronType | None = None,
+    ) -> int:
+        """
+        Add a neuron to the network.
+
+        Parameters
+        ----------
+        parameters : HHParameters or IzhikevichParameters, optional
+            Custom parameters for the neuron.
+        neuron_type : NetworkNeuronType, optional
+            Type of neuron to add.
+
+        Returns
+        -------
+        int
+            Index of the added neuron.
+        """
+        if neuron_type is not None:
+            return self._network.add_neuron(neuron_type)
+        elif parameters is not None:
+            return self._network.add_neuron(parameters)
+        return self._network.add_neuron()
+
+    def add_hh_neuron(self, parameters: HHParameters | None = None) -> int:
         """
         Add an HH neuron to the network.
 
@@ -330,8 +374,32 @@ class Network:
             Index of the added neuron.
         """
         if parameters is not None:
-            return self._network.add_neuron(parameters)
-        return self._network.add_neuron()
+            return self._network.add_hh_neuron(parameters)
+        return self._network.add_hh_neuron()
+
+    def add_izhikevich_neuron(
+        self,
+        neuron_type: IzhikevichType = IzhikevichType.REGULAR_SPIKING,
+        parameters: IzhikevichParameters | None = None,
+    ) -> int:
+        """
+        Add an Izhikevich neuron to the network.
+
+        Parameters
+        ----------
+        neuron_type : IzhikevichType, optional
+            Preset neuron type. Default is REGULAR_SPIKING.
+        parameters : IzhikevichParameters, optional
+            Custom parameters. Overrides neuron_type if provided.
+
+        Returns
+        -------
+        int
+            Index of the added neuron.
+        """
+        if parameters is not None:
+            return self._network.add_izhikevich_neuron(parameters)
+        return self._network.add_izhikevich_neuron(neuron_type)
 
     def add_synapse(
         self,
@@ -353,7 +421,8 @@ class Network:
         weight : float
             Synaptic weight (conductance).
         E_syn : float, optional
-            Synaptic reversal potential in mV. Default is 0.
+            Synaptic reversal potential in mV. Default is 0 (excitatory).
+            Use -80 for inhibitory synapses.
         tau : float, optional
             Synaptic time constant in ms. Default is 2.
         """
@@ -369,9 +438,21 @@ class Network:
         """Number of synaptic connections."""
         return self._network.num_synapses
 
-    def neuron(self, idx: int) -> _HHNeuron:
-        """Get a neuron by index."""
+    def neuron(self, idx: int) -> _NeuronBase:
+        """Get a neuron by index (polymorphic access)."""
         return self._network.neuron(idx)
+
+    def hh_neuron(self, idx: int) -> _HHNeuron:
+        """Get an HH neuron by index. Throws if wrong type."""
+        return self._network.hh_neuron(idx)
+
+    def iz_neuron(self, idx: int) -> _IzhikevichNeuron:
+        """Get an Izhikevich neuron by index. Throws if wrong type."""
+        return self._network.iz_neuron(idx)
+
+    def neuron_type(self, idx: int) -> str:
+        """Get the type name of a neuron at given index."""
+        return self._network.neuron_type(idx)
 
     def get_potentials(self) -> NDArray[np.float64]:
         """Get membrane potentials of all neurons."""
@@ -390,7 +471,7 @@ class Network:
         dt : float
             Time step in milliseconds.
         I_ext : array-like
-            External currents for each neuron in uA/cm^2.
+            External currents for each neuron.
         """
         I_ext = np.asarray(I_ext, dtype=np.float64).tolist()
         self._network.step(dt, I_ext)

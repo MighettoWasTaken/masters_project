@@ -1,8 +1,11 @@
 #pragma once
 
+#include "neuron_base.hpp"
 #include "neuron.hpp"
+#include "izhikevich.hpp"
 #include <vector>
 #include <memory>
+#include <string>
 
 namespace hodgkin_huxley {
 
@@ -22,18 +25,51 @@ struct Synapse {
 };
 
 /**
- * @brief Network of Hodgkin-Huxley neurons
+ * @brief Network of neurons with polymorphic neuron support
  *
- * Allows simulation of interconnected neurons with synaptic connections.
+ * Allows simulation of interconnected neurons (HH, Izhikevich, or mixed)
+ * with synaptic connections.
  */
 class Network {
 public:
+    /**
+     * @brief Enum for neuron types when adding neurons
+     */
+    enum class NeuronType {
+        HH,
+        IZHIKEVICH_RS,
+        IZHIKEVICH_FS,
+        IZHIKEVICH_IB,
+        IZHIKEVICH_CH,
+        IZHIKEVICH_LTS,
+        IZHIKEVICH_CUSTOM
+    };
+
     Network() = default;
+
+    /**
+     * @brief Create network with N HH neurons (backward compatible)
+     */
     explicit Network(size_t num_neurons);
 
+    /**
+     * @brief Create network with N neurons of specified type
+     */
+    Network(size_t num_neurons, NeuronType type);
+
     // Add neurons
-    size_t add_neuron();
+    size_t add_neuron();  // Add default HH neuron
     size_t add_neuron(const HHNeuron::Parameters& params);
+    size_t add_neuron(NeuronType type);
+    size_t add_neuron(const IzhikevichNeuron::Parameters& params);
+
+    /**
+     * @brief Add a neuron with explicit type specification
+     */
+    size_t add_hh_neuron();
+    size_t add_hh_neuron(const HHNeuron::Parameters& params);
+    size_t add_izhikevich_neuron(IzhikevichNeuron::Type type = IzhikevichNeuron::Type::REGULAR_SPIKING);
+    size_t add_izhikevich_neuron(const IzhikevichNeuron::Parameters& params);
 
     // Add synaptic connection
     void add_synapse(size_t pre_idx, size_t post_idx, double weight,
@@ -42,8 +78,29 @@ public:
     // Getters
     [[nodiscard]] size_t num_neurons() const { return neurons_.size(); }
     [[nodiscard]] size_t num_synapses() const { return synapses_.size(); }
-    [[nodiscard]] const HHNeuron& neuron(size_t idx) const { return neurons_[idx]; }
-    [[nodiscard]] HHNeuron& neuron(size_t idx) { return neurons_[idx]; }
+
+    /**
+     * @brief Get neuron by index (polymorphic access)
+     */
+    [[nodiscard]] const NeuronBase& neuron(size_t idx) const { return *neurons_[idx]; }
+    [[nodiscard]] NeuronBase& neuron(size_t idx) { return *neurons_[idx]; }
+
+    /**
+     * @brief Get neuron as HH (throws if wrong type)
+     */
+    [[nodiscard]] const HHNeuron& hh_neuron(size_t idx) const;
+    [[nodiscard]] HHNeuron& hh_neuron(size_t idx);
+
+    /**
+     * @brief Get neuron as Izhikevich (throws if wrong type)
+     */
+    [[nodiscard]] const IzhikevichNeuron& iz_neuron(size_t idx) const;
+    [[nodiscard]] IzhikevichNeuron& iz_neuron(size_t idx);
+
+    /**
+     * @brief Get neuron type name
+     */
+    [[nodiscard]] std::string neuron_type(size_t idx) const { return neurons_[idx]->type_name(); }
 
     // Get all membrane potentials
     [[nodiscard]] std::vector<double> get_potentials() const;
@@ -62,7 +119,7 @@ public:
     );
 
 private:
-    std::vector<HHNeuron> neurons_;
+    std::vector<std::unique_ptr<NeuronBase>> neurons_;
     std::vector<Synapse> synapses_;
 
     // Compute synaptic currents for each neuron
