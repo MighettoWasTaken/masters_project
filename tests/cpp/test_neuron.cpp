@@ -310,7 +310,7 @@ TEST(network_add_neuron_custom_params) {
     HHNeuron::Parameters params;
     params.g_Na = 100.0;
     size_t idx = net.add_neuron(params);
-    check_approx(net.neuron(idx).parameters().g_Na, 100.0, 0.001, "Custom params not applied");
+    check_approx(net.hh_neuron(idx).parameters().g_Na, 100.0, 0.001, "Custom params not applied");
 }
 
 TEST(network_add_synapse) {
