@@ -157,6 +157,33 @@ PYBIND11_MODULE(_core, m) {
         });
 
     // =========================================================================
+    // Synapse Classes
+    // =========================================================================
+
+    py::class_<SynapseBase>(m, "SynapseBase")
+        .def_property_readonly("conductance", &SynapseBase::conductance, "Current conductance")
+        .def_property_readonly("reversal_potential", &SynapseBase::reversal_potential, "Reversal potential (mV)")
+        .def_property_readonly("weight", &SynapseBase::weight, "Synaptic weight")
+        .def_property_readonly("pre_idx", &SynapseBase::pre_idx, "Pre-synaptic neuron index")
+        .def_property_readonly("post_idx", &SynapseBase::post_idx, "Post-synaptic neuron index")
+        .def("type_name", &SynapseBase::type_name, "Get synapse type name")
+        .def("__repr__", [](const SynapseBase& s) {
+            return "<" + s.type_name() + "Synapse " +
+                   std::to_string(s.pre_idx()) + "->" + std::to_string(s.post_idx()) +
+                   " w=" + std::to_string(s.weight()) + ">";
+        });
+
+    py::class_<ExponentialSynapse, SynapseBase>(m, "ExponentialSynapse")
+        .def_property_readonly("tau", &ExponentialSynapse::tau, "Decay time constant (ms)");
+
+    py::class_<AlphaSynapse, SynapseBase>(m, "AlphaSynapse")
+        .def_property_readonly("tau", &AlphaSynapse::tau, "Time to peak (ms)");
+
+    py::class_<DoubleExponentialSynapse, SynapseBase>(m, "DoubleExponentialSynapse")
+        .def_property_readonly("tau_rise", &DoubleExponentialSynapse::tau_rise, "Rise time constant (ms)")
+        .def_property_readonly("tau_decay", &DoubleExponentialSynapse::tau_decay, "Decay time constant (ms)");
+
+    // =========================================================================
     // Network
     // =========================================================================
 
@@ -212,11 +239,19 @@ PYBIND11_MODULE(_core, m) {
              "Add an Izhikevich neuron with custom parameters",
              py::arg("parameters"))
 
-        // Synapse
+        // Synapses
         .def("add_synapse", &Network::add_synapse,
-             "Add a synaptic connection between neurons",
+             "Add an exponential synapse between neurons",
              py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
              py::arg("E_syn") = 0.0, py::arg("tau") = 2.0)
+        .def("add_alpha_synapse", &Network::add_alpha_synapse,
+             "Add an alpha-function synapse between neurons",
+             py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
+             py::arg("E_syn") = 0.0, py::arg("tau") = 2.0)
+        .def("add_double_exp_synapse", &Network::add_double_exp_synapse,
+             "Add a double-exponential synapse between neurons",
+             py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
+             py::arg("E_syn") = 0.0, py::arg("tau_rise") = 0.4, py::arg("tau_decay") = 2.5)
 
         // Properties
         .def_property_readonly("num_neurons", &Network::num_neurons)
@@ -236,6 +271,11 @@ PYBIND11_MODULE(_core, m) {
              "Get Izhikevich neuron by index (throws if wrong type)", py::arg("idx"))
         .def("neuron_type", &Network::neuron_type,
              "Get neuron type name at index", py::arg("idx"))
+        .def("synapse", [](const Network& net, size_t idx) -> const SynapseBase& {
+                return net.synapse(idx);
+             },
+             py::return_value_policy::reference_internal,
+             "Get synapse by index (polymorphic)", py::arg("idx"))
 
         // Simulation
         .def("get_potentials", &Network::get_potentials,

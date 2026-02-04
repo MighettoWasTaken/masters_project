@@ -829,6 +829,261 @@ TEST(neuron_type_names) {
 }
 
 // =============================================================================
+// Synapse Type Tests
+// =============================================================================
+
+TEST(synapse_exponential_creation) {
+    ExponentialSynapse syn(0, 1, 0.5, 0.0, 2.0);
+    check(syn.pre_idx() == 0, "pre_idx incorrect");
+    check(syn.post_idx() == 1, "post_idx incorrect");
+    check_approx(syn.weight(), 0.5, 1e-9, "weight incorrect");
+    check_approx(syn.reversal_potential(), 0.0, 1e-9, "E_syn incorrect");
+    check_approx(syn.tau(), 2.0, 1e-9, "tau incorrect");
+    check_approx(syn.conductance(), 0.0, 1e-9, "initial g should be 0");
+    check(syn.type_name() == "Exponential", "type_name incorrect");
+}
+
+TEST(synapse_exponential_spike_and_decay) {
+    ExponentialSynapse syn(0, 1, 1.0, 0.0, 2.0);
+
+    // Trigger spike
+    syn.update(0.05, true);
+    double g_after_spike = syn.conductance();
+    check(g_after_spike > 0.0, "g should increase after spike");
+
+    // Decay over several steps
+    double prev_g = g_after_spike;
+    for (int i = 0; i < 100; i++) {
+        syn.update(0.05, false);
+        check(syn.conductance() < prev_g, "g should decay monotonically");
+        prev_g = syn.conductance();
+    }
+    check(syn.conductance() < g_after_spike * 0.1, "g should decay significantly");
+}
+
+TEST(synapse_exponential_reset) {
+    ExponentialSynapse syn(0, 1, 1.0, 0.0, 2.0);
+    syn.update(0.05, true);
+    check(syn.conductance() > 0.0, "g should be nonzero after spike");
+    syn.reset();
+    check_approx(syn.conductance(), 0.0, 1e-9, "g should be 0 after reset");
+}
+
+TEST(synapse_alpha_creation) {
+    AlphaSynapse syn(0, 1, 0.5, 0.0, 5.0);
+    check_approx(syn.weight(), 0.5, 1e-9, "weight incorrect");
+    check_approx(syn.tau(), 5.0, 1e-9, "tau incorrect");
+    check_approx(syn.conductance(), 0.0, 1e-9, "initial g should be 0");
+    check(syn.type_name() == "Alpha", "type_name incorrect");
+}
+
+TEST(synapse_alpha_rise_and_fall) {
+    AlphaSynapse syn(0, 1, 1.0, 0.0, 2.0);
+    double dt = 0.05;
+
+    // Trigger spike
+    syn.update(dt, true);
+
+    // Should rise initially
+    double prev_g = syn.conductance();
+    bool rose = false;
+    double peak_g = prev_g;
+
+    for (int i = 0; i < 2000; i++) {
+        syn.update(dt, false);
+        double g = syn.conductance();
+        if (g > prev_g) rose = true;
+        if (g > peak_g) peak_g = g;
+        prev_g = g;
+    }
+
+    check(rose, "Alpha synapse should rise before decaying");
+    check(peak_g > 0.0, "Peak conductance should be positive");
+    // After many steps, should have decayed back
+    check(syn.conductance() < peak_g * 0.01, "Should decay back to near zero");
+}
+
+TEST(synapse_alpha_peaks_near_tau) {
+    double tau = 5.0;
+    double dt = 0.01;
+    AlphaSynapse syn(0, 1, 1.0, 0.0, tau);
+
+    syn.update(dt, true);
+
+    double peak_g = 0.0;
+    double peak_time = 0.0;
+    double t = dt;
+
+    for (int i = 0; i < 5000; i++) {
+        syn.update(dt, false);
+        t += dt;
+        if (syn.conductance() > peak_g) {
+            peak_g = syn.conductance();
+            peak_time = t;
+        }
+    }
+
+    // Peak should occur near t = tau
+    check_approx(peak_time, tau, tau * 0.2, "Alpha peak should occur near t=tau");
+    // Peak should be approximately weight
+    check_approx(peak_g, 1.0, 0.15, "Alpha peak should approximately equal weight");
+}
+
+TEST(synapse_alpha_reset) {
+    AlphaSynapse syn(0, 1, 1.0, 0.0, 2.0);
+    syn.update(0.05, true);
+    for (int i = 0; i < 20; i++) syn.update(0.05, false);
+    check(syn.conductance() > 0.0, "g should be nonzero");
+    syn.reset();
+    check_approx(syn.conductance(), 0.0, 1e-9, "g should be 0 after reset");
+}
+
+TEST(synapse_double_exp_creation) {
+    DoubleExponentialSynapse syn(0, 1, 0.5, 0.0, 0.4, 2.5);
+    check_approx(syn.weight(), 0.5, 1e-9, "weight incorrect");
+    check_approx(syn.tau_rise(), 0.4, 1e-9, "tau_rise incorrect");
+    check_approx(syn.tau_decay(), 2.5, 1e-9, "tau_decay incorrect");
+    check_approx(syn.conductance(), 0.0, 1e-9, "initial g should be 0");
+    check(syn.type_name() == "DoubleExponential", "type_name incorrect");
+}
+
+TEST(synapse_double_exp_invalid_tau) {
+    bool caught = false;
+    try {
+        DoubleExponentialSynapse syn(0, 1, 0.5, 0.0, 5.0, 2.0);  // tau_rise > tau_decay
+    } catch (const std::invalid_argument&) {
+        caught = true;
+    }
+    check(caught, "Should throw when tau_rise >= tau_decay");
+}
+
+TEST(synapse_double_exp_rise_and_fall) {
+    DoubleExponentialSynapse syn(0, 1, 1.0, 0.0, 0.4, 2.5);
+    double dt = 0.01;
+
+    syn.update(dt, true);
+
+    double prev_g = syn.conductance();
+    bool rose = false;
+    double peak_g = prev_g;
+
+    for (int i = 0; i < 5000; i++) {
+        syn.update(dt, false);
+        double g = syn.conductance();
+        if (g > prev_g) rose = true;
+        if (g > peak_g) peak_g = g;
+        prev_g = g;
+    }
+
+    check(rose, "Double-exp should rise before decaying");
+    check(peak_g > 0.0, "Peak conductance should be positive");
+    // Peak should be approximately weight
+    check_approx(peak_g, 1.0, 0.15, "Double-exp peak should approximately equal weight");
+    check(syn.conductance() < peak_g * 0.01, "Should decay back to near zero");
+}
+
+TEST(synapse_double_exp_reset) {
+    DoubleExponentialSynapse syn(0, 1, 1.0, 0.0, 0.4, 2.5);
+    syn.update(0.01, true);
+    for (int i = 0; i < 50; i++) syn.update(0.01, false);
+    check(syn.conductance() > 0.0, "g should be nonzero");
+    syn.reset();
+    check_approx(syn.conductance(), 0.0, 1e-9, "g should be 0 after reset");
+}
+
+// =============================================================================
+// Network Synapse Type Integration Tests
+// =============================================================================
+
+TEST(network_add_alpha_synapse) {
+    Network net(2);
+    net.add_alpha_synapse(0, 1, 0.5, 0.0, 5.0);
+    check(net.num_synapses() == 1, "Should have 1 synapse");
+    check(net.synapse(0).type_name() == "Alpha", "Should be Alpha synapse");
+}
+
+TEST(network_add_double_exp_synapse) {
+    Network net(2);
+    net.add_double_exp_synapse(0, 1, 0.5, 0.0, 0.4, 2.5);
+    check(net.num_synapses() == 1, "Should have 1 synapse");
+    check(net.synapse(0).type_name() == "DoubleExponential", "Should be DoubleExponential synapse");
+}
+
+TEST(network_mixed_synapse_types) {
+    Network net(3);
+    net.add_synapse(0, 1, 0.5);              // Exponential
+    net.add_alpha_synapse(1, 2, 0.5);        // Alpha
+    net.add_double_exp_synapse(0, 2, 0.5);   // DoubleExponential
+    check(net.num_synapses() == 3, "Should have 3 synapses");
+    check(net.synapse(0).type_name() == "Exponential", "Wrong type at idx 0");
+    check(net.synapse(1).type_name() == "Alpha", "Wrong type at idx 1");
+    check(net.synapse(2).type_name() == "DoubleExponential", "Wrong type at idx 2");
+}
+
+TEST(network_alpha_synapse_transmission) {
+    Network net(2);
+    net.add_alpha_synapse(0, 1, 10.0, 0.0, 2.0);
+
+    double duration = 300.0;
+    double dt = 0.01;
+    size_t num_steps = static_cast<size_t>(duration / dt);
+
+    std::vector<std::vector<double>> I_ext(2, std::vector<double>(num_steps, 0.0));
+    for (size_t i = 0; i < num_steps; i++) I_ext[0][i] = 15.0;
+
+    auto traces = net.simulate(duration, dt, I_ext);
+
+    double max_v0 = *std::max_element(traces[0].begin(), traces[0].end());
+    double max_v1 = *std::max_element(traces[1].begin(), traces[1].end());
+    check(max_v0 > 0.0, "Presynaptic neuron should spike");
+    check(max_v1 > -60.0, "Alpha synapse should affect postsynaptic neuron");
+}
+
+TEST(network_double_exp_synapse_transmission) {
+    Network net(2);
+    net.add_double_exp_synapse(0, 1, 10.0, 0.0, 0.4, 2.5);
+
+    double duration = 300.0;
+    double dt = 0.01;
+    size_t num_steps = static_cast<size_t>(duration / dt);
+
+    std::vector<std::vector<double>> I_ext(2, std::vector<double>(num_steps, 0.0));
+    for (size_t i = 0; i < num_steps; i++) I_ext[0][i] = 15.0;
+
+    auto traces = net.simulate(duration, dt, I_ext);
+
+    double max_v0 = *std::max_element(traces[0].begin(), traces[0].end());
+    double max_v1 = *std::max_element(traces[1].begin(), traces[1].end());
+    check(max_v0 > 0.0, "Presynaptic neuron should spike");
+    check(max_v1 > -60.0, "Double-exp synapse should affect postsynaptic neuron");
+}
+
+TEST(network_reset_with_mixed_synapses) {
+    Network net(3);
+    net.add_synapse(0, 1, 5.0);
+    net.add_alpha_synapse(1, 2, 5.0);
+
+    double duration = 100.0;
+    double dt = 0.01;
+    size_t num_steps = static_cast<size_t>(duration / dt);
+
+    std::vector<std::vector<double>> I_ext(3, std::vector<double>(num_steps, 0.0));
+    for (size_t i = 0; i < num_steps; i++) I_ext[0][i] = 15.0;
+
+    auto traces1 = net.simulate(duration, dt, I_ext);
+    net.reset();
+    auto traces2 = net.simulate(duration, dt, I_ext);
+
+    // Check traces are identical after reset
+    for (size_t n = 0; n < 3; n++) {
+        for (size_t t = 0; t < traces1[n].size(); t++) {
+            check_approx(traces1[n][t], traces2[n][t], 1e-6,
+                        "Reset should produce identical traces");
+        }
+    }
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -901,6 +1156,27 @@ int main() {
     RUN_TEST(neuron_base_polymorphism);
     RUN_TEST(neuron_base_simulate_polymorphism);
     RUN_TEST(neuron_type_names);
+
+    std::cout << "\n--- Synapse Type Tests ---\n";
+    RUN_TEST(synapse_exponential_creation);
+    RUN_TEST(synapse_exponential_spike_and_decay);
+    RUN_TEST(synapse_exponential_reset);
+    RUN_TEST(synapse_alpha_creation);
+    RUN_TEST(synapse_alpha_rise_and_fall);
+    RUN_TEST(synapse_alpha_peaks_near_tau);
+    RUN_TEST(synapse_alpha_reset);
+    RUN_TEST(synapse_double_exp_creation);
+    RUN_TEST(synapse_double_exp_invalid_tau);
+    RUN_TEST(synapse_double_exp_rise_and_fall);
+    RUN_TEST(synapse_double_exp_reset);
+
+    std::cout << "\n--- Network Synapse Integration Tests ---\n";
+    RUN_TEST(network_add_alpha_synapse);
+    RUN_TEST(network_add_double_exp_synapse);
+    RUN_TEST(network_mixed_synapse_types);
+    RUN_TEST(network_alpha_synapse_transmission);
+    RUN_TEST(network_double_exp_synapse_transmission);
+    RUN_TEST(network_reset_with_mixed_synapses);
 
     std::cout << "\n--- Network Basic Tests ---\n";
     RUN_TEST(network_empty_creation);

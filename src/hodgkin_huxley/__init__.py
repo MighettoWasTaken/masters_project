@@ -23,6 +23,11 @@ from ._core import (
     IzhikevichParameters,
     IzhikevichState,
     IzhikevichType,
+    # Synapse classes
+    SynapseBase,
+    ExponentialSynapse,
+    AlphaSynapse,
+    DoubleExponentialSynapse,
     # Network
     Network as _Network,
     NetworkNeuronType,
@@ -45,6 +50,11 @@ __all__ = [
     "IzhikevichParameters",
     "IzhikevichState",
     "IzhikevichType",
+    # Synapse classes
+    "SynapseBase",
+    "ExponentialSynapse",
+    "AlphaSynapse",
+    "DoubleExponentialSynapse",
     # Network
     "Network",
     "NetworkNeuronType",
@@ -427,6 +437,73 @@ class Network:
             Synaptic time constant in ms. Default is 2.
         """
         self._network.add_synapse(pre_idx, post_idx, weight, E_syn, tau)
+
+    def add_alpha_synapse(
+        self,
+        pre_idx: int,
+        post_idx: int,
+        weight: float,
+        E_syn: float = 0.0,
+        tau: float = 2.0,
+    ) -> None:
+        """
+        Add an alpha-function synapse between two neurons.
+
+        Conductance follows g(t) = g_peak * (t/tau) * exp(1 - t/tau),
+        producing a smooth rise and fall that peaks at t = tau.
+
+        Parameters
+        ----------
+        pre_idx : int
+            Index of the pre-synaptic neuron.
+        post_idx : int
+            Index of the post-synaptic neuron.
+        weight : float
+            Peak synaptic conductance.
+        E_syn : float, optional
+            Synaptic reversal potential in mV. Default is 0 (excitatory).
+        tau : float, optional
+            Time to peak in ms. Default is 2.
+        """
+        self._network.add_alpha_synapse(pre_idx, post_idx, weight, E_syn, tau)
+
+    def add_double_exp_synapse(
+        self,
+        pre_idx: int,
+        post_idx: int,
+        weight: float,
+        E_syn: float = 0.0,
+        tau_rise: float = 0.4,
+        tau_decay: float = 2.5,
+    ) -> None:
+        """
+        Add a double-exponential synapse between two neurons.
+
+        Conductance follows g(t) = g_peak * f * (exp(-t/tau_d) - exp(-t/tau_r)),
+        with separate rise and decay time constants. Used for AMPA/NMDA
+        receptor kinetics. Requires tau_rise < tau_decay.
+
+        Parameters
+        ----------
+        pre_idx : int
+            Index of the pre-synaptic neuron.
+        post_idx : int
+            Index of the post-synaptic neuron.
+        weight : float
+            Peak synaptic conductance.
+        E_syn : float, optional
+            Synaptic reversal potential in mV. Default is 0 (excitatory).
+        tau_rise : float, optional
+            Rise time constant in ms. Default is 0.4.
+        tau_decay : float, optional
+            Decay time constant in ms. Default is 2.5.
+        """
+        self._network.add_double_exp_synapse(
+            pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay)
+
+    def synapse(self, idx: int) -> SynapseBase:
+        """Get a synapse by index (polymorphic access)."""
+        return self._network.synapse(idx)
 
     @property
     def num_neurons(self) -> int:

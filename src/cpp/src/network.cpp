@@ -1,5 +1,4 @@
 #include "hodgkin_huxley/network.hpp"
-#include <cmath>
 #include <stdexcept>
 
 namespace hodgkin_huxley {
@@ -123,17 +122,31 @@ void Network::add_synapse(size_t pre_idx, size_t post_idx, double weight,
     if (pre_idx >= neurons_.size() || post_idx >= neurons_.size()) {
         throw std::out_of_range("Neuron index out of range");
     }
+    synapses_.push_back(
+        std::make_unique<ExponentialSynapse>(pre_idx, post_idx, weight, E_syn, tau));
+    V_pre_prev_.push_back(neurons_[pre_idx]->membrane_potential());
+}
 
-    Synapse syn;
-    syn.pre_idx = pre_idx;
-    syn.post_idx = post_idx;
-    syn.weight = weight;
-    syn.E_syn = E_syn;
-    syn.tau = tau;
-    syn.g = 0.0;
-    syn.V_pre_prev = neurons_[pre_idx]->membrane_potential();
+void Network::add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
+                                double E_syn, double tau) {
+    if (pre_idx >= neurons_.size() || post_idx >= neurons_.size()) {
+        throw std::out_of_range("Neuron index out of range");
+    }
+    synapses_.push_back(
+        std::make_unique<AlphaSynapse>(pre_idx, post_idx, weight, E_syn, tau));
+    V_pre_prev_.push_back(neurons_[pre_idx]->membrane_potential());
+}
 
-    synapses_.push_back(syn);
+void Network::add_double_exp_synapse(size_t pre_idx, size_t post_idx, double weight,
+                                     double E_syn,
+                                     double tau_rise, double tau_decay) {
+    if (pre_idx >= neurons_.size() || post_idx >= neurons_.size()) {
+        throw std::out_of_range("Neuron index out of range");
+    }
+    synapses_.push_back(
+        std::make_unique<DoubleExponentialSynapse>(
+            pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay));
+    V_pre_prev_.push_back(neurons_[pre_idx]->membrane_potential());
 }
 
 std::vector<double> Network::get_potentials() const {
@@ -149,9 +162,9 @@ void Network::reset() {
     for (auto& neuron : neurons_) {
         neuron->reset();
     }
-    for (auto& synapse : synapses_) {
-        synapse.g = 0.0;
-        synapse.V_pre_prev = neurons_[synapse.pre_idx]->membrane_potential();
+    for (size_t i = 0; i < synapses_.size(); ++i) {
+        synapses_[i]->reset();
+        V_pre_prev_[i] = neurons_[synapses_[i]->pre_idx()]->membrane_potential();
     }
 }
 
@@ -159,38 +172,26 @@ std::vector<double> Network::compute_synaptic_currents() const {
     std::vector<double> currents(neurons_.size(), 0.0);
 
     for (const auto& syn : synapses_) {
-        double V_post = neurons_[syn.post_idx]->membrane_potential();
-        // I_syn = g * (E_syn - V_post)
-        // Positive current when E_syn > V_post (excitatory, depolarizing)
-        // Negative current when E_syn < V_post (inhibitory, hyperpolarizing)
-        double I_syn = syn.g * (syn.E_syn - V_post);
-        currents[syn.post_idx] += I_syn;
+        double V_post = neurons_[syn->post_idx()]->membrane_potential();
+        double I_syn = syn->conductance() * (syn->reversal_potential() - V_post);
+        currents[syn->post_idx()] += I_syn;
     }
 
     return currents;
 }
 
 void Network::update_synapses(double dt) {
-    // Simple exponential synapse model
-    // When pre-synaptic neuron spikes (crosses threshold), g increases by weight
-    // Then decays exponentially with time constant tau
-
     const double spike_threshold = 0.0;  // mV
 
-    for (auto& syn : synapses_) {
-        double V_pre = neurons_[syn.pre_idx]->membrane_potential();
+    for (size_t i = 0; i < synapses_.size(); ++i) {
+        double V_pre = neurons_[synapses_[i]->pre_idx()]->membrane_potential();
 
         // Detect spike as upward threshold crossing (rising edge only)
-        // This ensures we only trigger once per action potential
-        if (V_pre > spike_threshold && syn.V_pre_prev <= spike_threshold) {
-            syn.g += syn.weight;
-        }
+        bool spiked = (V_pre > spike_threshold && V_pre_prev_[i] <= spike_threshold);
+        V_pre_prev_[i] = V_pre;
 
-        // Update previous voltage for next iteration
-        syn.V_pre_prev = V_pre;
-
-        // Exponential decay
-        syn.g *= std::exp(-dt / syn.tau);
+        // Delegate kinetics to synapse subclass
+        synapses_[i]->update(dt, spiked);
     }
 }
 

@@ -3,26 +3,12 @@
 #include "neuron_base.hpp"
 #include "neuron.hpp"
 #include "izhikevich.hpp"
+#include "synapse.hpp"
 #include <vector>
 #include <memory>
 #include <string>
 
 namespace hodgkin_huxley {
-
-/**
- * @brief Synapse model for connecting neurons
- */
-struct Synapse {
-    size_t pre_idx;         // Pre-synaptic neuron index
-    size_t post_idx;        // Post-synaptic neuron index
-    double weight;          // Synaptic weight (conductance)
-    double E_syn;           // Synaptic reversal potential (mV)
-    double tau;             // Synaptic time constant (ms)
-
-    // Synapse state
-    double g = 0.0;         // Current synaptic conductance
-    double V_pre_prev = -65.0;  // Previous presynaptic voltage (for spike detection)
-};
 
 /**
  * @brief Network of neurons with polymorphic neuron support
@@ -71,9 +57,14 @@ public:
     size_t add_izhikevich_neuron(IzhikevichNeuron::Type type = IzhikevichNeuron::Type::REGULAR_SPIKING);
     size_t add_izhikevich_neuron(const IzhikevichNeuron::Parameters& params);
 
-    // Add synaptic connection
+    // Add synaptic connections
     void add_synapse(size_t pre_idx, size_t post_idx, double weight,
                      double E_syn = 0.0, double tau = 2.0);
+    void add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
+                           double E_syn = 0.0, double tau = 2.0);
+    void add_double_exp_synapse(size_t pre_idx, size_t post_idx, double weight,
+                                double E_syn = 0.0,
+                                double tau_rise = 0.4, double tau_decay = 2.5);
 
     // Getters
     [[nodiscard]] size_t num_neurons() const { return neurons_.size(); }
@@ -102,6 +93,11 @@ public:
      */
     [[nodiscard]] std::string neuron_type(size_t idx) const { return neurons_[idx]->type_name(); }
 
+    /**
+     * @brief Get synapse by index (polymorphic access)
+     */
+    [[nodiscard]] const SynapseBase& synapse(size_t idx) const { return *synapses_[idx]; }
+
     // Get all membrane potentials
     [[nodiscard]] std::vector<double> get_potentials() const;
 
@@ -120,7 +116,8 @@ public:
 
 private:
     std::vector<std::unique_ptr<NeuronBase>> neurons_;
-    std::vector<Synapse> synapses_;
+    std::vector<std::unique_ptr<SynapseBase>> synapses_;
+    std::vector<double> V_pre_prev_;  // Previous presynaptic voltages for spike detection
 
     // Compute synaptic currents for each neuron
     [[nodiscard]] std::vector<double> compute_synaptic_currents() const;
