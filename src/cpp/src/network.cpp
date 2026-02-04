@@ -118,34 +118,34 @@ IzhikevichNeuron& Network::iz_neuron(size_t idx) {
 }
 
 void Network::add_synapse(size_t pre_idx, size_t post_idx, double weight,
-                          double E_syn, double tau) {
+                          double E_syn, double tau, double delay) {
     if (pre_idx >= neurons_.size() || post_idx >= neurons_.size()) {
         throw std::out_of_range("Neuron index out of range");
     }
     synapses_.push_back(
-        std::make_unique<ExponentialSynapse>(pre_idx, post_idx, weight, E_syn, tau));
+        std::make_unique<ExponentialSynapse>(pre_idx, post_idx, weight, E_syn, tau, delay));
     V_pre_prev_.push_back(neurons_[pre_idx]->membrane_potential());
 }
 
 void Network::add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
-                                double E_syn, double tau) {
+                                double E_syn, double tau, double delay) {
     if (pre_idx >= neurons_.size() || post_idx >= neurons_.size()) {
         throw std::out_of_range("Neuron index out of range");
     }
     synapses_.push_back(
-        std::make_unique<AlphaSynapse>(pre_idx, post_idx, weight, E_syn, tau));
+        std::make_unique<AlphaSynapse>(pre_idx, post_idx, weight, E_syn, tau, delay));
     V_pre_prev_.push_back(neurons_[pre_idx]->membrane_potential());
 }
 
 void Network::add_double_exp_synapse(size_t pre_idx, size_t post_idx, double weight,
                                      double E_syn,
-                                     double tau_rise, double tau_decay) {
+                                     double tau_rise, double tau_decay, double delay) {
     if (pre_idx >= neurons_.size() || post_idx >= neurons_.size()) {
         throw std::out_of_range("Neuron index out of range");
     }
     synapses_.push_back(
         std::make_unique<DoubleExponentialSynapse>(
-            pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay));
+            pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay, delay));
     V_pre_prev_.push_back(neurons_[pre_idx]->membrane_potential());
 }
 
@@ -164,6 +164,7 @@ void Network::reset() {
     }
     for (size_t i = 0; i < synapses_.size(); ++i) {
         synapses_[i]->reset();
+        synapses_[i]->reset_delay_buffer();
         V_pre_prev_[i] = neurons_[synapses_[i]->pre_idx()]->membrane_potential();
     }
 }
@@ -190,8 +191,11 @@ void Network::update_synapses(double dt) {
         bool spiked = (V_pre > spike_threshold && V_pre_prev_[i] <= spike_threshold);
         V_pre_prev_[i] = V_pre;
 
+        // Route through delay buffer (pass-through when delay == 0)
+        bool delayed_spike = synapses_[i]->process_spike(spiked, dt);
+
         // Delegate kinetics to synapse subclass
-        synapses_[i]->update(dt, spiked);
+        synapses_[i]->update(dt, delayed_spike);
     }
 }
 

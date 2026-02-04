@@ -418,6 +418,7 @@ class Network:
         weight: float,
         E_syn: float = 0.0,
         tau: float = 2.0,
+        delay: float = 0.0,
     ) -> None:
         """
         Add a synaptic connection between two neurons.
@@ -435,8 +436,10 @@ class Network:
             Use -80 for inhibitory synapses.
         tau : float, optional
             Synaptic time constant in ms. Default is 2.
+        delay : float, optional
+            Axonal conduction delay in ms. Default is 0.
         """
-        self._network.add_synapse(pre_idx, post_idx, weight, E_syn, tau)
+        self._network.add_synapse(pre_idx, post_idx, weight, E_syn, tau, delay)
 
     def add_alpha_synapse(
         self,
@@ -445,6 +448,7 @@ class Network:
         weight: float,
         E_syn: float = 0.0,
         tau: float = 2.0,
+        delay: float = 0.0,
     ) -> None:
         """
         Add an alpha-function synapse between two neurons.
@@ -464,8 +468,10 @@ class Network:
             Synaptic reversal potential in mV. Default is 0 (excitatory).
         tau : float, optional
             Time to peak in ms. Default is 2.
+        delay : float, optional
+            Axonal conduction delay in ms. Default is 0.
         """
-        self._network.add_alpha_synapse(pre_idx, post_idx, weight, E_syn, tau)
+        self._network.add_alpha_synapse(pre_idx, post_idx, weight, E_syn, tau, delay)
 
     def add_double_exp_synapse(
         self,
@@ -475,6 +481,7 @@ class Network:
         E_syn: float = 0.0,
         tau_rise: float = 0.4,
         tau_decay: float = 2.5,
+        delay: float = 0.0,
     ) -> None:
         """
         Add a double-exponential synapse between two neurons.
@@ -497,9 +504,11 @@ class Network:
             Rise time constant in ms. Default is 0.4.
         tau_decay : float, optional
             Decay time constant in ms. Default is 2.5.
+        delay : float, optional
+            Axonal conduction delay in ms. Default is 0.
         """
         self._network.add_double_exp_synapse(
-            pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay)
+            pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay, delay)
 
     def synapse(self, idx: int) -> SynapseBase:
         """Get a synapse by index (polymorphic access)."""

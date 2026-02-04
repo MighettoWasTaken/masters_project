@@ -454,3 +454,590 @@ class TestEdgeCases:
             for i in range(2):
                 assert not np.any(np.isnan(traces[i])), f"NaN in neuron {i}"
                 assert not np.any(np.isinf(traces[i])), f"Inf in neuron {i}"
+
+
+# =============================================================================
+# Delay Test Utilities
+# =============================================================================
+
+# Biologically realistic pathway delays from task3.md
+DELAY_STN_GPE = 2.0    # ms
+DELAY_STN_GPI = 1.5    # ms
+DELAY_GPE_STN = 4.0    # ms
+DELAY_GPE_GPI = 3.0    # ms
+DELAY_GPI_TH  = 5.0    # ms
+DELAY_COR_STN = 5.9    # ms
+DELAY_TH_COR  = 5.0    # ms
+
+
+def _find_first_spike_time(trace, dt, threshold=0.0):
+    """
+    Find the time (in ms) of the first upward threshold crossing in the trace.
+    Returns None if no spike is found.
+    """
+    trace = np.asarray(trace)
+    for i in range(1, len(trace)):
+        if trace[i] > threshold and trace[i - 1] <= threshold:
+            return i * dt
+    return None
+
+
+# =============================================================================
+# Test Class: Synaptic Delay - Creation and Properties
+# =============================================================================
+
+class TestSynapticDelayProperties:
+    """Tests for delay parameter storage and access."""
+
+    def test_exponential_delay_stored(self):
+        """Delay should be stored and retrievable on ExponentialSynapse."""
+        net = Network(2)
+        net.add_synapse(0, 1, WEIGHT, E_SYN_EXC, TAU, delay=3.0)
+        syn = net.synapse(0)
+        assert syn.delay == pytest.approx(3.0)
+
+    def test_alpha_delay_stored(self):
+        """Delay should be stored and retrievable on AlphaSynapse."""
+        net = Network(2)
+        net.add_alpha_synapse(0, 1, WEIGHT, E_SYN_EXC, TAU, delay=4.0)
+        syn = net.synapse(0)
+        assert syn.delay == pytest.approx(4.0)
+
+    def test_double_exp_delay_stored(self):
+        """Delay should be stored and retrievable on DoubleExponentialSynapse."""
+        net = Network(2)
+        net.add_double_exp_synapse(0, 1, WEIGHT, E_SYN_EXC, TAU_RISE, TAU_DECAY, delay=5.9)
+        syn = net.synapse(0)
+        assert syn.delay == pytest.approx(5.9)
+
+    def test_default_delay_is_zero(self):
+        """When delay is not specified, it should default to 0."""
+        net = Network(2)
+        net.add_synapse(0, 1, WEIGHT)
+        assert net.synapse(0).delay == pytest.approx(0.0)
+
+        net.add_alpha_synapse(0, 1, WEIGHT)
+        assert net.synapse(1).delay == pytest.approx(0.0)
+
+        net.add_double_exp_synapse(0, 1, WEIGHT)
+        assert net.synapse(2).delay == pytest.approx(0.0)
+
+    def test_mixed_delays(self):
+        """Multiple synapses with different delays should each store correctly."""
+        net = Network(3)
+        net.add_synapse(0, 1, WEIGHT, delay=2.0)
+        net.add_alpha_synapse(1, 2, WEIGHT, delay=4.0)
+        net.add_double_exp_synapse(0, 2, WEIGHT, delay=5.9)
+
+        assert net.synapse(0).delay == pytest.approx(2.0)
+        assert net.synapse(1).delay == pytest.approx(4.0)
+        assert net.synapse(2).delay == pytest.approx(5.9)
+
+
+# =============================================================================
+# Test Class: Synaptic Delay - Backward Compatibility
+# =============================================================================
+
+class TestSynapticDelayBackwardCompat:
+    """Verify that delay=0 produces identical behavior to the old code."""
+
+    def test_zero_delay_matches_no_delay(self):
+        """Explicit delay=0 should produce identical traces to omitting delay."""
+        duration = 200.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        # Without delay arg (uses default)
+        net1 = Network(2)
+        net1.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU)
+        traces1 = net1.simulate(duration, dt, I_ext)
+
+        # With explicit delay=0
+        net2 = Network(2)
+        net2.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=0.0)
+        traces2 = net2.simulate(duration, dt, I_ext)
+
+        for i in range(2):
+            np.testing.assert_array_almost_equal(
+                traces1[i], traces2[i], decimal=10,
+                err_msg=f"Neuron {i}: delay=0 should match no-delay default"
+            )
+
+    def test_zero_delay_all_types(self):
+        """delay=0 should match default for all synapse types."""
+        duration = 200.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        for add_default, add_explicit in [
+            (lambda n: n.add_synapse(0, 1, WEIGHT_STRONG),
+             lambda n: n.add_synapse(0, 1, WEIGHT_STRONG, delay=0.0)),
+            (lambda n: n.add_alpha_synapse(0, 1, WEIGHT_STRONG),
+             lambda n: n.add_alpha_synapse(0, 1, WEIGHT_STRONG, delay=0.0)),
+            (lambda n: n.add_double_exp_synapse(0, 1, WEIGHT_STRONG),
+             lambda n: n.add_double_exp_synapse(0, 1, WEIGHT_STRONG, delay=0.0)),
+        ]:
+            net1 = Network(2)
+            add_default(net1)
+            t1 = net1.simulate(duration, dt, I_ext)
+
+            net2 = Network(2)
+            add_explicit(net2)
+            t2 = net2.simulate(duration, dt, I_ext)
+
+            np.testing.assert_array_almost_equal(
+                t1[1], t2[1], decimal=10,
+                err_msg="delay=0 should match default for all synapse types"
+            )
+
+
+# =============================================================================
+# Test Class: Synaptic Delay - Functional Behavior
+# =============================================================================
+
+class TestSynapticDelayBehavior:
+    """Tests verifying that delays actually delay spike propagation.
+
+    Strategy: compare the first spike time of the postsynaptic neuron
+    between delayed and non-delayed networks. This avoids fragile
+    voltage-onset heuristics and relies on unambiguous spike detection.
+    """
+
+    def _make_two_neuron_input(self, duration, dt):
+        """Constant drive to neuron 0, nothing to neuron 1."""
+        num_steps = int(duration / dt)
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+        return I_ext
+
+    def test_delay_postpones_first_postsynaptic_spike(self):
+        """First postsynaptic spike should arrive later with delay > 0."""
+        duration = 200.0
+        dt = 0.01
+        I_ext = self._make_two_neuron_input(duration, dt)
+
+        net0 = Network(2)
+        net0.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=0.0)
+        traces0 = net0.simulate(duration, dt, I_ext)
+
+        net5 = Network(2)
+        net5.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=5.0)
+        traces5 = net5.simulate(duration, dt, I_ext)
+
+        t0 = _find_first_spike_time(traces0[1], dt)
+        t5 = _find_first_spike_time(traces5[1], dt)
+
+        assert t0 is not None, "No-delay: neuron 1 should spike"
+        assert t5 is not None, "Delayed: neuron 1 should spike"
+        assert t5 > t0, \
+            f"Delayed first spike ({t5:.2f} ms) should be later than no-delay ({t0:.2f} ms)"
+
+    def test_delay_accuracy(self):
+        """Difference in first postsynaptic spike times should match the delay."""
+        duration = 200.0
+        dt = 0.01
+        delay_ms = 5.0
+        I_ext = self._make_two_neuron_input(duration, dt)
+
+        net0 = Network(2)
+        net0.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=0.0)
+        traces0 = net0.simulate(duration, dt, I_ext)
+
+        net_d = Network(2)
+        net_d.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=delay_ms)
+        traces_d = net_d.simulate(duration, dt, I_ext)
+
+        t0 = _find_first_spike_time(traces0[1], dt)
+        td = _find_first_spike_time(traces_d[1], dt)
+
+        assert t0 is not None and td is not None
+        measured_delay = td - t0
+        assert abs(measured_delay - delay_ms) < 1.5, \
+            f"Measured delay {measured_delay:.2f} ms should be ~{delay_ms} ms"
+
+    def test_delay_with_alpha_synapse(self):
+        """Delay should postpone first postsynaptic spike with alpha synapses."""
+        duration = 200.0
+        dt = 0.01
+        I_ext = self._make_two_neuron_input(duration, dt)
+
+        net0 = Network(2)
+        net0.add_alpha_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=0.0)
+        traces0 = net0.simulate(duration, dt, I_ext)
+
+        net_d = Network(2)
+        net_d.add_alpha_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=5.0)
+        traces_d = net_d.simulate(duration, dt, I_ext)
+
+        t0 = _find_first_spike_time(traces0[1], dt)
+        td = _find_first_spike_time(traces_d[1], dt)
+
+        assert t0 is not None and td is not None
+        assert td > t0, "Alpha synapse delay should postpone first spike"
+
+    def test_delay_with_double_exp_synapse(self):
+        """Delay should postpone first postsynaptic spike with double-exp synapses."""
+        duration = 200.0
+        dt = 0.01
+        I_ext = self._make_two_neuron_input(duration, dt)
+
+        net0 = Network(2)
+        net0.add_double_exp_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC,
+                                    TAU_RISE, TAU_DECAY, delay=0.0)
+        traces0 = net0.simulate(duration, dt, I_ext)
+
+        net_d = Network(2)
+        net_d.add_double_exp_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC,
+                                     TAU_RISE, TAU_DECAY, delay=5.0)
+        traces_d = net_d.simulate(duration, dt, I_ext)
+
+        t0 = _find_first_spike_time(traces0[1], dt)
+        td = _find_first_spike_time(traces_d[1], dt)
+
+        assert t0 is not None and td is not None
+        assert td > t0, "Double-exp synapse delay should postpone first spike"
+
+    def test_longer_delay_means_later_first_spike(self):
+        """Increasing delay should monotonically increase first spike time."""
+        duration = 300.0
+        dt = 0.01
+        I_ext = self._make_two_neuron_input(duration, dt)
+
+        spike_times = []
+        for delay in [0.0, 2.0, 5.0]:
+            net = Network(2)
+            net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=delay)
+            traces = net.simulate(duration, dt, I_ext)
+            t = _find_first_spike_time(traces[1], dt)
+            assert t is not None, f"Neuron 1 should spike with delay={delay}"
+            spike_times.append(t)
+
+        assert spike_times[0] < spike_times[1] < spike_times[2], \
+            f"First spike times {spike_times} should be strictly increasing with delay"
+
+    def test_inhibitory_with_delay(self):
+        """Delay should also work with inhibitory (E_syn=-80) synapses."""
+        duration = 200.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+        I_ext[1, :] = 10.0  # drive postsynaptic so inhibition is visible
+
+        # Inhibitory with delay
+        net = Network(2)
+        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_INH, 5.0, delay=4.0)
+        traces = net.simulate(duration, dt, I_ext)
+
+        # Inhibitory without delay
+        net_nodelay = Network(2)
+        net_nodelay.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_INH, 5.0, delay=0.0)
+        traces_nodelay = net_nodelay.simulate(duration, dt, I_ext)
+
+        # Control: no synapse at all
+        ctrl = Network(2).simulate(duration, dt, I_ext)
+
+        # Both inhibitory networks should reduce mean voltage compared to ctrl
+        ctrl_mean = get_mean_voltage(ctrl[1])
+        assert get_mean_voltage(traces[1]) < ctrl_mean, \
+            "Inhibitory synapse with delay should still inhibit"
+        assert get_mean_voltage(traces_nodelay[1]) < ctrl_mean, \
+            "Inhibitory synapse without delay should inhibit"
+
+
+# =============================================================================
+# Test Class: Synaptic Delay - Chain Propagation
+# =============================================================================
+
+class TestSynapticDelayChains:
+    """Tests for delays accumulating through multi-neuron chains."""
+
+    def test_delay_chain_accumulates(self):
+        """Delays through a chain should add up."""
+        duration = 500.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+        delay_per_hop = 3.0
+
+        I_ext = np.zeros((3, num_steps))
+        I_ext[0, :] = 15.0
+
+        # Chain with delays: 0 --3ms--> 1 --3ms--> 2
+        net = Network(3)
+        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=delay_per_hop)
+        net.add_synapse(1, 2, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=delay_per_hop)
+        traces = net.simulate(duration, dt, I_ext)
+
+        # Chain without delays
+        net0 = Network(3)
+        net0.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=0.0)
+        net0.add_synapse(1, 2, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=0.0)
+        traces0 = net0.simulate(duration, dt, I_ext)
+
+        # Neuron 2 first spike: delayed chain should be later
+        t2_nodelay = _find_first_spike_time(traces0[2], dt)
+        t2_delay = _find_first_spike_time(traces[2], dt)
+
+        assert t2_nodelay is not None and t2_delay is not None
+        assert t2_delay > t2_nodelay, \
+            f"Chain delay first spike ({t2_delay:.1f}) should be later than no-delay ({t2_nodelay:.1f})"
+
+    def test_chain_with_mixed_delays(self):
+        """Different delays on different hops should all contribute."""
+        duration = 500.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((3, num_steps))
+        I_ext[0, :] = 15.0
+
+        # 0 --2ms--> 1 --4ms--> 2  (total ~6ms extra)
+        net = Network(3)
+        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=2.0)
+        net.add_synapse(1, 2, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=4.0)
+        traces = net.simulate(duration, dt, I_ext)
+
+        # Same chain with uniform 3ms each (total ~6ms extra)
+        net_uni = Network(3)
+        net_uni.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=3.0)
+        net_uni.add_synapse(1, 2, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=3.0)
+        traces_uni = net_uni.simulate(duration, dt, I_ext)
+
+        t_mixed = _find_first_spike_time(traces[2], dt)
+        t_uni = _find_first_spike_time(traces_uni[2], dt)
+
+        assert t_mixed is not None and t_uni is not None
+        # Both have ~6ms total delay; first spike should be at similar times
+        assert abs(t_mixed - t_uni) < 5.0, \
+            f"Mixed delays (2+4={t_mixed:.1f}ms) and uniform (3+3={t_uni:.1f}ms) " \
+            f"should produce similar total delay"
+
+    def test_biologically_realistic_pathway_delays(self):
+        """Cortex->STN->GPe chain with realistic delays should propagate."""
+        duration = 200.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((3, num_steps))
+        I_ext[0, :] = 15.0  # drive "cortex"
+
+        # Cortex -> STN (5.9ms) -> GPe (2.0ms)
+        net = Network(3)
+        net.add_double_exp_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC,
+                                   0.5, 2.49, delay=DELAY_COR_STN)
+        net.add_double_exp_synapse(1, 2, WEIGHT_STRONG, E_SYN_EXC,
+                                   0.4, 2.5, delay=DELAY_STN_GPE)
+        traces = net.simulate(duration, dt, I_ext)
+
+        # All neurons should eventually spike
+        assert count_spikes(traces[0]) > 0, "Cortex should spike"
+        assert count_spikes(traces[1]) > 0, "STN should spike"
+        assert count_spikes(traces[2]) > 0, "GPe should spike"
+
+        # No NaN/Inf
+        for i in range(3):
+            assert not np.any(np.isnan(traces[i])), f"NaN in neuron {i}"
+            assert not np.any(np.isinf(traces[i])), f"Inf in neuron {i}"
+
+
+# =============================================================================
+# Test Class: Synaptic Delay - Reset Behavior
+# =============================================================================
+
+class TestSynapticDelayReset:
+    """Tests that reset properly clears delay buffers."""
+
+    def test_reset_with_delay_reproduces_traces(self):
+        """After reset, a delayed network should produce identical traces."""
+        duration = 200.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        net = Network(2)
+        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=5.0)
+
+        traces1 = net.simulate(duration, dt, I_ext)
+        net.reset()
+        traces2 = net.simulate(duration, dt, I_ext)
+
+        for i in range(2):
+            np.testing.assert_array_almost_equal(
+                traces1[i], traces2[i], decimal=5,
+                err_msg=f"Neuron {i}: reset should reproduce identical traces with delay"
+            )
+
+    def test_reset_all_synapse_types_with_delay(self):
+        """Reset should work for all synapse types when they have delays."""
+        duration = 200.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((4, num_steps))
+        I_ext[0, :] = 15.0
+
+        net = Network(4)
+        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=2.0)
+        net.add_alpha_synapse(0, 2, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=4.0)
+        net.add_double_exp_synapse(0, 3, WEIGHT_STRONG, E_SYN_EXC,
+                                   TAU_RISE, TAU_DECAY, delay=5.0)
+
+        traces1 = net.simulate(duration, dt, I_ext)
+        net.reset()
+        traces2 = net.simulate(duration, dt, I_ext)
+
+        for i in range(4):
+            np.testing.assert_array_almost_equal(
+                traces1[i], traces2[i], decimal=5,
+                err_msg=f"Neuron {i}: reset with mixed delays should reproduce traces"
+            )
+
+    def test_reset_clears_buffered_spikes(self):
+        """Reset mid-simulation should not leak spikes from the previous run."""
+        duration = 50.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        # First run: drive neuron 0 hard so it spikes
+        I_ext_active = np.zeros((2, num_steps))
+        I_ext_active[0, :] = 15.0
+
+        net = Network(2)
+        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=3.0)
+        net.simulate(duration, dt, I_ext_active)
+
+        net.reset()
+
+        # Second run: no input at all
+        I_ext_silent = np.zeros((2, num_steps))
+        traces = net.simulate(duration, dt, I_ext_silent)
+
+        # Neuron 1 should NOT spike — no leaked spikes from first run
+        assert count_spikes(traces[1]) == 0, \
+            "After reset, buffered spikes should be cleared"
+
+
+# =============================================================================
+# Test Class: Synaptic Delay - Numerical Stability
+# =============================================================================
+
+class TestSynapticDelayStability:
+    """Stability tests for delayed synapses."""
+
+    def test_long_simulation_with_delay(self):
+        """Delayed synapses should remain stable over long simulations."""
+        duration = 1000.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        for add_fn in [
+            lambda n: n.add_synapse(0, 1, WEIGHT, delay=5.0),
+            lambda n: n.add_alpha_synapse(0, 1, WEIGHT, delay=5.0),
+            lambda n: n.add_double_exp_synapse(0, 1, WEIGHT, delay=5.0),
+        ]:
+            net = Network(2)
+            add_fn(net)
+            traces = net.simulate(duration, dt, I_ext)
+
+            for i in range(2):
+                assert not np.any(np.isnan(traces[i])), f"NaN in neuron {i}"
+                assert not np.any(np.isinf(traces[i])), f"Inf in neuron {i}"
+
+    def test_large_delay_stability(self):
+        """Even large delays (like TH->Cortex 5ms, Cortex->STN 5.9ms) should be stable."""
+        duration = 500.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        for delay in [DELAY_TH_COR, DELAY_COR_STN, DELAY_GPI_TH]:
+            net = Network(2)
+            net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=delay)
+            traces = net.simulate(duration, dt, I_ext)
+
+            for i in range(2):
+                assert not np.any(np.isnan(traces[i])), \
+                    f"NaN with delay={delay} in neuron {i}"
+                assert not np.any(np.isinf(traces[i])), \
+                    f"Inf with delay={delay} in neuron {i}"
+
+    def test_many_synapses_with_delays(self):
+        """A convergent network with many delayed synapses should be stable."""
+        n_pre = 10
+        net = Network(n_pre + 1)  # n_pre presynaptic + 1 postsynaptic
+
+        for i in range(n_pre):
+            net.add_synapse(i, n_pre, WEIGHT, E_SYN_EXC, TAU, delay=float(i + 1))
+
+        duration = 300.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((n_pre + 1, num_steps))
+        for i in range(n_pre):
+            I_ext[i, :] = 15.0
+
+        traces = net.simulate(duration, dt, I_ext)
+
+        for i in range(n_pre + 1):
+            assert not np.any(np.isnan(traces[i])), f"NaN in neuron {i}"
+            assert not np.any(np.isinf(traces[i])), f"Inf in neuron {i}"
+
+        # The postsynaptic neuron should fire (lots of excitatory input)
+        assert count_spikes(traces[n_pre]) > 0, \
+            "Postsynaptic neuron should spike with convergent delayed input"
+
+    def test_small_dt_with_delay(self):
+        """Delay should work correctly with very small dt (high resolution)."""
+        duration = 50.0
+        dt = 0.001  # 1 us steps
+        num_steps = int(duration / dt)
+        delay = 2.0
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        net = Network(2)
+        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=delay)
+        traces = net.simulate(duration, dt, I_ext)
+
+        assert not np.any(np.isnan(traces[1])), "No NaN with small dt"
+        assert not np.any(np.isinf(traces[1])), "No Inf with small dt"
+
+    def test_delay_smaller_than_dt(self):
+        """When delay < dt, it should effectively round to 0 (pass-through)."""
+        duration = 100.0
+        dt = 0.5  # large dt
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        # delay=0.1 ms < dt=0.5 ms → rounds to 0 steps
+        net = Network(2)
+        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=0.1)
+        traces_tiny = net.simulate(duration, dt, I_ext)
+
+        net0 = Network(2)
+        net0.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXC, TAU, delay=0.0)
+        traces_zero = net0.simulate(duration, dt, I_ext)
+
+        # Should behave identically since delay rounds to 0 steps
+        np.testing.assert_array_almost_equal(
+            traces_tiny[1], traces_zero[1], decimal=5,
+            err_msg="Sub-dt delay should behave as zero delay"
+        )

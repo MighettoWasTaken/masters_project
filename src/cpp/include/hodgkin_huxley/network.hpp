@@ -59,12 +59,15 @@ public:
 
     // Add synaptic connections
     void add_synapse(size_t pre_idx, size_t post_idx, double weight,
-                     double E_syn = 0.0, double tau = 2.0);
+                     double E_syn = 0.0, double tau = 2.0,
+                     double delay = 0.0);
     void add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
-                           double E_syn = 0.0, double tau = 2.0);
+                           double E_syn = 0.0, double tau = 2.0,
+                           double delay = 0.0);
     void add_double_exp_synapse(size_t pre_idx, size_t post_idx, double weight,
                                 double E_syn = 0.0,
-                                double tau_rise = 0.4, double tau_decay = 2.5);
+                                double tau_rise = 0.4, double tau_decay = 2.5,
+                                double delay = 0.0);
 
     // Getters
     [[nodiscard]] size_t num_neurons() const { return neurons_.size(); }

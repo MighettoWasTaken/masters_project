@@ -10,7 +10,8 @@ namespace hodgkin_huxley {
 class ExponentialSynapse : public SynapseBase {
 public:
     ExponentialSynapse(size_t pre_idx, size_t post_idx, double weight,
-                       double E_syn = 0.0, double tau = 2.0);
+                       double E_syn = 0.0, double tau = 2.0,
+                       double delay = 0.0);
 
     void update(double dt, bool spiked) override;
     void reset() override;
@@ -34,7 +35,8 @@ private:
 class AlphaSynapse : public SynapseBase {
 public:
     AlphaSynapse(size_t pre_idx, size_t post_idx, double weight,
-                 double E_syn = 0.0, double tau = 2.0);
+                 double E_syn = 0.0, double tau = 2.0,
+                 double delay = 0.0);
 
     void update(double dt, bool spiked) override;
     void reset() override;
@@ -58,7 +60,8 @@ class DoubleExponentialSynapse : public SynapseBase {
 public:
     DoubleExponentialSynapse(size_t pre_idx, size_t post_idx, double weight,
                              double E_syn = 0.0,
-                             double tau_rise = 0.4, double tau_decay = 2.5);
+                             double tau_rise = 0.4, double tau_decay = 2.5,
+                             double delay = 0.0);
 
     void update(double dt, bool spiked) override;
     void reset() override;

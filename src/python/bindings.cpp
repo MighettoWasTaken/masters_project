@@ -166,11 +166,13 @@ PYBIND11_MODULE(_core, m) {
         .def_property_readonly("weight", &SynapseBase::weight, "Synaptic weight")
         .def_property_readonly("pre_idx", &SynapseBase::pre_idx, "Pre-synaptic neuron index")
         .def_property_readonly("post_idx", &SynapseBase::post_idx, "Post-synaptic neuron index")
+        .def_property_readonly("delay", &SynapseBase::delay, "Axonal conduction delay (ms)")
         .def("type_name", &SynapseBase::type_name, "Get synapse type name")
         .def("__repr__", [](const SynapseBase& s) {
             return "<" + s.type_name() + "Synapse " +
                    std::to_string(s.pre_idx()) + "->" + std::to_string(s.post_idx()) +
-                   " w=" + std::to_string(s.weight()) + ">";
+                   " w=" + std::to_string(s.weight()) +
+                   " delay=" + std::to_string(s.delay()) + ">";
         });
 
     py::class_<ExponentialSynapse, SynapseBase>(m, "ExponentialSynapse")
@@ -243,15 +245,18 @@ PYBIND11_MODULE(_core, m) {
         .def("add_synapse", &Network::add_synapse,
              "Add an exponential synapse between neurons",
              py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
-             py::arg("E_syn") = 0.0, py::arg("tau") = 2.0)
+             py::arg("E_syn") = 0.0, py::arg("tau") = 2.0,
+             py::arg("delay") = 0.0)
         .def("add_alpha_synapse", &Network::add_alpha_synapse,
              "Add an alpha-function synapse between neurons",
              py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
-             py::arg("E_syn") = 0.0, py::arg("tau") = 2.0)
+             py::arg("E_syn") = 0.0, py::arg("tau") = 2.0,
+             py::arg("delay") = 0.0)
         .def("add_double_exp_synapse", &Network::add_double_exp_synapse,
              "Add a double-exponential synapse between neurons",
              py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
-             py::arg("E_syn") = 0.0, py::arg("tau_rise") = 0.4, py::arg("tau_decay") = 2.5)
+             py::arg("E_syn") = 0.0, py::arg("tau_rise") = 0.4, py::arg("tau_decay") = 2.5,
+             py::arg("delay") = 0.0)
 
         // Properties
         .def_property_readonly("num_neurons", &Network::num_neurons)

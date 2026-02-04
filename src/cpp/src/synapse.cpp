@@ -9,7 +9,8 @@ namespace hodgkin_huxley {
 // =============================================================================
 
 ExponentialSynapse::ExponentialSynapse(size_t pre_idx, size_t post_idx,
-                                       double weight, double E_syn, double tau)
+                                       double weight, double E_syn, double tau,
+                                       double delay)
     : tau_(tau)
 {
     pre_idx_ = pre_idx;
@@ -17,6 +18,7 @@ ExponentialSynapse::ExponentialSynapse(size_t pre_idx, size_t post_idx,
     weight_ = weight;
     E_syn_ = E_syn;
     g_ = 0.0;
+    delay_ = delay;
 }
 
 void ExponentialSynapse::update(double dt, bool spiked) {
@@ -35,7 +37,8 @@ void ExponentialSynapse::reset() {
 // =============================================================================
 
 AlphaSynapse::AlphaSynapse(size_t pre_idx, size_t post_idx,
-                           double weight, double E_syn, double tau)
+                           double weight, double E_syn, double tau,
+                           double delay)
     : tau_(tau), x_(0.0)
 {
     pre_idx_ = pre_idx;
@@ -43,6 +46,7 @@ AlphaSynapse::AlphaSynapse(size_t pre_idx, size_t post_idx,
     weight_ = weight;
     E_syn_ = E_syn;
     g_ = 0.0;
+    delay_ = delay;
 }
 
 void AlphaSynapse::update(double dt, bool spiked) {
@@ -71,7 +75,8 @@ void AlphaSynapse::reset() {
 DoubleExponentialSynapse::DoubleExponentialSynapse(
     size_t pre_idx, size_t post_idx,
     double weight, double E_syn,
-    double tau_rise, double tau_decay)
+    double tau_rise, double tau_decay,
+    double delay)
     : tau_rise_(tau_rise), tau_decay_(tau_decay),
       g_rise_(0.0), g_decay_(0.0)
 {
@@ -85,6 +90,7 @@ DoubleExponentialSynapse::DoubleExponentialSynapse(
     weight_ = weight;
     E_syn_ = E_syn;
     g_ = 0.0;
+    delay_ = delay;
 
     // Normalization so peak conductance = weight
     double t_peak = (tau_decay_ * tau_rise_) / (tau_decay_ - tau_rise_)
