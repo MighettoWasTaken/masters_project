@@ -84,6 +84,7 @@ public:
     [[nodiscard]] size_t pre_idx() const { return pre_idx_; }
     [[nodiscard]] size_t post_idx() const { return post_idx_; }
     [[nodiscard]] double delay() const { return delay_; }
+    void set_conductance(double g) { g_ = g; }
 
 protected:
     size_t pre_idx_ = 0;

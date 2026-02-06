@@ -1,7 +1,13 @@
 #include "hodgkin_huxley/network.hpp"
 #include <stdexcept>
+#include <cmath>
+#include <algorithm>
 
 namespace hodgkin_huxley {
+
+// =============================================================================
+// Constructors
+// =============================================================================
 
 Network::Network(size_t num_neurons) {
     neurons_.reserve(num_neurons);
@@ -16,6 +22,10 @@ Network::Network(size_t num_neurons, NeuronType type) {
         add_neuron(type);
     }
 }
+
+// =============================================================================
+// Add neurons (unchanged)
+// =============================================================================
 
 size_t Network::add_neuron() {
     neurons_.push_back(std::make_unique<HHNeuron>());
@@ -73,6 +83,10 @@ size_t Network::add_izhikevich_neuron(const IzhikevichNeuron::Parameters& params
     return neurons_.size() - 1;
 }
 
+// =============================================================================
+// Neuron accessors (unchanged)
+// =============================================================================
+
 const HHNeuron& Network::hh_neuron(size_t idx) const {
     if (idx >= neurons_.size()) {
         throw std::out_of_range("Neuron index out of range");
@@ -117,14 +131,50 @@ IzhikevichNeuron& Network::iz_neuron(size_t idx) {
     return *iz;
 }
 
+// =============================================================================
+// Synapse accessor with lazy sync
+// =============================================================================
+
+const SynapseBase& Network::synapse(size_t idx) const {
+    if (soa_dirty_) sync_soa_to_objects();
+    return *synapses_[idx];
+}
+
+// =============================================================================
+// Add synapses — populate both API objects and SoA arrays
+// =============================================================================
+
 void Network::add_synapse(size_t pre_idx, size_t post_idx, double weight,
                           double E_syn, double tau, double delay) {
     if (pre_idx >= neurons_.size() || post_idx >= neurons_.size()) {
         throw std::out_of_range("Neuron index out of range");
     }
+
+    // API object
     synapses_.push_back(
         std::make_unique<ExponentialSynapse>(pre_idx, post_idx, weight, E_syn, tau, delay));
-    V_pre_prev_.push_back(neurons_[pre_idx]->membrane_potential());
+
+    // SoA common
+    sa_.pre.push_back(pre_idx);
+    sa_.post.push_back(post_idx);
+    sa_.weight.push_back(weight);
+    sa_.E_syn.push_back(E_syn);
+    sa_.g.push_back(0.0);
+    sa_.type.push_back(SYN_EXP);
+    sa_.V_pre_prev.push_back(neurons_[pre_idx]->membrane_potential());
+    sa_.delay.push_back(delay);
+    sa_.spike_buf.emplace_back();
+    sa_.buf_head.push_back(0);
+    sa_.delay_init.push_back(false);
+
+    // Type-specific defaults
+    sa_.push_type_defaults();
+
+    // Overwrite exp-specific
+    sa_.exp_tau.back() = tau;
+
+    // Invalidate cached decay factors
+    sa_.cached_dt = -1.0;
 }
 
 void Network::add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
@@ -132,9 +182,28 @@ void Network::add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
     if (pre_idx >= neurons_.size() || post_idx >= neurons_.size()) {
         throw std::out_of_range("Neuron index out of range");
     }
+
     synapses_.push_back(
         std::make_unique<AlphaSynapse>(pre_idx, post_idx, weight, E_syn, tau, delay));
-    V_pre_prev_.push_back(neurons_[pre_idx]->membrane_potential());
+
+    sa_.pre.push_back(pre_idx);
+    sa_.post.push_back(post_idx);
+    sa_.weight.push_back(weight);
+    sa_.E_syn.push_back(E_syn);
+    sa_.g.push_back(0.0);
+    sa_.type.push_back(SYN_ALPHA);
+    sa_.V_pre_prev.push_back(neurons_[pre_idx]->membrane_potential());
+    sa_.delay.push_back(delay);
+    sa_.spike_buf.emplace_back();
+    sa_.buf_head.push_back(0);
+    sa_.delay_init.push_back(false);
+
+    sa_.push_type_defaults();
+
+    // Overwrite alpha-specific
+    sa_.alpha_inv_tau.back() = 1.0 / tau;
+
+    sa_.cached_dt = -1.0;
 }
 
 void Network::add_double_exp_synapse(size_t pre_idx, size_t post_idx, double weight,
@@ -143,11 +212,42 @@ void Network::add_double_exp_synapse(size_t pre_idx, size_t post_idx, double wei
     if (pre_idx >= neurons_.size() || post_idx >= neurons_.size()) {
         throw std::out_of_range("Neuron index out of range");
     }
+
+    // API object (validates tau_rise < tau_decay)
     synapses_.push_back(
         std::make_unique<DoubleExponentialSynapse>(
             pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay, delay));
-    V_pre_prev_.push_back(neurons_[pre_idx]->membrane_potential());
+
+    sa_.pre.push_back(pre_idx);
+    sa_.post.push_back(post_idx);
+    sa_.weight.push_back(weight);
+    sa_.E_syn.push_back(E_syn);
+    sa_.g.push_back(0.0);
+    sa_.type.push_back(SYN_DEXP);
+    sa_.V_pre_prev.push_back(neurons_[pre_idx]->membrane_potential());
+    sa_.delay.push_back(delay);
+    sa_.spike_buf.emplace_back();
+    sa_.buf_head.push_back(0);
+    sa_.delay_init.push_back(false);
+
+    sa_.push_type_defaults();
+
+    // Overwrite dexp-specific
+    sa_.dexp_tau_rise.back() = tau_rise;
+    sa_.dexp_tau_decay.back() = tau_decay;
+
+    // Normalization factor so peak conductance = weight
+    double t_peak = (tau_decay * tau_rise) / (tau_decay - tau_rise)
+                    * std::log(tau_decay / tau_rise);
+    double peak_val = std::exp(-t_peak / tau_decay) - std::exp(-t_peak / tau_rise);
+    sa_.dexp_norm.back() = 1.0 / peak_val;
+
+    sa_.cached_dt = -1.0;
 }
+
+// =============================================================================
+// Utility methods
+// =============================================================================
 
 std::vector<double> Network::get_potentials() const {
     std::vector<double> potentials;
@@ -158,63 +258,203 @@ std::vector<double> Network::get_potentials() const {
     return potentials;
 }
 
+void Network::ensure_buffers() {
+    size_t n = neurons_.size();
+    if (I_syn_buffer_.size() != n) {
+        I_syn_buffer_.resize(n, 0.0);
+        V_cache_.resize(n, 0.0);
+    }
+}
+
+void Network::cache_voltages() {
+    for (size_t i = 0; i < neurons_.size(); ++i) {
+        V_cache_[i] = neurons_[i]->membrane_potential();
+    }
+}
+
+void Network::sync_soa_to_objects() const {
+    for (size_t i = 0; i < synapses_.size(); ++i) {
+        synapses_[i]->set_conductance(sa_.g[i]);
+    }
+    soa_dirty_ = false;
+}
+
+// =============================================================================
+// Reset
+// =============================================================================
+
 void Network::reset() {
     for (auto& neuron : neurons_) {
         neuron->reset();
     }
-    for (size_t i = 0; i < synapses_.size(); ++i) {
-        synapses_[i]->reset();
-        synapses_[i]->reset_delay_buffer();
-        V_pre_prev_[i] = neurons_[synapses_[i]->pre_idx()]->membrane_potential();
+
+    const size_t S = sa_.size();
+
+    // Reset SoA mutable state
+    std::fill(sa_.g.begin(), sa_.g.end(), 0.0);
+    std::fill(sa_.alpha_x.begin(), sa_.alpha_x.end(), 0.0);
+    std::fill(sa_.dexp_g_rise.begin(), sa_.dexp_g_rise.end(), 0.0);
+    std::fill(sa_.dexp_g_decay.begin(), sa_.dexp_g_decay.end(), 0.0);
+
+    for (size_t i = 0; i < S; ++i) {
+        sa_.V_pre_prev[i] = neurons_[sa_.pre[i]]->membrane_potential();
+        if (sa_.delay_init[i]) {
+            std::fill(sa_.spike_buf[i].begin(), sa_.spike_buf[i].end(), false);
+            sa_.buf_head[i] = 0;
+        }
+    }
+    sa_.cached_dt = -1.0;
+
+    // Reset API objects
+    for (auto& syn : synapses_) {
+        syn->reset();
+        syn->reset_delay_buffer();
+    }
+
+    soa_dirty_ = false;
+}
+
+// =============================================================================
+// Decay factor caching (called once when dt changes)
+// =============================================================================
+
+void Network::update_decay_factors(double dt) {
+    if (dt == sa_.cached_dt) return;
+
+    const size_t S = sa_.size();
+    for (size_t i = 0; i < S; ++i) {
+        switch (sa_.type[i]) {
+            case SYN_EXP:
+                sa_.exp_decay[i] = std::exp(-dt / sa_.exp_tau[i]);
+                break;
+            case SYN_DEXP:
+                sa_.dexp_rise_decay[i] = std::exp(-dt / sa_.dexp_tau_rise[i]);
+                sa_.dexp_fall_decay[i] = std::exp(-dt / sa_.dexp_tau_decay[i]);
+                break;
+            default:
+                break;
+        }
+    }
+    sa_.cached_dt = dt;
+}
+
+// =============================================================================
+// Synaptic current computation (SoA — contiguous, cache-friendly)
+// =============================================================================
+
+void Network::compute_synaptic_currents() {
+    std::fill(I_syn_buffer_.begin(), I_syn_buffer_.end(), 0.0);
+
+    const size_t S = sa_.size();
+    const double* g = sa_.g.data();
+    const double* E_syn = sa_.E_syn.data();
+    const size_t* post = sa_.post.data();
+    const double* V = V_cache_.data();
+    double* I_syn = I_syn_buffer_.data();
+
+    for (size_t i = 0; i < S; ++i) {
+        I_syn[post[i]] += g[i] * (E_syn[i] - V[post[i]]);
     }
 }
 
-std::vector<double> Network::compute_synaptic_currents() const {
-    std::vector<double> currents(neurons_.size(), 0.0);
-
-    for (const auto& syn : synapses_) {
-        double V_post = neurons_[syn->post_idx()]->membrane_potential();
-        double I_syn = syn->conductance() * (syn->reversal_potential() - V_post);
-        currents[syn->post_idx()] += I_syn;
-    }
-
-    return currents;
-}
+// =============================================================================
+// Synapse state update (SoA — spike detection + type-specific kinetics)
+// =============================================================================
 
 void Network::update_synapses(double dt) {
-    const double spike_threshold = 0.0;  // mV
+    update_decay_factors(dt);
 
-    for (size_t i = 0; i < synapses_.size(); ++i) {
-        double V_pre = neurons_[synapses_[i]->pre_idx()]->membrane_potential();
+    const size_t S = sa_.size();
+    const double spike_threshold = 0.0;
+    static constexpr double E_CONST = 2.718281828459045;
 
-        // Detect spike as upward threshold crossing (rising edge only)
-        bool spiked = (V_pre > spike_threshold && V_pre_prev_[i] <= spike_threshold);
-        V_pre_prev_[i] = V_pre;
+    for (size_t i = 0; i < S; ++i) {
+        // Spike detection using cached voltages
+        double V_pre = V_cache_[sa_.pre[i]];
+        bool spiked = (V_pre > spike_threshold) && (sa_.V_pre_prev[i] <= spike_threshold);
+        sa_.V_pre_prev[i] = V_pre;
 
-        // Route through delay buffer (pass-through when delay == 0)
-        bool delayed_spike = synapses_[i]->process_spike(spiked, dt);
+        // Delay processing
+        if (sa_.delay[i] > 0.0) {
+            if (!sa_.delay_init[i]) {
+                size_t steps = static_cast<size_t>(std::round(sa_.delay[i] / dt));
+                if (steps > 0) {
+                    sa_.spike_buf[i].assign(steps, false);
+                    sa_.buf_head[i] = 0;
+                    sa_.delay_init[i] = true;
+                }
+            }
+            if (sa_.delay_init[i]) {
+                bool delayed = sa_.spike_buf[i][sa_.buf_head[i]];
+                sa_.spike_buf[i][sa_.buf_head[i]] = spiked;
+                sa_.buf_head[i] = (sa_.buf_head[i] + 1) % sa_.spike_buf[i].size();
+                spiked = delayed;
+            }
+        }
 
-        // Delegate kinetics to synapse subclass
-        synapses_[i]->update(dt, delayed_spike);
+        // Type-specific conductance update
+        switch (sa_.type[i]) {
+            case SYN_EXP:
+                if (spiked) sa_.g[i] += sa_.weight[i];
+                sa_.g[i] *= sa_.exp_decay[i];
+                break;
+
+            case SYN_ALPHA: {
+                if (spiked) sa_.alpha_x[i] += sa_.weight[i] * E_CONST;
+                double inv_tau = sa_.alpha_inv_tau[i];
+                double dx = -sa_.alpha_x[i] * inv_tau;
+                double dg = (sa_.alpha_x[i] - sa_.g[i]) * inv_tau;
+                sa_.alpha_x[i] += dt * dx;
+                sa_.g[i] += dt * dg;
+                if (sa_.g[i] < 0.0) sa_.g[i] = 0.0;
+                break;
+            }
+
+            case SYN_DEXP:
+                if (spiked) {
+                    sa_.dexp_g_rise[i] += 1.0;
+                    sa_.dexp_g_decay[i] += 1.0;
+                }
+                sa_.dexp_g_rise[i] *= sa_.dexp_rise_decay[i];
+                sa_.dexp_g_decay[i] *= sa_.dexp_fall_decay[i];
+                sa_.g[i] = sa_.weight[i] * sa_.dexp_norm[i]
+                         * (sa_.dexp_g_decay[i] - sa_.dexp_g_rise[i]);
+                if (sa_.g[i] < 0.0) sa_.g[i] = 0.0;
+                break;
+        }
     }
 }
+
+// =============================================================================
+// Step
+// =============================================================================
 
 void Network::step(double dt, const std::vector<double>& I_ext) {
     if (I_ext.size() != neurons_.size()) {
         throw std::invalid_argument("I_ext size must match number of neurons");
     }
 
-    // Compute synaptic currents
-    auto I_syn = compute_synaptic_currents();
+    ensure_buffers();
+
+    // Cache voltages for synaptic current computation
+    cache_voltages();
+    compute_synaptic_currents();
 
     // Step each neuron
     for (size_t i = 0; i < neurons_.size(); ++i) {
-        neurons_[i]->step(dt, I_ext[i] + I_syn[i]);
+        neurons_[i]->step(dt, I_ext[i] + I_syn_buffer_[i]);
     }
 
-    // Update synapse states
+    // Re-cache voltages for spike detection
+    cache_voltages();
     update_synapses(dt);
+
+    soa_dirty_ = true;
 }
+
+// =============================================================================
+// Simulate (inlined step logic — avoids per-step validation and sync)
+// =============================================================================
 
 std::vector<std::vector<double>> Network::simulate(
     double duration,
@@ -234,24 +474,40 @@ std::vector<std::vector<double>> Network::simulate(
         }
     }
 
-    // Initialize output
+    // Pre-allocate output
     std::vector<std::vector<double>> traces(n_neurons);
     for (auto& trace : traces) {
-        trace.reserve(num_steps);
+        trace.resize(num_steps);
     }
 
-    // Run simulation
+    // Pre-allocate working buffers
+    ensure_buffers();
     std::vector<double> I_step(n_neurons);
+
+    // Run simulation
     for (size_t t = 0; t < num_steps; ++t) {
-        // Record voltages
+        // Cache voltages and record traces in one pass
+        cache_voltages();
         for (size_t i = 0; i < n_neurons; ++i) {
-            traces[i].push_back(neurons_[i]->membrane_potential());
+            traces[i][t] = V_cache_[i];
             I_step[i] = I_ext[i][t];
         }
 
-        // Step network
-        step(dt, I_step);
+        // Compute synaptic currents from cached voltages
+        compute_synaptic_currents();
+
+        // Step each neuron
+        for (size_t i = 0; i < n_neurons; ++i) {
+            neurons_[i]->step(dt, I_step[i] + I_syn_buffer_[i]);
+        }
+
+        // Re-cache voltages for spike detection
+        cache_voltages();
+        update_synapses(dt);
     }
+
+    // Sync conductances back to API objects once at the end
+    sync_soa_to_objects();
 
     return traces;
 }

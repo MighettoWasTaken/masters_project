@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <cstdint>
 
 namespace hodgkin_huxley {
 
@@ -15,6 +16,10 @@ namespace hodgkin_huxley {
  *
  * Allows simulation of interconnected neurons (HH, Izhikevich, or mixed)
  * with synaptic connections.
+ *
+ * Synapse data is stored in Structure-of-Arrays (SoA) layout for
+ * cache-friendly inner loops. The polymorphic synapse objects are kept
+ * only for API access (synapse() getter).
  */
 class Network {
 public:
@@ -97,9 +102,9 @@ public:
     [[nodiscard]] std::string neuron_type(size_t idx) const { return neurons_[idx]->type_name(); }
 
     /**
-     * @brief Get synapse by index (polymorphic access)
+     * @brief Get synapse by index (lazy-syncs conductance from SoA)
      */
-    [[nodiscard]] const SynapseBase& synapse(size_t idx) const { return *synapses_[idx]; }
+    [[nodiscard]] const SynapseBase& synapse(size_t idx) const;
 
     // Get all membrane potentials
     [[nodiscard]] std::vector<double> get_potentials() const;
@@ -119,14 +124,82 @@ public:
 
 private:
     std::vector<std::unique_ptr<NeuronBase>> neurons_;
-    std::vector<std::unique_ptr<SynapseBase>> synapses_;
-    std::vector<double> V_pre_prev_;  // Previous presynaptic voltages for spike detection
+    std::vector<std::unique_ptr<SynapseBase>> synapses_;  // API access only
 
-    // Compute synaptic currents for each neuron
-    [[nodiscard]] std::vector<double> compute_synaptic_currents() const;
+    // =========================================================================
+    // Structure-of-Arrays (SoA) synapse data for cache-friendly inner loops.
+    // Eliminates pointer chasing and enables SIMD auto-vectorization.
+    // =========================================================================
+    enum SynType : uint8_t { SYN_EXP = 0, SYN_ALPHA = 1, SYN_DEXP = 2 };
 
-    // Update synapse states
+    struct SynArrays {
+        // Common fields (all synapse types)
+        std::vector<size_t> pre;
+        std::vector<size_t> post;
+        std::vector<double> weight;
+        std::vector<double> E_syn;
+        std::vector<double> g;          // mutable conductance
+
+        std::vector<SynType> type;
+
+        // Spike detection
+        std::vector<double> V_pre_prev;
+
+        // Delay
+        std::vector<double> delay;
+        std::vector<std::vector<bool>> spike_buf;
+        std::vector<size_t> buf_head;
+        std::vector<bool> delay_init;
+
+        // Exponential-specific
+        std::vector<double> exp_tau;
+        std::vector<double> exp_decay;  // cached exp(-dt/tau)
+
+        // Alpha-specific
+        std::vector<double> alpha_x;
+        std::vector<double> alpha_inv_tau;
+
+        // Double-exponential-specific
+        std::vector<double> dexp_g_rise;
+        std::vector<double> dexp_g_decay;
+        std::vector<double> dexp_tau_rise;
+        std::vector<double> dexp_tau_decay;
+        std::vector<double> dexp_rise_decay;  // cached exp(-dt/tau_rise)
+        std::vector<double> dexp_fall_decay;  // cached exp(-dt/tau_decay)
+        std::vector<double> dexp_norm;
+
+        double cached_dt = -1.0;
+        size_t size() const { return pre.size(); }
+
+        // Push default values for all type-specific fields
+        void push_type_defaults() {
+            exp_tau.push_back(0.0);
+            exp_decay.push_back(0.0);
+            alpha_x.push_back(0.0);
+            alpha_inv_tau.push_back(0.0);
+            dexp_g_rise.push_back(0.0);
+            dexp_g_decay.push_back(0.0);
+            dexp_tau_rise.push_back(0.0);
+            dexp_tau_decay.push_back(0.0);
+            dexp_rise_decay.push_back(0.0);
+            dexp_fall_decay.push_back(0.0);
+            dexp_norm.push_back(0.0);
+        }
+    } sa_;
+
+    // Pre-allocated working buffers
+    std::vector<double> I_syn_buffer_;
+    std::vector<double> V_cache_;
+
+    // Lazy sync: SoA is source of truth during simulation
+    mutable bool soa_dirty_ = false;
+
+    void cache_voltages();
+    void ensure_buffers();
+    void compute_synaptic_currents();
     void update_synapses(double dt);
+    void update_decay_factors(double dt);
+    void sync_soa_to_objects() const;
 };
 
 } // namespace hodgkin_huxley

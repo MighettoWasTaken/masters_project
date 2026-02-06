@@ -22,10 +22,14 @@ ExponentialSynapse::ExponentialSynapse(size_t pre_idx, size_t post_idx,
 }
 
 void ExponentialSynapse::update(double dt, bool spiked) {
+    if (dt != cached_dt_) {
+        decay_factor_ = std::exp(-dt / tau_);
+        cached_dt_ = dt;
+    }
     if (spiked) {
         g_ += weight_;
     }
-    g_ *= std::exp(-dt / tau_);
+    g_ *= decay_factor_;
 }
 
 void ExponentialSynapse::reset() {
@@ -39,7 +43,7 @@ void ExponentialSynapse::reset() {
 AlphaSynapse::AlphaSynapse(size_t pre_idx, size_t post_idx,
                            double weight, double E_syn, double tau,
                            double delay)
-    : tau_(tau), x_(0.0)
+    : tau_(tau), inv_tau_(1.0 / tau), x_(0.0)
 {
     pre_idx_ = pre_idx;
     post_idx_ = post_idx;
@@ -51,11 +55,11 @@ AlphaSynapse::AlphaSynapse(size_t pre_idx, size_t post_idx,
 
 void AlphaSynapse::update(double dt, bool spiked) {
     if (spiked) {
-        x_ += weight_ * std::exp(1.0);
+        x_ += weight_ * E_CONST;
     }
 
-    double dx = -x_ / tau_;
-    double dg = (x_ - g_) / tau_;
+    double dx = -x_ * inv_tau_;
+    double dg = (x_ - g_) * inv_tau_;
 
     x_ += dt * dx;
     g_ += dt * dg;
@@ -100,13 +104,18 @@ DoubleExponentialSynapse::DoubleExponentialSynapse(
 }
 
 void DoubleExponentialSynapse::update(double dt, bool spiked) {
+    if (dt != cached_dt_) {
+        rise_decay_ = std::exp(-dt / tau_rise_);
+        fall_decay_ = std::exp(-dt / tau_decay_);
+        cached_dt_ = dt;
+    }
     if (spiked) {
         g_rise_ += 1.0;
         g_decay_ += 1.0;
     }
 
-    g_rise_ *= std::exp(-dt / tau_rise_);
-    g_decay_ *= std::exp(-dt / tau_decay_);
+    g_rise_ *= rise_decay_;
+    g_decay_ *= fall_decay_;
 
     g_ = weight_ * norm_factor_ * (g_decay_ - g_rise_);
 

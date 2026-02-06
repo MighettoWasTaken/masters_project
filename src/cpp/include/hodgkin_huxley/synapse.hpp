@@ -21,6 +21,8 @@ public:
 
 private:
     double tau_;
+    double decay_factor_ = 0.0;   // cached exp(-dt/tau)
+    double cached_dt_ = -1.0;     // dt used to compute cache
 };
 
 /**
@@ -45,7 +47,9 @@ public:
     [[nodiscard]] double tau() const { return tau_; }
 
 private:
+    static constexpr double E_CONST = 2.718281828459045;  // exp(1)
     double tau_;
+    double inv_tau_ = 0.0;  // cached 1.0/tau
     double x_ = 0.0;
 };
 
@@ -76,6 +80,9 @@ private:
     double norm_factor_;
     double g_rise_ = 0.0;
     double g_decay_ = 0.0;
+    double rise_decay_ = 0.0;   // cached exp(-dt/tau_rise)
+    double fall_decay_ = 0.0;   // cached exp(-dt/tau_decay)
+    double cached_dt_ = -1.0;   // dt used to compute cache
 };
 
 } // namespace hodgkin_huxley

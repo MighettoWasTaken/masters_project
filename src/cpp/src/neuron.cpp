@@ -101,18 +101,49 @@ void HHNeuron::compute_derivatives(double I_ext, double& dV, double& dm, double&
     const double h = state_.h;
     const double n = state_.n;
 
-    // Ionic currents
+    // Ionic currents — use (n*n)*(n*n) to help compiler reuse n^2
+    double n2 = n * n;
     double I_Na = params_.g_Na * m * m * m * h * (V - params_.E_Na);
-    double I_K = params_.g_K * n * n * n * n * (V - params_.E_K);
+    double I_K = params_.g_K * n2 * n2 * (V - params_.E_K);
     double I_L = params_.g_L * (V - params_.E_L);
 
-    // Membrane potential derivative
     dV = (I_ext - I_Na - I_K - I_L) / params_.C_m;
 
-    // Gating variable derivatives
-    dm = alpha_m(V) * (1.0 - m) - beta_m(V) * m;
-    dh = alpha_h(V) * (1.0 - h) - beta_h(V) * h;
-    dn = alpha_n(V) * (1.0 - n) - beta_n(V) * n;
+    // Inline all rate functions to avoid function call overhead and enable
+    // shared subexpression elimination. safe_exp removed: for V in [-100, +100]
+    // all exp arguments are well within double range.
+    double V_plus_65 = V + 65.0;
+
+    // alpha_m
+    double dV_m = V + 40.0;
+    double am;
+    if (std::abs(dV_m) < 1e-7) {
+        am = 1.0;
+    } else {
+        am = 0.1 * dV_m / (1.0 - std::exp(-dV_m * 0.1));
+    }
+    // beta_m
+    double bm = 4.0 * std::exp(-V_plus_65 / 18.0);
+
+    // alpha_h
+    double ah = 0.07 * std::exp(-V_plus_65 * 0.05);
+    // beta_h
+    double bh = 1.0 / (1.0 + std::exp(-(V + 35.0) * 0.1));
+
+    // alpha_n
+    double dV_n = V + 55.0;
+    double an;
+    if (std::abs(dV_n) < 1e-7) {
+        an = 0.1;
+    } else {
+        an = 0.01 * dV_n / (1.0 - std::exp(-dV_n * 0.1));
+    }
+    // beta_n
+    double bn = 0.125 * std::exp(-V_plus_65 * 0.0125);
+
+    dm = am * (1.0 - m) - bm * m;
+    dh = ah * (1.0 - h) - bh * h;
+    dn = an * (1.0 - n) - bn * n;
 }
 
 void HHNeuron::euler_step(double dt, double I_ext) {
@@ -136,7 +167,11 @@ void HHNeuron::rk4_step(double dt, double I_ext) {
     double dV3, dm3, dh3, dn3;
     double dV4, dm4, dh4, dn4;
 
-    // Helper to clamp gating variables
+    // Pre-compute dt fractions
+    const double dt_half = dt * 0.5;
+    const double dt_sixth = dt / 6.0;
+
+    // Helper to clamp gating variables to [0, 1]
     auto clamp_gates = [this]() {
         state_.m = std::max(0.0, std::min(1.0, state_.m));
         state_.h = std::max(0.0, std::min(1.0, state_.h));
@@ -149,18 +184,18 @@ void HHNeuron::rk4_step(double dt, double I_ext) {
     compute_derivatives(I_ext, dV1, dm1, dh1, dn1);
 
     // k2
-    state_.V = orig.V + 0.5 * dt * dV1;
-    state_.m = orig.m + 0.5 * dt * dm1;
-    state_.h = orig.h + 0.5 * dt * dh1;
-    state_.n = orig.n + 0.5 * dt * dn1;
+    state_.V = orig.V + dt_half * dV1;
+    state_.m = orig.m + dt_half * dm1;
+    state_.h = orig.h + dt_half * dh1;
+    state_.n = orig.n + dt_half * dn1;
     clamp_gates();
     compute_derivatives(I_ext, dV2, dm2, dh2, dn2);
 
     // k3
-    state_.V = orig.V + 0.5 * dt * dV2;
-    state_.m = orig.m + 0.5 * dt * dm2;
-    state_.h = orig.h + 0.5 * dt * dh2;
-    state_.n = orig.n + 0.5 * dt * dn2;
+    state_.V = orig.V + dt_half * dV2;
+    state_.m = orig.m + dt_half * dm2;
+    state_.h = orig.h + dt_half * dh2;
+    state_.n = orig.n + dt_half * dn2;
     clamp_gates();
     compute_derivatives(I_ext, dV3, dm3, dh3, dn3);
 
@@ -173,10 +208,10 @@ void HHNeuron::rk4_step(double dt, double I_ext) {
     compute_derivatives(I_ext, dV4, dm4, dh4, dn4);
 
     // Combine
-    state_.V = orig.V + (dt / 6.0) * (dV1 + 2.0 * dV2 + 2.0 * dV3 + dV4);
-    state_.m = orig.m + (dt / 6.0) * (dm1 + 2.0 * dm2 + 2.0 * dm3 + dm4);
-    state_.h = orig.h + (dt / 6.0) * (dh1 + 2.0 * dh2 + 2.0 * dh3 + dh4);
-    state_.n = orig.n + (dt / 6.0) * (dn1 + 2.0 * dn2 + 2.0 * dn3 + dn4);
+    state_.V = orig.V + dt_sixth * (dV1 + 2.0 * dV2 + 2.0 * dV3 + dV4);
+    state_.m = orig.m + dt_sixth * (dm1 + 2.0 * dm2 + 2.0 * dm3 + dm4);
+    state_.h = orig.h + dt_sixth * (dh1 + 2.0 * dh2 + 2.0 * dh3 + dh4);
+    state_.n = orig.n + dt_sixth * (dn1 + 2.0 * dn2 + 2.0 * dn3 + dn4);
 
     // Final clamp
     clamp_gates();
