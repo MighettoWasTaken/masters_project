@@ -727,7 +727,7 @@ def run_neuron_scaling(duration: float = 100.0, dt: float = 0.05,
     Increase neuron count, keep synapses per neuron fixed (sparse ring k=2).
     Synapses grow linearly: S = 2*N.
     """
-    neuron_counts = [10, 20, 50, 100, 200, 500, 1000, 2000]
+    neuron_counts = [10, 20, 50, 100, 200, 500, 1000, 2000, 4000]
     k = 2  # each neuron connects to 2 neighbours
     cpp_times = []
     numpy_times = []
@@ -1066,7 +1066,7 @@ def main():
 
     figs_dir = setup_output_dir()
 
-    sizes = [5, 10, 20, 50, 100, 200, 500, 1000, 2000]
+    sizes = [5, 10, 20, 50, 100, 200, 500, 1000, 2000, 4000, 8000]
     duration = 100.0  # ms
     dt = 0.05         # ms (RK4-safe for HH)
     I_val = 10.0      # uA/cm^2

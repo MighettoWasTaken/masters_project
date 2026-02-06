@@ -691,7 +691,7 @@ std::vector<std::vector<double>> Network::simulate(
         else if (dynamic_cast<IzhikevichNeuron*>(neurons_[i].get())) ++n_iz;
     }
 
-    HHPool hh_pool(n_hh);
+    HHPool hh_pool(n_hh, fast_math_);
     IzPool iz_pool(n_iz);
 
     for (size_t i = 0; i < n_neurons; ++i) {

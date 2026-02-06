@@ -630,6 +630,15 @@ class Network:
         """Number of synaptic connections."""
         return self._network.num_synapses
 
+    @property
+    def fast_math(self) -> bool:
+        """Use fast polynomial exp (~8 digits) vs full precision. Default: True."""
+        return self._network.fast_math
+
+    @fast_math.setter
+    def fast_math(self, enabled: bool) -> None:
+        self._network.fast_math = enabled
+
     def neuron(self, idx: int) -> _NeuronBase:
         """Get a neuron by index (polymorphic access)."""
         return self._network.neuron(idx)

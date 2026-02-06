@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:eigen.tuxfamily.org)",
+      "WebFetch(domain:libeigen.gitlab.io)"
+    ]
+  }
+}

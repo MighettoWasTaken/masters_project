@@ -284,6 +284,8 @@ PYBIND11_MODULE(_core, m) {
         // Properties
         .def_property_readonly("num_neurons", &Network::num_neurons)
         .def_property_readonly("num_synapses", &Network::num_synapses)
+        .def_property("fast_math", &Network::fast_math, &Network::set_fast_math,
+                      "Use fast polynomial exp (~8 digits) vs full precision. Default: true.")
 
         // Neuron access
         .def("neuron", [](Network& net, size_t idx) -> NeuronBase& {

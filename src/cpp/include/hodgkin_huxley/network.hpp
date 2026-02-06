@@ -127,6 +127,10 @@ public:
      */
     [[nodiscard]] const SynapseBase& synapse(size_t idx) const;
 
+    // Fast math toggle (affects exp() in HH pool — ~8 digits vs full precision)
+    void set_fast_math(bool enabled) { fast_math_ = enabled; }
+    [[nodiscard]] bool fast_math() const { return fast_math_; }
+
     // Get all membrane potentials
     [[nodiscard]] std::vector<double> get_potentials() const;
 
@@ -219,6 +223,9 @@ private:
         std::vector<size_t> dexp;
     } syn_groups_;
     std::vector<uint8_t> spike_detected_;  // per-synapse spike flag buffer
+
+    // Use fast polynomial exp approximation (~8 digits) vs Eigen's built-in
+    bool fast_math_ = true;
 
     // Lazy sync: SoA is source of truth during simulation
     mutable bool soa_dirty_ = false;

@@ -7,7 +7,7 @@ namespace hodgkin_huxley {
 // Construction — pre-allocate every buffer so the hot loop does 0 mallocs
 // =============================================================================
 
-HHPool::HHPool(size_t capacity) : N_(0) {
+HHPool::HHPool(size_t capacity, bool fast_math) : N_(0), fast_math_(fast_math) {
     net_idx_.reserve(capacity);
 
     // State
@@ -38,6 +38,9 @@ HHPool::HHPool(size_t capacity) : N_(0) {
     tmp_am_.resize(capacity);  tmp_bm_.resize(capacity);
     tmp_ah_.resize(capacity);  tmp_bh_.resize(capacity);
     tmp_an_.resize(capacity);  tmp_bn_.resize(capacity);
+
+    // Fast exp working buffer
+    tmp_exp_r_.resize(capacity);
 }
 
 void HHPool::add(size_t network_idx, const HHNeuron::Parameters& params,
@@ -81,12 +84,43 @@ void HHPool::gather_currents(const double* I_buf) {
 }
 
 // =============================================================================
+// Fast exp: range reduction by 32 + degree-7 Taylor + 5 squarings
+//
+// exp(x) = exp(x/32)^32.  Taylor degree-7 on [-0.31, 0.09] gives ~8
+// significant digits after 5 squarings.  Entirely Eigen-vectorized —
+// every line is a SIMD fma or multiply over the full array.
+// Safe to call with src == dst (input consumed in first line).
+// =============================================================================
+
+void HHPool::fast_exp(const Eigen::ArrayXd& src, Eigen::ArrayXd& dst) {
+    // Range reduction: exp(x) = exp(x/32)^32
+    tmp_exp_r_ = src * (1.0 / 32.0);
+
+    // Degree-7 Taylor polynomial in Horner form:
+    // exp(r) ≈ 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120 + r⁶/720 + r⁷/5040
+    dst = tmp_exp_r_ * (1.0 / 5040.0) + (1.0 / 720.0);
+    dst = dst * tmp_exp_r_ + (1.0 / 120.0);
+    dst = dst * tmp_exp_r_ + (1.0 / 24.0);
+    dst = dst * tmp_exp_r_ + (1.0 / 6.0);
+    dst = dst * tmp_exp_r_ + 0.5;
+    dst = dst * tmp_exp_r_ + 1.0;
+    dst = dst * tmp_exp_r_ + 1.0;
+
+    // 5 squarings: exp(x/32)^32 = exp(x)
+    dst *= dst;
+    dst *= dst;
+    dst *= dst;
+    dst *= dst;
+    dst *= dst;
+}
+
+// =============================================================================
 // Vectorized HH derivative computation — zero allocation
 //
-// Multi-use intermediates (n2, V+65, V+40, V+55) write to pre-allocated
-// tmp_ buffers.  Single-use rate functions use auto (lazy evaluation via
-// Eigen expression templates) so they fuse into the final dm/dh/dn
-// assignment without materialising separate arrays.
+// Multi-use intermediates (n², V+65, V+40, V+55) write to pre-allocated
+// tmp_ buffers.  Rate functions are materialized into tmp_am_ .. tmp_bn_.
+// When fast_math_ is true, uses polynomial fast_exp (~8 digits);
+// otherwise uses Eigen's built-in exp (full precision).
 // =============================================================================
 
 void HHPool::compute_derivatives(
@@ -108,25 +142,61 @@ void HHPool::compute_derivatives(
           - g_K_ * tmp_n2_ * tmp_n2_ * (V - E_K_)
           - g_L_ * (V - E_L_)) / C_m_;
 
-    // Rate functions — materialized into pre-allocated buffers.
-    // Forces Eigen to use SIMD packet evaluation for exp(), which
-    // lazy auto expressions may prevent when fused with outer ops.
+    // fast_exp wins at large N (amortized over many elements) but has too
+    // much loop overhead for tiny arrays.  Threshold ~64 = 8 AVX2 registers.
+    if (fast_math_ && N_ > 64) {
+        // --- Fast polynomial exp (~8 significant digits) ---
 
-    // alpha_m: singularity at V=-40 via select (branchless)
-    tmp_am_ = (tmp_dVm_.abs() < 1e-7).select(
-        Eigen::ArrayXd::Ones(N_),
-        0.1 * tmp_dVm_ / (1.0 - (-tmp_dVm_ * 0.1).exp()));
+        // beta_m: 4 * exp(-(V+65)/18)
+        tmp_bm_ = -tmp_Vp65_ / 18.0;
+        fast_exp(tmp_bm_, tmp_bm_);
+        tmp_bm_ *= 4.0;
 
-    tmp_bm_ = 4.0 * (-tmp_Vp65_ / 18.0).exp();
-    tmp_ah_ = 0.07 * (-tmp_Vp65_ * 0.05).exp();
-    tmp_bh_ = 1.0 / (1.0 + (-(V + 35.0) * 0.1).exp());
+        // alpha_h: 0.07 * exp(-0.05*(V+65))
+        tmp_ah_ = -tmp_Vp65_ * 0.05;
+        fast_exp(tmp_ah_, tmp_ah_);
+        tmp_ah_ *= 0.07;
 
-    // alpha_n: singularity at V=-55 via select
-    tmp_an_ = (tmp_dVn_.abs() < 1e-7).select(
-        Eigen::ArrayXd::Constant(N_, 0.1),
-        0.01 * tmp_dVn_ / (1.0 - (-tmp_dVn_ * 0.1).exp()));
+        // beta_h: 1 / (1 + exp(-0.1*(V+35)))
+        tmp_bh_ = -(V + 35.0) * 0.1;
+        fast_exp(tmp_bh_, tmp_bh_);
+        tmp_bh_ = 1.0 / (1.0 + tmp_bh_);
 
-    tmp_bn_ = 0.125 * (-tmp_Vp65_ * 0.0125).exp();
+        // beta_n: 0.125 * exp(-0.0125*(V+65))
+        tmp_bn_ = -tmp_Vp65_ * 0.0125;
+        fast_exp(tmp_bn_, tmp_bn_);
+        tmp_bn_ *= 0.125;
+
+        // alpha_m: 0.1*(V+40) / (1 - exp(-0.1*(V+40))), singularity at V=-40
+        tmp_am_ = -tmp_dVm_ * 0.1;
+        fast_exp(tmp_am_, tmp_am_);
+        tmp_am_ = (tmp_dVm_.abs() < 1e-7).select(
+            Eigen::ArrayXd::Ones(N_),
+            0.1 * tmp_dVm_ / (1.0 - tmp_am_));
+
+        // alpha_n: 0.01*(V+55) / (1 - exp(-0.1*(V+55))), singularity at V=-55
+        tmp_an_ = -tmp_dVn_ * 0.1;
+        fast_exp(tmp_an_, tmp_an_);
+        tmp_an_ = (tmp_dVn_.abs() < 1e-7).select(
+            Eigen::ArrayXd::Constant(N_, 0.1),
+            0.01 * tmp_dVn_ / (1.0 - tmp_an_));
+    } else {
+        // --- Full-precision Eigen exp ---
+
+        tmp_am_ = (tmp_dVm_.abs() < 1e-7).select(
+            Eigen::ArrayXd::Ones(N_),
+            0.1 * tmp_dVm_ / (1.0 - (-tmp_dVm_ * 0.1).exp()));
+
+        tmp_bm_ = 4.0 * (-tmp_Vp65_ / 18.0).exp();
+        tmp_ah_ = 0.07 * (-tmp_Vp65_ * 0.05).exp();
+        tmp_bh_ = 1.0 / (1.0 + (-(V + 35.0) * 0.1).exp());
+
+        tmp_an_ = (tmp_dVn_.abs() < 1e-7).select(
+            Eigen::ArrayXd::Constant(N_, 0.1),
+            0.01 * tmp_dVn_ / (1.0 - (-tmp_dVn_ * 0.1).exp()));
+
+        tmp_bn_ = 0.125 * (-tmp_Vp65_ * 0.0125).exp();
+    }
 
     dm = tmp_am_ * (1.0 - m) - tmp_bm_ * m;
     dh = tmp_ah_ * (1.0 - h) - tmp_bh_ * h;

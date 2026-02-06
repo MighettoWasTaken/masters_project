@@ -19,7 +19,7 @@ namespace hodgkin_huxley {
 class HHPool {
 public:
     HHPool() = default;
-    explicit HHPool(size_t capacity);
+    explicit HHPool(size_t capacity, bool fast_math = true);
 
     void add(size_t network_idx, const HHNeuron::Parameters& params,
              const HHNeuron::State& state);
@@ -65,8 +65,19 @@ private:
     // Rate function buffers — materialized for guaranteed SIMD packet eval
     Eigen::ArrayXd tmp_am_, tmp_bm_, tmp_ah_, tmp_bh_, tmp_an_, tmp_bn_;
 
+    // Fast exp working buffer (range-reduced input)
+    Eigen::ArrayXd tmp_exp_r_;
+
+    // When true, use fast polynomial exp (~8 digits); when false, use Eigen's built-in
+    bool fast_math_ = true;
+
     // True when pool indices are [start, start+1, ..., start+N-1]
     bool contiguous_ = false;
+
+    // Fast exp approximation: ~8 significant digits, no 2^k bit tricks.
+    // Uses range reduction (divide by 32) + degree-7 Taylor + 5 squarings.
+    // Entirely Eigen-vectorized. Safe to call with src == dst.
+    void fast_exp(const Eigen::ArrayXd& src, Eigen::ArrayXd& dst);
 
     // Writes derivatives into kV_/km_/kh_/kn_ (passed as dV/dm/dh/dn).
     // Non-const because it writes to tmp_ members.
