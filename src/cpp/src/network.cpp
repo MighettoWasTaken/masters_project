@@ -2,6 +2,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
 
 namespace hodgkin_huxley {
 
@@ -173,8 +174,9 @@ void Network::add_synapse(size_t pre_idx, size_t post_idx, double weight,
     // Overwrite exp-specific
     sa_.exp_tau.back() = tau;
 
-    // Invalidate cached decay factors
+    // Invalidate caches
     sa_.cached_dt = -1.0;
+    soa_sorted_ = false;
 }
 
 void Network::add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
@@ -204,6 +206,7 @@ void Network::add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
     sa_.alpha_inv_tau.back() = 1.0 / tau;
 
     sa_.cached_dt = -1.0;
+    soa_sorted_ = false;
 }
 
 void Network::add_double_exp_synapse(size_t pre_idx, size_t post_idx, double weight,
@@ -243,6 +246,44 @@ void Network::add_double_exp_synapse(size_t pre_idx, size_t post_idx, double wei
     sa_.dexp_norm.back() = 1.0 / peak_val;
 
     sa_.cached_dt = -1.0;
+    soa_sorted_ = false;
+}
+
+// =============================================================================
+// Receptor-type convenience methods
+// =============================================================================
+
+void Network::add_ampa_synapse(size_t pre_idx, size_t post_idx, double weight,
+                               double delay) {
+    add_double_exp_synapse(pre_idx, post_idx, weight,
+                           0.0, 0.5, 2.5, delay);
+}
+
+void Network::add_nmda_synapse(size_t pre_idx, size_t post_idx, double weight,
+                               double delay) {
+    add_double_exp_synapse(pre_idx, post_idx, weight,
+                           0.0, 2.0, 67.0, delay);
+}
+
+void Network::add_gaba_a_synapse(size_t pre_idx, size_t post_idx, double weight,
+                                 double delay) {
+    add_double_exp_synapse(pre_idx, post_idx, weight,
+                           -80.0, 0.4, 7.7, delay);
+}
+
+void Network::add_receptor_synapse(size_t pre_idx, size_t post_idx, double weight,
+                                   ReceptorType receptor, double delay) {
+    switch (receptor) {
+        case ReceptorType::AMPA:
+            add_ampa_synapse(pre_idx, post_idx, weight, delay);
+            break;
+        case ReceptorType::NMDA:
+            add_nmda_synapse(pre_idx, post_idx, weight, delay);
+            break;
+        case ReceptorType::GABA_A:
+            add_gaba_a_synapse(pre_idx, post_idx, weight, delay);
+            break;
+    }
 }
 
 // =============================================================================
@@ -453,7 +494,164 @@ void Network::step(double dt, const std::vector<double>& I_ext) {
 }
 
 // =============================================================================
-// Simulate (inlined step logic — avoids per-step validation and sync)
+// Sort SoA arrays by presynaptic index for cache-friendly access
+// =============================================================================
+
+void Network::sort_synapses_by_pre() {
+    if (soa_sorted_) return;
+
+    const size_t S = sa_.size();
+    if (S <= 1) { soa_sorted_ = true; return; }
+
+    // Build sort permutation: sort by (pre, post) for locality
+    std::vector<size_t> perm(S);
+    std::iota(perm.begin(), perm.end(), 0);
+    std::sort(perm.begin(), perm.end(), [&](size_t a, size_t b) {
+        if (sa_.pre[a] != sa_.pre[b]) return sa_.pre[a] < sa_.pre[b];
+        return sa_.post[a] < sa_.post[b];
+    });
+
+    // Apply permutation to all parallel arrays using a temporary
+    auto permute = [&](auto& vec) {
+        using T = typename std::decay<decltype(vec)>::type;
+        T tmp(vec.size());
+        for (size_t i = 0; i < S; ++i) tmp[i] = std::move(vec[perm[i]]);
+        vec = std::move(tmp);
+    };
+
+    // Common fields
+    permute(sa_.pre);
+    permute(sa_.post);
+    permute(sa_.weight);
+    permute(sa_.E_syn);
+    permute(sa_.g);
+    permute(sa_.type);
+    permute(sa_.V_pre_prev);
+    permute(sa_.delay);
+    permute(sa_.spike_buf);
+    permute(sa_.buf_head);
+    permute(sa_.delay_init);
+
+    // Exponential
+    permute(sa_.exp_tau);
+    permute(sa_.exp_decay);
+
+    // Alpha
+    permute(sa_.alpha_x);
+    permute(sa_.alpha_inv_tau);
+
+    // Double-exponential
+    permute(sa_.dexp_g_rise);
+    permute(sa_.dexp_g_decay);
+    permute(sa_.dexp_tau_rise);
+    permute(sa_.dexp_tau_decay);
+    permute(sa_.dexp_rise_decay);
+    permute(sa_.dexp_fall_decay);
+    permute(sa_.dexp_norm);
+
+    // Reorder API synapse objects to match
+    std::vector<std::unique_ptr<SynapseBase>> reordered(S);
+    for (size_t i = 0; i < S; ++i) reordered[i] = std::move(synapses_[perm[i]]);
+    synapses_ = std::move(reordered);
+
+    // Invalidate cached decay factors (order changed)
+    sa_.cached_dt = -1.0;
+    soa_sorted_ = true;
+}
+
+// =============================================================================
+// Build type-separated synapse index lists
+// =============================================================================
+
+void Network::build_synapse_groups() {
+    syn_groups_.exp.clear();
+    syn_groups_.alpha.clear();
+    syn_groups_.dexp.clear();
+
+    const size_t S = sa_.size();
+    for (size_t i = 0; i < S; ++i) {
+        switch (sa_.type[i]) {
+            case SYN_EXP:   syn_groups_.exp.push_back(i);   break;
+            case SYN_ALPHA: syn_groups_.alpha.push_back(i); break;
+            case SYN_DEXP:  syn_groups_.dexp.push_back(i);  break;
+        }
+    }
+
+    spike_detected_.resize(S);
+}
+
+// =============================================================================
+// Type-separated synapse update (no switch in inner loops)
+// =============================================================================
+
+void Network::update_synapses_grouped(double dt) {
+    update_decay_factors(dt);
+
+    const size_t S = sa_.size();
+    const double spike_threshold = 0.0;
+    static constexpr double E_CONST = 2.718281828459045;
+
+    // Phase 1: spike detection + delay processing for ALL synapses
+    for (size_t i = 0; i < S; ++i) {
+        double V_pre = V_cache_[sa_.pre[i]];
+        bool spiked = (V_pre > spike_threshold) && (sa_.V_pre_prev[i] <= spike_threshold);
+        sa_.V_pre_prev[i] = V_pre;
+
+        if (sa_.delay[i] > 0.0) {
+            if (!sa_.delay_init[i]) {
+                size_t steps = static_cast<size_t>(std::round(sa_.delay[i] / dt));
+                if (steps > 0) {
+                    sa_.spike_buf[i].assign(steps, false);
+                    sa_.buf_head[i] = 0;
+                    sa_.delay_init[i] = true;
+                }
+            }
+            if (sa_.delay_init[i]) {
+                bool delayed = sa_.spike_buf[i][sa_.buf_head[i]];
+                sa_.spike_buf[i][sa_.buf_head[i]] = spiked;
+                sa_.buf_head[i] = (sa_.buf_head[i] + 1) % sa_.spike_buf[i].size();
+                spiked = delayed;
+            }
+        }
+
+        spike_detected_[i] = spiked ? 1 : 0;
+    }
+
+    // Phase 2: type-separated kinetics — tight loops, no branch on type
+
+    for (size_t j = 0, je = syn_groups_.exp.size(); j < je; ++j) {
+        size_t i = syn_groups_.exp[j];
+        if (spike_detected_[i]) sa_.g[i] += sa_.weight[i];
+        sa_.g[i] *= sa_.exp_decay[i];
+    }
+
+    for (size_t j = 0, je = syn_groups_.alpha.size(); j < je; ++j) {
+        size_t i = syn_groups_.alpha[j];
+        if (spike_detected_[i]) sa_.alpha_x[i] += sa_.weight[i] * E_CONST;
+        double inv_tau = sa_.alpha_inv_tau[i];
+        double dx = -sa_.alpha_x[i] * inv_tau;
+        double dg = (sa_.alpha_x[i] - sa_.g[i]) * inv_tau;
+        sa_.alpha_x[i] += dt * dx;
+        sa_.g[i] += dt * dg;
+        if (sa_.g[i] < 0.0) sa_.g[i] = 0.0;
+    }
+
+    for (size_t j = 0, je = syn_groups_.dexp.size(); j < je; ++j) {
+        size_t i = syn_groups_.dexp[j];
+        if (spike_detected_[i]) {
+            sa_.dexp_g_rise[i] += 1.0;
+            sa_.dexp_g_decay[i] += 1.0;
+        }
+        sa_.dexp_g_rise[i] *= sa_.dexp_rise_decay[i];
+        sa_.dexp_g_decay[i] *= sa_.dexp_fall_decay[i];
+        sa_.g[i] = sa_.weight[i] * sa_.dexp_norm[i]
+                 * (sa_.dexp_g_decay[i] - sa_.dexp_g_rise[i]);
+        if (sa_.g[i] < 0.0) sa_.g[i] = 0.0;
+    }
+}
+
+// =============================================================================
+// Simulate — batched pools + type-separated synapse loops
 // =============================================================================
 
 std::vector<std::vector<double>> Network::simulate(
@@ -480,33 +678,81 @@ std::vector<std::vector<double>> Network::simulate(
         trace.resize(num_steps);
     }
 
-    // Pre-allocate working buffers
-    ensure_buffers();
-    std::vector<double> I_step(n_neurons);
+    // Sort synapses by pre-index for cache-friendly access
+    sort_synapses_by_pre();
+    build_synapse_groups();
 
-    // Run simulation
-    for (size_t t = 0; t < num_steps; ++t) {
-        // Cache voltages and record traces in one pass
-        cache_voltages();
-        for (size_t i = 0; i < n_neurons; ++i) {
-            traces[i][t] = V_cache_[i];
-            I_step[i] = I_ext[i][t];
-        }
-
-        // Compute synaptic currents from cached voltages
-        compute_synaptic_currents();
-
-        // Step each neuron
-        for (size_t i = 0; i < n_neurons; ++i) {
-            neurons_[i]->step(dt, I_step[i] + I_syn_buffer_[i]);
-        }
-
-        // Re-cache voltages for spike detection
-        cache_voltages();
-        update_synapses(dt);
+    // =========================================================================
+    // Build batched neuron pools — classify via dynamic_cast once
+    // =========================================================================
+    size_t n_hh = 0, n_iz = 0;
+    for (size_t i = 0; i < n_neurons; ++i) {
+        if (dynamic_cast<HHNeuron*>(neurons_[i].get())) ++n_hh;
+        else if (dynamic_cast<IzhikevichNeuron*>(neurons_[i].get())) ++n_iz;
     }
 
-    // Sync conductances back to API objects once at the end
+    HHPool hh_pool(n_hh);
+    IzPool iz_pool(n_iz);
+
+    for (size_t i = 0; i < n_neurons; ++i) {
+        if (auto* hh = dynamic_cast<HHNeuron*>(neurons_[i].get())) {
+            hh_pool.add(i, hh->parameters(), hh->state());
+        } else if (auto* iz = dynamic_cast<IzhikevichNeuron*>(neurons_[i].get())) {
+            iz_pool.add(i, iz->parameters(), iz->state());
+        }
+    }
+
+    // Pre-allocate working buffers
+    ensure_buffers();
+
+    // =========================================================================
+    // Hot loop — pools do batched SIMD math, no virtual dispatch
+    // =========================================================================
+    for (size_t t = 0; t < num_steps; ++t) {
+        // Read voltages from pools into V_cache_
+        hh_pool.scatter_voltages(V_cache_.data());
+        iz_pool.scatter_voltages(V_cache_.data());
+
+        // Record traces + gather external currents into I_syn_buffer_
+        // (reuse I_syn_buffer_ as combined I buffer — compute_synaptic_currents
+        //  will ADD into it after we seed it with I_ext)
+        for (size_t i = 0; i < n_neurons; ++i) {
+            traces[i][t] = V_cache_[i];
+            I_syn_buffer_[i] = I_ext[i][t];
+        }
+
+        // Compute synaptic currents — ADDS g*(E-V) into I_syn_buffer_
+        const size_t S = sa_.size();
+        const double* g = sa_.g.data();
+        const double* E_syn = sa_.E_syn.data();
+        const size_t* post = sa_.post.data();
+        const double* V = V_cache_.data();
+        double* I_buf = I_syn_buffer_.data();
+        for (size_t i = 0; i < S; ++i) {
+            I_buf[post[i]] += g[i] * (E_syn[i] - V[post[i]]);
+        }
+
+        // Feed combined currents to pools
+        hh_pool.gather_currents(I_syn_buffer_.data());
+        iz_pool.gather_currents(I_syn_buffer_.data());
+
+        // Step pools (batched SIMD — the main performance win)
+        hh_pool.step_rk4(dt);
+        iz_pool.step_euler(dt);
+
+        // Re-read voltages for spike detection
+        hh_pool.scatter_voltages(V_cache_.data());
+        iz_pool.scatter_voltages(V_cache_.data());
+
+        // Type-separated synapse update (no switch in inner loops)
+        update_synapses_grouped(dt);
+    }
+
+    // =========================================================================
+    // Sync pool state back to API objects once at the end
+    // =========================================================================
+    hh_pool.sync_to_neurons(neurons_);
+    iz_pool.sync_to_neurons(neurons_);
     sync_soa_to_objects();
 
     return traces;

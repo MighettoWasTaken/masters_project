@@ -31,6 +31,7 @@ from ._core import (
     # Network
     Network as _Network,
     NetworkNeuronType,
+    ReceptorType,
     # Enums
     IntegrationMethod,
     # Version
@@ -58,6 +59,7 @@ __all__ = [
     # Network
     "Network",
     "NetworkNeuronType",
+    "ReceptorType",
     # Enums
     "IntegrationMethod",
     # Version
@@ -509,6 +511,110 @@ class Network:
         """
         self._network.add_double_exp_synapse(
             pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay, delay)
+
+    def add_ampa_synapse(
+        self,
+        pre_idx: int,
+        post_idx: int,
+        weight: float,
+        delay: float = 0.0,
+    ) -> None:
+        """
+        Add an AMPA synapse (fast excitatory).
+
+        Uses double-exponential kinetics with E_syn=0 mV,
+        tau_rise=0.5 ms, tau_decay=2.5 ms.
+
+        Parameters
+        ----------
+        pre_idx : int
+            Index of the pre-synaptic neuron.
+        post_idx : int
+            Index of the post-synaptic neuron.
+        weight : float
+            Peak synaptic conductance.
+        delay : float, optional
+            Axonal conduction delay in ms. Default is 0.
+        """
+        self._network.add_ampa_synapse(pre_idx, post_idx, weight, delay)
+
+    def add_nmda_synapse(
+        self,
+        pre_idx: int,
+        post_idx: int,
+        weight: float,
+        delay: float = 0.0,
+    ) -> None:
+        """
+        Add an NMDA synapse (slow excitatory).
+
+        Uses double-exponential kinetics with E_syn=0 mV,
+        tau_rise=2.0 ms, tau_decay=67.0 ms.
+
+        Parameters
+        ----------
+        pre_idx : int
+            Index of the pre-synaptic neuron.
+        post_idx : int
+            Index of the post-synaptic neuron.
+        weight : float
+            Peak synaptic conductance.
+        delay : float, optional
+            Axonal conduction delay in ms. Default is 0.
+        """
+        self._network.add_nmda_synapse(pre_idx, post_idx, weight, delay)
+
+    def add_gaba_a_synapse(
+        self,
+        pre_idx: int,
+        post_idx: int,
+        weight: float,
+        delay: float = 0.0,
+    ) -> None:
+        """
+        Add a GABA_A synapse (inhibitory).
+
+        Uses double-exponential kinetics with E_syn=-80 mV,
+        tau_rise=0.4 ms, tau_decay=7.7 ms.
+
+        Parameters
+        ----------
+        pre_idx : int
+            Index of the pre-synaptic neuron.
+        post_idx : int
+            Index of the post-synaptic neuron.
+        weight : float
+            Peak synaptic conductance.
+        delay : float, optional
+            Axonal conduction delay in ms. Default is 0.
+        """
+        self._network.add_gaba_a_synapse(pre_idx, post_idx, weight, delay)
+
+    def add_receptor_synapse(
+        self,
+        pre_idx: int,
+        post_idx: int,
+        weight: float,
+        receptor: "ReceptorType",
+        delay: float = 0.0,
+    ) -> None:
+        """
+        Add a synapse by receptor type.
+
+        Parameters
+        ----------
+        pre_idx : int
+            Index of the pre-synaptic neuron.
+        post_idx : int
+            Index of the post-synaptic neuron.
+        weight : float
+            Peak synaptic conductance.
+        receptor : ReceptorType
+            Receptor type (AMPA, NMDA, or GABA_A).
+        delay : float, optional
+            Axonal conduction delay in ms. Default is 0.
+        """
+        self._network.add_receptor_synapse(pre_idx, post_idx, weight, receptor, delay)
 
     def synapse(self, idx: int) -> SynapseBase:
         """Get a synapse by index (polymorphic access)."""

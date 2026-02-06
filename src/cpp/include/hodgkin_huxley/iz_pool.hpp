@@ -1,0 +1,58 @@
+#pragma once
+
+#include "izhikevich.hpp"
+#include <Eigen/Core>
+#include <vector>
+#include <memory>
+
+namespace hodgkin_huxley {
+
+/**
+ * @brief Batched pool for Izhikevich neurons using Eigen SIMD
+ *
+ * Processes all Izhikevich neurons simultaneously via vectorized array
+ * operations.  Spike detection and reset are handled branchlessly using
+ * Eigen mask operations (select).  All working buffers are pre-allocated.
+ *
+ * Used internally by Network::simulate() for the hot loop.
+ */
+class IzPool {
+public:
+    IzPool() = default;
+    explicit IzPool(size_t capacity);
+
+    void add(size_t network_idx, const IzhikevichNeuron::Parameters& params,
+             const IzhikevichNeuron::State& state);
+
+    size_t size() const { return N_; }
+    bool empty() const { return N_ == 0; }
+    size_t network_idx(size_t pool_idx) const { return net_idx_[pool_idx]; }
+
+    void scatter_voltages(double* V_buf) const;
+    void gather_currents(const double* I_buf);
+    void step_euler(double dt);
+    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const;
+
+private:
+    size_t N_ = 0;
+    std::vector<size_t> net_idx_;
+
+    // State (SoA)
+    Eigen::ArrayXd v_, u_;
+
+    // Parameters (SoA)
+    Eigen::ArrayXd a_, b_, c_, d_;
+
+    // Per-step current input
+    Eigen::ArrayXd I_ext_;
+
+    // Pre-allocated working buffers
+    Eigen::ArrayXd dv_, du_;
+
+    static constexpr double SPIKE_THRESHOLD = 30.0;
+
+    // True when pool indices are [start, start+1, ..., start+N-1]
+    bool contiguous_ = false;
+};
+
+} // namespace hodgkin_huxley

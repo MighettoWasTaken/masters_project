@@ -4,6 +4,8 @@
 #include "neuron.hpp"
 #include "izhikevich.hpp"
 #include "synapse.hpp"
+#include "hh_pool.hpp"
+#include "iz_pool.hpp"
 #include <vector>
 #include <memory>
 #include <string>
@@ -23,6 +25,15 @@ namespace hodgkin_huxley {
  */
 class Network {
 public:
+    /**
+     * @brief Receptor types with biologically accurate default kinetics
+     */
+    enum class ReceptorType {
+        AMPA,     // Fast excitatory: E_syn=0, tau_rise=0.5, tau_decay=2.5
+        NMDA,     // Slow excitatory: E_syn=0, tau_rise=2.0, tau_decay=67.0
+        GABA_A    // Inhibitory:      E_syn=-80, tau_rise=0.4, tau_decay=7.7
+    };
+
     /**
      * @brief Enum for neuron types when adding neurons
      */
@@ -73,6 +84,16 @@ public:
                                 double E_syn = 0.0,
                                 double tau_rise = 0.4, double tau_decay = 2.5,
                                 double delay = 0.0);
+
+    // Receptor-type convenience methods (double-exponential with preset kinetics)
+    void add_ampa_synapse(size_t pre_idx, size_t post_idx, double weight,
+                          double delay = 0.0);
+    void add_nmda_synapse(size_t pre_idx, size_t post_idx, double weight,
+                          double delay = 0.0);
+    void add_gaba_a_synapse(size_t pre_idx, size_t post_idx, double weight,
+                            double delay = 0.0);
+    void add_receptor_synapse(size_t pre_idx, size_t post_idx, double weight,
+                              ReceptorType receptor, double delay = 0.0);
 
     // Getters
     [[nodiscard]] size_t num_neurons() const { return neurons_.size(); }
@@ -191,15 +212,27 @@ private:
     std::vector<double> I_syn_buffer_;
     std::vector<double> V_cache_;
 
+    // Type-separated synapse index lists for branch-free inner loops
+    struct SynapseGroups {
+        std::vector<size_t> exp;
+        std::vector<size_t> alpha;
+        std::vector<size_t> dexp;
+    } syn_groups_;
+    std::vector<uint8_t> spike_detected_;  // per-synapse spike flag buffer
+
     // Lazy sync: SoA is source of truth during simulation
     mutable bool soa_dirty_ = false;
+    bool soa_sorted_ = false;
 
     void cache_voltages();
     void ensure_buffers();
     void compute_synaptic_currents();
     void update_synapses(double dt);
+    void update_synapses_grouped(double dt);
     void update_decay_factors(double dt);
+    void build_synapse_groups();
     void sync_soa_to_objects() const;
+    void sort_synapses_by_pre();
 };
 
 } // namespace hodgkin_huxley

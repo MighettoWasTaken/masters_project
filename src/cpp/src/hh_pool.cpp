@@ -1,0 +1,206 @@
+#include "hodgkin_huxley/hh_pool.hpp"
+#include <cstring>
+
+namespace hodgkin_huxley {
+
+// =============================================================================
+// Construction — pre-allocate every buffer so the hot loop does 0 mallocs
+// =============================================================================
+
+HHPool::HHPool(size_t capacity) : N_(0) {
+    net_idx_.reserve(capacity);
+
+    // State
+    V_.resize(capacity);  m_.resize(capacity);
+    h_.resize(capacity);  n_.resize(capacity);
+
+    // Parameters
+    C_m_.resize(capacity);  g_Na_.resize(capacity); g_K_.resize(capacity);
+    g_L_.resize(capacity);  E_Na_.resize(capacity); E_K_.resize(capacity);
+    E_L_.resize(capacity);
+
+    // Current input
+    I_ext_.resize(capacity);
+
+    // RK4 working buffers
+    kV_.resize(capacity);   km_.resize(capacity);
+    kh_.resize(capacity);   kn_.resize(capacity);
+    accV_.resize(capacity); accm_.resize(capacity);
+    acch_.resize(capacity); accn_.resize(capacity);
+    V0_.resize(capacity);   m0_.resize(capacity);
+    h0_.resize(capacity);   n0_.resize(capacity);
+
+    // Derivative intermediates
+    tmp_n2_.resize(capacity);   tmp_Vp65_.resize(capacity);
+    tmp_dVm_.resize(capacity);  tmp_dVn_.resize(capacity);
+
+    // Rate function buffers
+    tmp_am_.resize(capacity);  tmp_bm_.resize(capacity);
+    tmp_ah_.resize(capacity);  tmp_bh_.resize(capacity);
+    tmp_an_.resize(capacity);  tmp_bn_.resize(capacity);
+}
+
+void HHPool::add(size_t network_idx, const HHNeuron::Parameters& params,
+                 const HHNeuron::State& state) {
+    size_t i = N_++;
+    net_idx_.push_back(network_idx);
+
+    // Track whether indices are contiguous (enables memcpy fast path)
+    if (i == 0) contiguous_ = true;
+    else if (contiguous_ && network_idx != net_idx_[i - 1] + 1) contiguous_ = false;
+
+    V_(i) = state.V;  m_(i) = state.m;
+    h_(i) = state.h;  n_(i) = state.n;
+
+    C_m_(i)  = params.C_m;  g_Na_(i) = params.g_Na;
+    g_K_(i)  = params.g_K;  g_L_(i)  = params.g_L;
+    E_Na_(i) = params.E_Na; E_K_(i)  = params.E_K;
+    E_L_(i)  = params.E_L;
+}
+
+// =============================================================================
+// Scatter / gather
+// =============================================================================
+
+void HHPool::scatter_voltages(double* V_buf) const {
+    if (contiguous_ && N_ > 0) {
+        std::memcpy(V_buf + net_idx_[0], V_.data(), N_ * sizeof(double));
+    } else {
+        for (size_t i = 0; i < N_; ++i)
+            V_buf[net_idx_[i]] = V_(i);
+    }
+}
+
+void HHPool::gather_currents(const double* I_buf) {
+    if (contiguous_ && N_ > 0) {
+        std::memcpy(I_ext_.data(), I_buf + net_idx_[0], N_ * sizeof(double));
+    } else {
+        for (size_t i = 0; i < N_; ++i)
+            I_ext_(i) = I_buf[net_idx_[i]];
+    }
+}
+
+// =============================================================================
+// Vectorized HH derivative computation — zero allocation
+//
+// Multi-use intermediates (n2, V+65, V+40, V+55) write to pre-allocated
+// tmp_ buffers.  Single-use rate functions use auto (lazy evaluation via
+// Eigen expression templates) so they fuse into the final dm/dh/dn
+// assignment without materialising separate arrays.
+// =============================================================================
+
+void HHPool::compute_derivatives(
+    const Eigen::ArrayXd& V, const Eigen::ArrayXd& m,
+    const Eigen::ArrayXd& h, const Eigen::ArrayXd& n,
+    const Eigen::ArrayXd& I_ext,
+    Eigen::ArrayXd& dV, Eigen::ArrayXd& dm,
+    Eigen::ArrayXd& dh, Eigen::ArrayXd& dn)
+{
+    // Materialise intermediates used >1 time into pre-allocated buffers
+    tmp_n2_   = n * n;
+    tmp_Vp65_ = V + 65.0;
+    tmp_dVm_  = V + 40.0;
+    tmp_dVn_  = V + 55.0;
+
+    // Ionic currents — fused into a single pass writing to dV
+    dV = (I_ext
+          - g_Na_ * m.cube() * h * (V - E_Na_)
+          - g_K_ * tmp_n2_ * tmp_n2_ * (V - E_K_)
+          - g_L_ * (V - E_L_)) / C_m_;
+
+    // Rate functions — materialized into pre-allocated buffers.
+    // Forces Eigen to use SIMD packet evaluation for exp(), which
+    // lazy auto expressions may prevent when fused with outer ops.
+
+    // alpha_m: singularity at V=-40 via select (branchless)
+    tmp_am_ = (tmp_dVm_.abs() < 1e-7).select(
+        Eigen::ArrayXd::Ones(N_),
+        0.1 * tmp_dVm_ / (1.0 - (-tmp_dVm_ * 0.1).exp()));
+
+    tmp_bm_ = 4.0 * (-tmp_Vp65_ / 18.0).exp();
+    tmp_ah_ = 0.07 * (-tmp_Vp65_ * 0.05).exp();
+    tmp_bh_ = 1.0 / (1.0 + (-(V + 35.0) * 0.1).exp());
+
+    // alpha_n: singularity at V=-55 via select
+    tmp_an_ = (tmp_dVn_.abs() < 1e-7).select(
+        Eigen::ArrayXd::Constant(N_, 0.1),
+        0.01 * tmp_dVn_ / (1.0 - (-tmp_dVn_ * 0.1).exp()));
+
+    tmp_bn_ = 0.125 * (-tmp_Vp65_ * 0.0125).exp();
+
+    dm = tmp_am_ * (1.0 - m) - tmp_bm_ * m;
+    dh = tmp_ah_ * (1.0 - h) - tmp_bh_ * h;
+    dn = tmp_an_ * (1.0 - n) - tmp_bn_ * n;
+}
+
+// =============================================================================
+// Batched RK4 — accumulator pattern, zero allocation
+//
+// Instead of storing all four k-vectors (16 arrays), we use a running
+// accumulator: acc = k1, then += 2*k2, += 2*k3, += k4.
+// Only needs: 4 k + 4 acc + 4 saved = 12 pre-allocated arrays.
+// =============================================================================
+
+void HHPool::step_rk4(double dt) {
+    if (N_ == 0) return;
+
+    const double dt_half  = dt * 0.5;
+    const double dt_sixth = dt / 6.0;
+
+    // Save original state (writes to pre-allocated buffers, no alloc)
+    V0_ = V_;  m0_ = m_;  h0_ = h_;  n0_ = n_;
+
+    // --- k1 ---
+    compute_derivatives(V_, m_, h_, n_, I_ext_, kV_, km_, kh_, kn_);
+    accV_ = kV_;  accm_ = km_;  acch_ = kh_;  accn_ = kn_;
+
+    // --- k2 (midpoint from k1) ---
+    V_ = V0_ + dt_half * kV_;
+    m_ = (m0_ + dt_half * km_).max(0.0).min(1.0);
+    h_ = (h0_ + dt_half * kh_).max(0.0).min(1.0);
+    n_ = (n0_ + dt_half * kn_).max(0.0).min(1.0);
+    compute_derivatives(V_, m_, h_, n_, I_ext_, kV_, km_, kh_, kn_);
+    accV_ += 2.0 * kV_;  accm_ += 2.0 * km_;
+    acch_ += 2.0 * kh_;  accn_ += 2.0 * kn_;
+
+    // --- k3 (midpoint from k2) ---
+    V_ = V0_ + dt_half * kV_;
+    m_ = (m0_ + dt_half * km_).max(0.0).min(1.0);
+    h_ = (h0_ + dt_half * kh_).max(0.0).min(1.0);
+    n_ = (n0_ + dt_half * kn_).max(0.0).min(1.0);
+    compute_derivatives(V_, m_, h_, n_, I_ext_, kV_, km_, kh_, kn_);
+    accV_ += 2.0 * kV_;  accm_ += 2.0 * km_;
+    acch_ += 2.0 * kh_;  accn_ += 2.0 * kn_;
+
+    // --- k4 (endpoint from k3) ---
+    V_ = V0_ + dt * kV_;
+    m_ = (m0_ + dt * km_).max(0.0).min(1.0);
+    h_ = (h0_ + dt * kh_).max(0.0).min(1.0);
+    n_ = (n0_ + dt * kn_).max(0.0).min(1.0);
+    compute_derivatives(V_, m_, h_, n_, I_ext_, kV_, km_, kh_, kn_);
+    accV_ += kV_;  accm_ += km_;  acch_ += kh_;  accn_ += kn_;
+
+    // --- Combine ---
+    V_ = V0_ + dt_sixth * accV_;
+    m_ = (m0_ + dt_sixth * accm_).max(0.0).min(1.0);
+    h_ = (h0_ + dt_sixth * acch_).max(0.0).min(1.0);
+    n_ = (n0_ + dt_sixth * accn_).max(0.0).min(1.0);
+}
+
+// =============================================================================
+// Sync back to polymorphic API objects
+// =============================================================================
+
+void HHPool::sync_to_neurons(
+    std::vector<std::unique_ptr<NeuronBase>>& neurons) const
+{
+    for (size_t i = 0; i < N_; ++i) {
+        HHNeuron* hh = static_cast<HHNeuron*>(neurons[net_idx_[i]].get());
+        HHNeuron::State s;
+        s.V = V_(i);  s.m = m_(i);
+        s.h = h_(i);  s.n = n_(i);
+        hh->set_state(s);
+    }
+}
+
+} // namespace hodgkin_huxley

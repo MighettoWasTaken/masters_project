@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Optimization flags for Release builds
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     if(MSVC)
-        add_compile_options(/O2 /fp:fast)
+        add_compile_options(/O2 /fp:fast /arch:AVX2)
     elseif(MINGW)
         # Avoid -march=native on MinGW due to SEH/AVX bugs in older versions
         add_compile_options(-O3 -ffast-math)
@@ -17,6 +17,20 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
         add_compile_options(-O3 -march=native -ffast-math)
     endif()
 endif()
+
+# Fetch Eigen 3.4 (header-only, SIMD-vectorized math)
+include(FetchContent)
+FetchContent_Declare(
+    eigen
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG 3.4.0
+    GIT_SHALLOW TRUE
+)
+# Eigen has a heavy CMakeLists; skip tests/docs
+set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
+set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(eigen)
 
 # Find pybind11
 find_package(pybind11 CONFIG REQUIRED)

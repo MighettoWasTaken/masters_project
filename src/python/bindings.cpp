@@ -189,6 +189,13 @@ PYBIND11_MODULE(_core, m) {
     // Network
     // =========================================================================
 
+    // Network::ReceptorType enum
+    py::enum_<Network::ReceptorType>(m, "ReceptorType")
+        .value("AMPA", Network::ReceptorType::AMPA)
+        .value("NMDA", Network::ReceptorType::NMDA)
+        .value("GABA_A", Network::ReceptorType::GABA_A)
+        .export_values();
+
     // Network::NeuronType enum
     py::enum_<Network::NeuronType>(m, "NetworkNeuronType")
         .value("HH", Network::NeuronType::HH)
@@ -257,6 +264,22 @@ PYBIND11_MODULE(_core, m) {
              py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
              py::arg("E_syn") = 0.0, py::arg("tau_rise") = 0.4, py::arg("tau_decay") = 2.5,
              py::arg("delay") = 0.0)
+        .def("add_ampa_synapse", &Network::add_ampa_synapse,
+             "Add an AMPA synapse (E=0, tau_r=0.5, tau_d=2.5)",
+             py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
+             py::arg("delay") = 0.0)
+        .def("add_nmda_synapse", &Network::add_nmda_synapse,
+             "Add an NMDA synapse (E=0, tau_r=2.0, tau_d=67.0)",
+             py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
+             py::arg("delay") = 0.0)
+        .def("add_gaba_a_synapse", &Network::add_gaba_a_synapse,
+             "Add a GABA_A synapse (E=-80, tau_r=0.4, tau_d=7.7)",
+             py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
+             py::arg("delay") = 0.0)
+        .def("add_receptor_synapse", &Network::add_receptor_synapse,
+             "Add a synapse by receptor type (AMPA, NMDA, GABA_A)",
+             py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
+             py::arg("receptor"), py::arg("delay") = 0.0)
 
         // Properties
         .def_property_readonly("num_neurons", &Network::num_neurons)

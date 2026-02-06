@@ -141,7 +141,16 @@ def _hh_rk4_step(V, m, h, n, I, dt):
 
 
 class NumpyHHNetwork:
-    """Pure-NumPy HH network with exponential conductance-based synapses."""
+    """
+    Pure-NumPy HH network with conductance-based synapses.
+
+    Supports three synapse types matching the C++ backend:
+      - Exponential decay  (add_synapse)
+      - Alpha function     (add_alpha_synapse)
+      - Double exponential (add_double_exp_synapse)
+
+    All synapse types support axonal conduction delays.
+    """
 
     def __init__(self, num_neurons: int):
         self.N = num_neurons
@@ -157,42 +166,147 @@ class NumpyHHNetwork:
         bn = _beta_n(self.V)
         self.n = an / (an + bn)
 
-        # Synapse storage (parallel arrays)
-        self._pre: List[int] = []
-        self._post: List[int] = []
-        self._weight: List[float] = []
-        self._E_syn: List[float] = []
-        self._tau: List[float] = []
+        # Build-phase lists (converted to arrays in _finalise)
+        self._exp_list = []    # (pre, post, weight, E_syn, tau, delay)
+        self._alpha_list = []  # (pre, post, weight, E_syn, tau, delay)
+        self._dexp_list = []   # (pre, post, weight, E_syn, tau_r, tau_d, delay)
         self._finalised = False
+        self._delays_ready = False
 
-        # Built after finalise
-        self.pre = np.empty(0, dtype=np.intp)
-        self.post = np.empty(0, dtype=np.intp)
-        self.weight = np.empty(0)
-        self.E_syn = np.empty(0)
-        self.tau = np.empty(0)
-        self.g = np.empty(0)
-        self.V_pre_prev = np.empty(0)
+    # ------------------------------------------------------------------
+    # Synapse creation
+    # ------------------------------------------------------------------
 
     def add_synapse(self, pre: int, post: int, weight: float,
-                    E_syn: float = 0.0, tau: float = 2.0):
-        self._pre.append(pre)
-        self._post.append(post)
-        self._weight.append(weight)
-        self._E_syn.append(E_syn)
-        self._tau.append(tau)
+                    E_syn: float = 0.0, tau: float = 2.0,
+                    delay: float = 0.0):
+        """Add an exponential-decay synapse."""
+        self._exp_list.append((pre, post, weight, E_syn, tau, delay))
+
+    def add_alpha_synapse(self, pre: int, post: int, weight: float,
+                          E_syn: float = 0.0, tau: float = 2.0,
+                          delay: float = 0.0):
+        """Add an alpha-function synapse (peaks at t = tau)."""
+        self._alpha_list.append((pre, post, weight, E_syn, tau, delay))
+
+    def add_double_exp_synapse(self, pre: int, post: int, weight: float,
+                               E_syn: float = 0.0,
+                               tau_rise: float = 0.4, tau_decay: float = 2.5,
+                               delay: float = 0.0):
+        """Add a double-exponential synapse (separate rise/decay)."""
+        self._dexp_list.append((pre, post, weight, E_syn,
+                                tau_rise, tau_decay, delay))
+
+    # ------------------------------------------------------------------
+    # Finalise: convert lists -> numpy arrays
+    # ------------------------------------------------------------------
 
     def _finalise(self):
-        """Convert synapse lists into numpy arrays for vectorised access."""
-        S = len(self._pre)
-        self.pre = np.array(self._pre, dtype=np.intp)
-        self.post = np.array(self._post, dtype=np.intp)
-        self.weight = np.array(self._weight)
-        self.E_syn = np.array(self._E_syn)
-        self.tau = np.array(self._tau)
-        self.g = np.zeros(S)
-        self.V_pre_prev = np.full(S, -65.0)
+        from collections import deque  # noqa: used later for delays
+
+        # --- Exponential synapses ---
+        S = len(self._exp_list)
+        self.S_exp = S
+        if S > 0:
+            pre, post, w, e, tau, dly = zip(*self._exp_list)
+            self.exp_pre = np.array(pre, dtype=np.intp)
+            self.exp_post = np.array(post, dtype=np.intp)
+            self.exp_weight = np.array(w)
+            self.exp_E_syn = np.array(e)
+            self.exp_tau = np.array(tau)
+            self.exp_delay = np.array(dly)
+            self.exp_g = np.zeros(S)
+            self.exp_V_prev = np.full(S, -65.0)
+        else:
+            self.exp_delay = np.empty(0)
+
+        # --- Alpha synapses ---
+        S = len(self._alpha_list)
+        self.S_alpha = S
+        if S > 0:
+            pre, post, w, e, tau, dly = zip(*self._alpha_list)
+            self.alpha_pre = np.array(pre, dtype=np.intp)
+            self.alpha_post = np.array(post, dtype=np.intp)
+            self.alpha_weight = np.array(w)
+            self.alpha_E_syn = np.array(e)
+            self.alpha_tau = np.array(tau)
+            self.alpha_delay = np.array(dly)
+            self.alpha_g = np.zeros(S)
+            self.alpha_x = np.zeros(S)   # auxiliary variable for ODE
+            self.alpha_V_prev = np.full(S, -65.0)
+        else:
+            self.alpha_delay = np.empty(0)
+
+        # --- Double-exponential synapses ---
+        S = len(self._dexp_list)
+        self.S_dexp = S
+        if S > 0:
+            pre, post, w, e, tr, td, dly = zip(*self._dexp_list)
+            self.dexp_pre = np.array(pre, dtype=np.intp)
+            self.dexp_post = np.array(post, dtype=np.intp)
+            self.dexp_weight = np.array(w)
+            self.dexp_E_syn = np.array(e)
+            self.dexp_tau_rise = np.array(tr)
+            self.dexp_tau_decay = np.array(td)
+            self.dexp_delay = np.array(dly)
+            self.dexp_g = np.zeros(S)
+            self.dexp_g_rise = np.zeros(S)
+            self.dexp_g_decay = np.zeros(S)
+            self.dexp_V_prev = np.full(S, -65.0)
+
+            # normalisation so peak conductance = weight
+            tp = (self.dexp_tau_decay * self.dexp_tau_rise) / \
+                 (self.dexp_tau_decay - self.dexp_tau_rise) * \
+                 np.log(self.dexp_tau_decay / self.dexp_tau_rise)
+            pk = np.exp(-tp / self.dexp_tau_decay) - \
+                 np.exp(-tp / self.dexp_tau_rise)
+            self.dexp_norm = 1.0 / pk
+        else:
+            self.dexp_delay = np.empty(0)
+
         self._finalised = True
+
+    # ------------------------------------------------------------------
+    # Delay buffers — simple per-synapse deques (initialised lazily
+    # because we need dt which is only known at simulate-time)
+    # ------------------------------------------------------------------
+
+    def _setup_delay_buffers(self, dt):
+        from collections import deque
+
+        def _make_buffers(delay_arr, count):
+            bufs = [None] * count
+            any_delay = False
+            for i in range(count):
+                d = delay_arr[i]
+                if d > 0:
+                    n_steps = int(round(d / dt))
+                    if n_steps > 0:
+                        bufs[i] = deque([False] * n_steps,
+                                        maxlen=n_steps)
+                        any_delay = True
+            return bufs, any_delay
+
+        self._exp_dbufs, self._has_exp_dly = \
+            _make_buffers(self.exp_delay, self.S_exp)
+        self._alpha_dbufs, self._has_alpha_dly = \
+            _make_buffers(self.alpha_delay, self.S_alpha)
+        self._dexp_dbufs, self._has_dexp_dly = \
+            _make_buffers(self.dexp_delay, self.S_dexp)
+        self._delays_ready = True
+
+    def _apply_delays(self, spiked, buffers):
+        """Route spikes through per-synapse delay buffers."""
+        delayed = spiked.copy()
+        for i, buf in enumerate(buffers):
+            if buf is not None:
+                delayed[i] = buf[0]       # oldest entry
+                buf.append(spiked[i])      # push current (auto-pops oldest)
+        return delayed
+
+    # ------------------------------------------------------------------
+    # Simulate
+    # ------------------------------------------------------------------
 
     def simulate(self, duration: float, dt: float,
                  I_ext: np.ndarray) -> np.ndarray:
@@ -203,40 +317,103 @@ class NumpyHHNetwork:
         """
         if not self._finalised:
             self._finalise()
+        if not self._delays_ready:
+            self._setup_delay_buffers(dt)
 
         num_steps = int(duration / dt)
         traces = np.empty((self.N, num_steps))
-        S = len(self.pre)
-        decay = np.exp(-dt / self.tau) if S > 0 else np.empty(0)
+
+        # Pre-compute constants that don't change per step
+        if self.S_exp > 0:
+            exp_decay = np.exp(-dt / self.exp_tau)
+        if self.S_alpha > 0:
+            alpha_inv_tau = 1.0 / self.alpha_tau
+        if self.S_dexp > 0:
+            dexp_rise_decay = np.exp(-dt / self.dexp_tau_rise)
+            dexp_fall_decay = np.exp(-dt / self.dexp_tau_decay)
 
         for t in range(num_steps):
-            # Record
+            # Record voltages
             traces[:, t] = self.V
 
-            # Compute synaptic currents
+            # ---- Synaptic currents (all types contribute) ----
             I_syn = np.zeros(self.N)
-            if S > 0:
-                V_post = self.V[self.post]
-                currents = self.g * (self.E_syn - V_post)
-                np.add.at(I_syn, self.post, currents)
 
-            # Total current
+            if self.S_exp > 0:
+                V_post = self.V[self.exp_post]
+                np.add.at(I_syn, self.exp_post,
+                          self.exp_g * (self.exp_E_syn - V_post))
+
+            if self.S_alpha > 0:
+                V_post = self.V[self.alpha_post]
+                np.add.at(I_syn, self.alpha_post,
+                          self.alpha_g * (self.alpha_E_syn - V_post))
+
+            if self.S_dexp > 0:
+                V_post = self.V[self.dexp_post]
+                np.add.at(I_syn, self.dexp_post,
+                          self.dexp_g * (self.dexp_E_syn - V_post))
+
             I_total = I_ext[:, t] + I_syn
 
-            # RK4 step
+            # ---- RK4 neuron step ----
             self.V, self.m, self.h, self.n = _hh_rk4_step(
                 self.V, self.m, self.h, self.n, I_total, dt
             )
 
-            # Update synapses
-            if S > 0:
-                V_pre_now = self.V[self.pre]
-                spiked = (V_pre_now > 0.0) & (self.V_pre_prev <= 0.0)
-                self.g[spiked] += self.weight[spiked]
-                self.V_pre_prev = V_pre_now.copy()
-                self.g *= decay
-                # Clamp conductance to prevent runaway in dense networks
-                np.clip(self.g, 0.0, 1000.0, out=self.g)
+            # ---- Update exponential synapses ----
+            if self.S_exp > 0:
+                V_pre = self.V[self.exp_pre]
+                spiked = (V_pre > 0.0) & (self.exp_V_prev <= 0.0)
+                self.exp_V_prev = V_pre.copy()
+
+                if self._has_exp_dly:
+                    spiked = self._apply_delays(spiked, self._exp_dbufs)
+
+                self.exp_g[spiked] += self.exp_weight[spiked]
+                self.exp_g *= exp_decay
+                np.clip(self.exp_g, 0.0, 1000.0, out=self.exp_g)
+
+            # ---- Update alpha synapses ----
+            if self.S_alpha > 0:
+                V_pre = self.V[self.alpha_pre]
+                spiked = (V_pre > 0.0) & (self.alpha_V_prev <= 0.0)
+                self.alpha_V_prev = V_pre.copy()
+
+                if self._has_alpha_dly:
+                    spiked = self._apply_delays(spiked, self._alpha_dbufs)
+
+                # on spike: x += weight * e  (Euler's number)
+                self.alpha_x[spiked] += self.alpha_weight[spiked] * np.e
+
+                # ODE step:  dx/dt = -x/tau,  dg/dt = (x - g)/tau
+                dx = -self.alpha_x * alpha_inv_tau
+                dg = (self.alpha_x - self.alpha_g) * alpha_inv_tau
+                self.alpha_x += dt * dx
+                self.alpha_g += dt * dg
+                np.clip(self.alpha_g, 0.0, None, out=self.alpha_g)
+
+            # ---- Update double-exponential synapses ----
+            if self.S_dexp > 0:
+                V_pre = self.V[self.dexp_pre]
+                spiked = (V_pre > 0.0) & (self.dexp_V_prev <= 0.0)
+                self.dexp_V_prev = V_pre.copy()
+
+                if self._has_dexp_dly:
+                    spiked = self._apply_delays(spiked, self._dexp_dbufs)
+
+                # on spike: bump both rise and decay components
+                self.dexp_g_rise[spiked] += 1.0
+                self.dexp_g_decay[spiked] += 1.0
+
+                # exponential decay of both components
+                self.dexp_g_rise *= dexp_rise_decay
+                self.dexp_g_decay *= dexp_fall_decay
+
+                # conductance = weight * norm * (decay - rise)
+                self.dexp_g = self.dexp_weight * self.dexp_norm * \
+                              (self.dexp_g_decay - self.dexp_g_rise)
+                np.clip(self.dexp_g, 0.0, None, out=self.dexp_g)
 
         return traces
 

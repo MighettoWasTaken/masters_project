@@ -21,6 +21,7 @@ from hodgkin_huxley import (
     ExponentialSynapse,
     AlphaSynapse,
     DoubleExponentialSynapse,
+    ReceptorType,
 )
 
 
@@ -1041,3 +1042,257 @@ class TestSynapticDelayStability:
             traces_tiny[1], traces_zero[1], decimal=5,
             err_msg="Sub-dt delay should behave as zero delay"
         )
+
+
+# =============================================================================
+# Test Class: Receptor Types — Creation and Properties
+# =============================================================================
+
+class TestReceptorTypeCreation:
+    """Tests for receptor-type convenience methods and their default parameters."""
+
+    def test_ampa_synapse_properties(self):
+        """AMPA synapse should have E_syn=0, tau_rise=0.5, tau_decay=2.5."""
+        net = Network(2)
+        net.add_ampa_synapse(0, 1, WEIGHT)
+        syn = net.synapse(0)
+
+        assert syn.type_name() == "DoubleExponential"
+        assert syn.reversal_potential == pytest.approx(0.0)
+        assert syn.tau_rise == pytest.approx(0.5)
+        assert syn.tau_decay == pytest.approx(2.5)
+        assert syn.weight == pytest.approx(WEIGHT)
+
+    def test_nmda_synapse_properties(self):
+        """NMDA synapse should have E_syn=0, tau_rise=2.0, tau_decay=67.0."""
+        net = Network(2)
+        net.add_nmda_synapse(0, 1, WEIGHT)
+        syn = net.synapse(0)
+
+        assert syn.type_name() == "DoubleExponential"
+        assert syn.reversal_potential == pytest.approx(0.0)
+        assert syn.tau_rise == pytest.approx(2.0)
+        assert syn.tau_decay == pytest.approx(67.0)
+        assert syn.weight == pytest.approx(WEIGHT)
+
+    def test_gaba_a_synapse_properties(self):
+        """GABA_A synapse should have E_syn=-80, tau_rise=0.4, tau_decay=7.7."""
+        net = Network(2)
+        net.add_gaba_a_synapse(0, 1, WEIGHT)
+        syn = net.synapse(0)
+
+        assert syn.type_name() == "DoubleExponential"
+        assert syn.reversal_potential == pytest.approx(-80.0)
+        assert syn.tau_rise == pytest.approx(0.4)
+        assert syn.tau_decay == pytest.approx(7.7)
+        assert syn.weight == pytest.approx(WEIGHT)
+
+    def test_receptor_type_enum_ampa(self):
+        """add_receptor_synapse with AMPA should match add_ampa_synapse."""
+        net = Network(2)
+        net.add_receptor_synapse(0, 1, WEIGHT, ReceptorType.AMPA)
+        syn = net.synapse(0)
+
+        assert syn.reversal_potential == pytest.approx(0.0)
+        assert syn.tau_rise == pytest.approx(0.5)
+        assert syn.tau_decay == pytest.approx(2.5)
+
+    def test_receptor_type_enum_nmda(self):
+        """add_receptor_synapse with NMDA should match add_nmda_synapse."""
+        net = Network(2)
+        net.add_receptor_synapse(0, 1, WEIGHT, ReceptorType.NMDA)
+        syn = net.synapse(0)
+
+        assert syn.reversal_potential == pytest.approx(0.0)
+        assert syn.tau_rise == pytest.approx(2.0)
+        assert syn.tau_decay == pytest.approx(67.0)
+
+    def test_receptor_type_enum_gaba_a(self):
+        """add_receptor_synapse with GABA_A should match add_gaba_a_synapse."""
+        net = Network(2)
+        net.add_receptor_synapse(0, 1, WEIGHT, ReceptorType.GABA_A)
+        syn = net.synapse(0)
+
+        assert syn.reversal_potential == pytest.approx(-80.0)
+        assert syn.tau_rise == pytest.approx(0.4)
+        assert syn.tau_decay == pytest.approx(7.7)
+
+    def test_receptor_synapse_with_delay(self):
+        """Receptor-type synapses should accept delay parameter."""
+        net = Network(2)
+        net.add_ampa_synapse(0, 1, WEIGHT, delay=5.9)
+        assert net.synapse(0).delay == pytest.approx(5.9)
+
+        net.add_nmda_synapse(0, 1, WEIGHT, delay=2.0)
+        assert net.synapse(1).delay == pytest.approx(2.0)
+
+        net.add_gaba_a_synapse(0, 1, WEIGHT, delay=4.0)
+        assert net.synapse(2).delay == pytest.approx(4.0)
+
+    def test_receptor_enum_with_delay(self):
+        """add_receptor_synapse should pass delay through."""
+        net = Network(2)
+        net.add_receptor_synapse(0, 1, WEIGHT, ReceptorType.AMPA, delay=3.0)
+        assert net.synapse(0).delay == pytest.approx(3.0)
+
+    def test_mixed_receptor_types(self):
+        """Multiple receptor types in one network should all work."""
+        net = Network(4)
+        net.add_ampa_synapse(0, 1, WEIGHT)
+        net.add_nmda_synapse(1, 2, WEIGHT)
+        net.add_gaba_a_synapse(2, 3, WEIGHT)
+
+        assert net.num_synapses == 3
+        assert net.synapse(0).reversal_potential == pytest.approx(0.0)
+        assert net.synapse(1).tau_decay == pytest.approx(67.0)
+        assert net.synapse(2).reversal_potential == pytest.approx(-80.0)
+
+    def test_synapse_index_out_of_range_receptor(self):
+        """Receptor-type methods should raise on invalid neuron index."""
+        net = Network(2)
+        with pytest.raises(Exception):
+            net.add_ampa_synapse(0, 5, WEIGHT)
+        with pytest.raises(Exception):
+            net.add_nmda_synapse(5, 0, WEIGHT)
+        with pytest.raises(Exception):
+            net.add_gaba_a_synapse(0, 5, WEIGHT)
+
+
+# =============================================================================
+# Test Class: Receptor Types — Functional Behavior
+# =============================================================================
+
+class TestReceptorTypeBehavior:
+    """Tests verifying that receptor types produce biologically plausible behavior."""
+
+    def test_ampa_is_excitatory(self):
+        """AMPA (E_syn=0) should depolarize the postsynaptic neuron."""
+        duration = 300.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        ctrl = Network(2).simulate(duration, dt, I_ext)
+        ctrl_mean = get_mean_voltage(ctrl[1])
+
+        net = Network(2)
+        net.add_ampa_synapse(0, 1, WEIGHT_STRONG)
+        traces = net.simulate(duration, dt, I_ext)
+        assert get_mean_voltage(traces[1]) > ctrl_mean, \
+            "AMPA synapse should be excitatory"
+
+    def test_nmda_is_excitatory(self):
+        """NMDA (E_syn=0) should depolarize the postsynaptic neuron."""
+        duration = 500.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        ctrl = Network(2).simulate(duration, dt, I_ext)
+        ctrl_mean = get_mean_voltage(ctrl[1])
+
+        net = Network(2)
+        net.add_nmda_synapse(0, 1, WEIGHT_STRONG)
+        traces = net.simulate(duration, dt, I_ext)
+        assert get_mean_voltage(traces[1]) > ctrl_mean, \
+            "NMDA synapse should be excitatory"
+
+    def test_gaba_a_is_inhibitory(self):
+        """GABA_A (E_syn=-80) should hyperpolarize the postsynaptic neuron."""
+        duration = 300.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+        I_ext[1, :] = 10.0  # drive postsynaptic so inhibition is visible
+
+        ctrl = Network(2).simulate(duration, dt, I_ext)
+        ctrl_mean = get_mean_voltage(ctrl[1])
+
+        net = Network(2)
+        net.add_gaba_a_synapse(0, 1, WEIGHT_STRONG)
+        traces = net.simulate(duration, dt, I_ext)
+        assert get_mean_voltage(traces[1]) < ctrl_mean, \
+            "GABA_A synapse should be inhibitory"
+
+    def test_nmda_slower_than_ampa(self):
+        """NMDA (tau_decay=67) should have a more sustained effect than AMPA (tau_decay=2.5)."""
+        duration = 500.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        # Brief pulse to neuron 0 — only first 10ms
+        I_ext[0, :int(10.0 / dt)] = 30.0
+
+        net_ampa = Network(2)
+        net_ampa.add_ampa_synapse(0, 1, WEIGHT_STRONG)
+        traces_ampa = net_ampa.simulate(duration, dt, I_ext)
+
+        net_nmda = Network(2)
+        net_nmda.add_nmda_synapse(0, 1, WEIGHT_STRONG)
+        traces_nmda = net_nmda.simulate(duration, dt, I_ext)
+
+        # Look at late portion of trace (after 100ms) — NMDA should still
+        # show elevated voltage due to long decay, AMPA should have decayed
+        late_start = int(100.0 / dt)
+        ampa_late_mean = np.mean(traces_ampa[1][late_start:])
+        nmda_late_mean = np.mean(traces_nmda[1][late_start:])
+
+        assert nmda_late_mean > ampa_late_mean, \
+            f"NMDA late-phase mean ({nmda_late_mean:.2f}) should exceed " \
+            f"AMPA late-phase mean ({ampa_late_mean:.2f})"
+
+    def test_receptor_types_numerical_stability(self):
+        """All receptor types should remain stable over long simulations."""
+        duration = 1000.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
+        for add_fn in [
+            lambda n: n.add_ampa_synapse(0, 1, WEIGHT),
+            lambda n: n.add_nmda_synapse(0, 1, WEIGHT),
+            lambda n: n.add_gaba_a_synapse(0, 1, WEIGHT),
+        ]:
+            net = Network(2)
+            add_fn(net)
+            traces = net.simulate(duration, dt, I_ext)
+
+            for i in range(2):
+                assert not np.any(np.isnan(traces[i])), f"NaN in neuron {i}"
+                assert not np.any(np.isinf(traces[i])), f"Inf in neuron {i}"
+
+    def test_biologically_realistic_circuit(self):
+        """A Cortex->STN(AMPA)->GPe(AMPA)->GPi(GABA) circuit should work."""
+        duration = 300.0
+        dt = 0.01
+        num_steps = int(duration / dt)
+
+        # 4 neurons: Cortex(0), STN(1), GPe(2), GPi(3)
+        net = Network(4)
+        net.add_ampa_synapse(0, 1, WEIGHT_STRONG, delay=5.9)   # Cor -> STN
+        net.add_ampa_synapse(1, 2, WEIGHT_STRONG, delay=2.0)   # STN -> GPe
+        net.add_gaba_a_synapse(2, 3, WEIGHT_STRONG, delay=3.0) # GPe -> GPi
+
+        I_ext = np.zeros((4, num_steps))
+        I_ext[0, :] = 15.0  # drive cortex
+        I_ext[3, :] = 10.0  # drive GPi so inhibition is visible
+
+        traces = net.simulate(duration, dt, I_ext)
+
+        # All should be stable
+        for i in range(4):
+            assert not np.any(np.isnan(traces[i])), f"NaN in neuron {i}"
+            assert not np.any(np.isinf(traces[i])), f"Inf in neuron {i}"
+
+        # Cortex and STN should spike
+        assert count_spikes(traces[0]) > 0, "Cortex should spike"
+        assert count_spikes(traces[1]) > 0, "STN should spike via AMPA"
