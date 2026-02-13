@@ -58,3 +58,5 @@ conda-bld/
 
 # Benchmarks
 benchmarks/
+
+.claude/

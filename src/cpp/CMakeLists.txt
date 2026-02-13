@@ -7,6 +7,7 @@ add_library(hodgkin_huxley_core STATIC
     src/hh_pool.cpp
     src/iz_pool.cpp
     src/network.cpp
+    src/regional_network.cpp
 )
 
 target_include_directories(hodgkin_huxley_core PUBLIC

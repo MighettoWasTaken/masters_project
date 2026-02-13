@@ -48,6 +48,10 @@ public:
     };
 
     Network() = default;
+    Network(const Network&) = delete;
+    Network& operator=(const Network&) = delete;
+    Network(Network&&) = default;
+    Network& operator=(Network&&) = default;
 
     /**
      * @brief Create network with N HH neurons (backward compatible)

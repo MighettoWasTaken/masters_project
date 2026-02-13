@@ -6,6 +6,7 @@
 #include "hodgkin_huxley/neuron.hpp"
 #include "hodgkin_huxley/izhikevich.hpp"
 #include "hodgkin_huxley/network.hpp"
+#include "hodgkin_huxley/regional_network.hpp"
 
 namespace py = pybind11;
 using namespace hodgkin_huxley;
@@ -330,6 +331,151 @@ PYBIND11_MODULE(_core, m) {
     m.attr("Parameters") = m.attr("HHParameters");
     m.attr("State") = m.attr("HHState");
 
+    // =========================================================================
+    // ConnectivityPattern enum
+    // =========================================================================
+    py::enum_<ConnectivityPattern>(m, "ConnectivityPattern")
+        .value("ALL_TO_ALL", ConnectivityPattern::ALL_TO_ALL)
+        .value("ONE_TO_ONE", ConnectivityPattern::ONE_TO_ONE)
+        .value("SHIFTED", ConnectivityPattern::SHIFTED)
+        .value("RANDOM_SPARSE", ConnectivityPattern::RANDOM_SPARSE)
+        .value("RANDOM_PERMUTATION", ConnectivityPattern::RANDOM_PERMUTATION)
+        .export_values();
+
+    // =========================================================================
+    // SynapseSpec
+    // =========================================================================
+    py::class_<SynapseSpec>(m, "SynapseSpec")
+        .def_readwrite("type", &SynapseSpec::type)
+        .def_readwrite("E_syn", &SynapseSpec::E_syn)
+        .def_readwrite("tau", &SynapseSpec::tau)
+        .def_readwrite("tau_rise", &SynapseSpec::tau_rise)
+        .def_readwrite("tau_decay", &SynapseSpec::tau_decay)
+        .def_static("ampa", &SynapseSpec::ampa)
+        .def_static("nmda", &SynapseSpec::nmda)
+        .def_static("gaba_a", &SynapseSpec::gaba_a)
+        .def_static("exponential", &SynapseSpec::exponential,
+                     py::arg("E_syn"), py::arg("tau"))
+        .def_static("alpha", &SynapseSpec::alpha,
+                     py::arg("E_syn"), py::arg("tau"))
+        .def_static("double_exponential", &SynapseSpec::double_exponential,
+                     py::arg("E_syn"), py::arg("tau_rise"), py::arg("tau_decay"))
+        .def("__repr__", [](const SynapseSpec& s) {
+            std::string type_str;
+            switch (s.type) {
+                case SynapseSpec::Type::EXPONENTIAL: type_str = "EXP"; break;
+                case SynapseSpec::Type::ALPHA: type_str = "ALPHA"; break;
+                case SynapseSpec::Type::DOUBLE_EXPONENTIAL: type_str = "DEXP"; break;
+            }
+            return "<SynapseSpec " + type_str + " E=" + std::to_string(s.E_syn) + ">";
+        });
+
+    py::enum_<SynapseSpec::Type>(m, "SynapseSpecType")
+        .value("EXPONENTIAL", SynapseSpec::Type::EXPONENTIAL)
+        .value("ALPHA", SynapseSpec::Type::ALPHA)
+        .value("DOUBLE_EXPONENTIAL", SynapseSpec::Type::DOUBLE_EXPONENTIAL)
+        .export_values();
+
+    // =========================================================================
+    // WeightDistribution
+    // =========================================================================
+    py::enum_<WeightDistType>(m, "WeightDistType")
+        .value("CONSTANT", WeightDistType::CONSTANT)
+        .value("UNIFORM", WeightDistType::UNIFORM)
+        .value("NORMAL", WeightDistType::NORMAL)
+        .export_values();
+
+    py::class_<WeightDistribution>(m, "WeightDistribution")
+        .def_readwrite("type", &WeightDistribution::type)
+        .def_readwrite("param1", &WeightDistribution::param1)
+        .def_readwrite("param2", &WeightDistribution::param2)
+        .def_static("constant", &WeightDistribution::constant, py::arg("value"))
+        .def_static("uniform", &WeightDistribution::uniform,
+                     py::arg("min"), py::arg("max"))
+        .def_static("normal", &WeightDistribution::normal,
+                     py::arg("mean"), py::arg("std"))
+        .def("__repr__", [](const WeightDistribution& w) {
+            std::string type_str;
+            switch (w.type) {
+                case WeightDistType::CONSTANT: type_str = "CONSTANT"; break;
+                case WeightDistType::UNIFORM: type_str = "UNIFORM"; break;
+                case WeightDistType::NORMAL: type_str = "NORMAL"; break;
+            }
+            return "<WeightDistribution " + type_str +
+                   " p1=" + std::to_string(w.param1) +
+                   " p2=" + std::to_string(w.param2) + ">";
+        });
+
+    // =========================================================================
+    // RegionalNetwork
+    // =========================================================================
+    py::class_<RegionalNetwork>(m, "RegionalNetwork")
+        .def(py::init<>())
+
+        // Add populations (three overloads)
+        .def("add_population",
+             py::overload_cast<const std::string&, size_t, Network::NeuronType>(
+                 &RegionalNetwork::add_population),
+             "Add a population with neuron type preset",
+             py::arg("name"), py::arg("count"), py::arg("neuron_type"))
+        .def("add_population",
+             py::overload_cast<const std::string&, size_t, const HHNeuron::Parameters&>(
+                 &RegionalNetwork::add_population),
+             "Add a population with custom HH parameters",
+             py::arg("name"), py::arg("count"), py::arg("parameters"))
+        .def("add_population",
+             py::overload_cast<const std::string&, size_t, const IzhikevichNeuron::Parameters&>(
+                 &RegionalNetwork::add_population),
+             "Add a population with custom Izhikevich parameters",
+             py::arg("name"), py::arg("count"), py::arg("parameters"))
+
+        // Connectivity
+        .def("connect", &RegionalNetwork::connect,
+             "Connect two populations with a preset pattern",
+             py::arg("src"), py::arg("dst"), py::arg("pattern"),
+             py::arg("synapse"), py::arg("weight"),
+             py::arg("delay") = 0.0, py::arg("shift") = 1,
+             py::arg("probability") = 0.1, py::arg("allow_self") = false,
+             py::arg("seed") = 0)
+        .def("add_connection", &RegionalNetwork::add_connection,
+             "Add a single connection using local indices",
+             py::arg("src"), py::arg("src_local"),
+             py::arg("dst"), py::arg("dst_local"),
+             py::arg("weight"), py::arg("synapse"),
+             py::arg("delay") = 0.0)
+
+        // Initial conditions
+        .def("randomize_membrane_potentials",
+             &RegionalNetwork::randomize_membrane_potentials,
+             "Randomize membrane potentials in a population",
+             py::arg("name"), py::arg("mean"), py::arg("std_dev"),
+             py::arg("seed") = 0)
+
+        // Population queries
+        .def("population_names", &RegionalNetwork::population_names)
+        .def("population_size", &RegionalNetwork::population_size, py::arg("name"))
+        .def("population_start", &RegionalNetwork::population_start, py::arg("name"))
+        .def("num_populations", &RegionalNetwork::num_populations)
+
+        // Delegation
+        .def_property_readonly("num_neurons", &RegionalNetwork::num_neurons)
+        .def_property_readonly("num_synapses", &RegionalNetwork::num_synapses)
+        .def_property("fast_math", &RegionalNetwork::fast_math,
+                      &RegionalNetwork::set_fast_math)
+        .def("reset", &RegionalNetwork::reset)
+        .def("network", py::overload_cast<>(&RegionalNetwork::network),
+             py::return_value_policy::reference_internal)
+
+        // Simulate
+        .def("simulate", &RegionalNetwork::simulate,
+             py::arg("duration"), py::arg("dt"), py::arg("I_ext"))
+
+        .def("__repr__", [](const RegionalNetwork& rn) {
+            return "<RegionalNetwork populations=" + std::to_string(rn.num_populations()) +
+                   " neurons=" + std::to_string(rn.num_neurons()) +
+                   " synapses=" + std::to_string(rn.num_synapses()) + ">";
+        });
+
     // Module version
-    m.attr("__version__") = "0.3.0";
+    m.attr("__version__") = "0.4.0";
 }

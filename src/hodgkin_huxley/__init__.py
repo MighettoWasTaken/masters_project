@@ -32,6 +32,13 @@ from ._core import (
     Network as _Network,
     NetworkNeuronType,
     ReceptorType,
+    # Regional network
+    RegionalNetwork as _RegionalNetwork,
+    ConnectivityPattern,
+    SynapseSpec,
+    SynapseSpecType,
+    WeightDistribution,
+    WeightDistType,
     # Enums
     IntegrationMethod,
     # Version
@@ -60,6 +67,13 @@ __all__ = [
     "Network",
     "NetworkNeuronType",
     "ReceptorType",
+    # Regional network
+    "RegionalNetwork",
+    "ConnectivityPattern",
+    "SynapseSpec",
+    "SynapseSpecType",
+    "WeightDistribution",
+    "WeightDistType",
     # Enums
     "IntegrationMethod",
     # Version
@@ -709,3 +723,308 @@ class Network:
 
     def __repr__(self) -> str:
         return f"<Network neurons={self.num_neurons} synapses={self.num_synapses}>"
+
+
+# String-to-enum mapping for neuron types
+_NEURON_TYPE_MAP = {
+    "HH": NetworkNeuronType.HH,
+    "IZHIKEVICH_RS": NetworkNeuronType.IZHIKEVICH_RS,
+    "IZHIKEVICH_FS": NetworkNeuronType.IZHIKEVICH_FS,
+    "IZHIKEVICH_IB": NetworkNeuronType.IZHIKEVICH_IB,
+    "IZHIKEVICH_CH": NetworkNeuronType.IZHIKEVICH_CH,
+    "IZHIKEVICH_LTS": NetworkNeuronType.IZHIKEVICH_LTS,
+    "IZHIKEVICH_CUSTOM": NetworkNeuronType.IZHIKEVICH_CUSTOM,
+}
+
+# String-to-enum mapping for connectivity patterns
+_PATTERN_MAP = {
+    "ALL_TO_ALL": ConnectivityPattern.ALL_TO_ALL,
+    "ONE_TO_ONE": ConnectivityPattern.ONE_TO_ONE,
+    "SHIFTED": ConnectivityPattern.SHIFTED,
+    "RANDOM_SPARSE": ConnectivityPattern.RANDOM_SPARSE,
+    "RANDOM_PERMUTATION": ConnectivityPattern.RANDOM_PERMUTATION,
+}
+
+
+def _resolve_weight(weight) -> WeightDistribution:
+    """Convert weight shorthand to WeightDistribution."""
+    if isinstance(weight, WeightDistribution):
+        return weight
+    if isinstance(weight, (int, float)):
+        return WeightDistribution.constant(float(weight))
+    if isinstance(weight, tuple) and len(weight) == 2:
+        return WeightDistribution.uniform(float(weight[0]), float(weight[1]))
+    raise TypeError(
+        f"weight must be a float, (min, max) tuple, or WeightDistribution, "
+        f"got {type(weight).__name__}"
+    )
+
+
+class RegionalNetwork:
+    """
+    Population-based network abstraction for multi-region neural simulations.
+
+    Wraps a single Network. All neurons flow into the same HHPool/IzPool
+    during simulate(). Populations are bookkeeping: {name, start_idx, count}.
+
+    Examples
+    --------
+    >>> rn = RegionalNetwork()
+    >>> rn.add_population("STN", 10, neuron_type="HH")
+    >>> rn.add_population("GPe", 10, neuron_type="HH")
+    >>> rn.connect("STN", "GPe", "all_to_all", weight=0.3, delay=2.0,
+    ...            synapse=SynapseSpec.ampa())
+    >>> traces = rn.simulate(100, 0.01, {"STN": 10.0})
+    """
+
+    def __init__(self):
+        self._rnet = _RegionalNetwork()
+
+    def add_population(
+        self,
+        name: str,
+        count: int,
+        neuron_type: "str | NetworkNeuronType | None" = None,
+        parameters: "HHParameters | IzhikevichParameters | None" = None,
+    ) -> None:
+        """
+        Add a population of neurons.
+
+        Parameters
+        ----------
+        name : str
+            Unique name for the population.
+        count : int
+            Number of neurons.
+        neuron_type : str or NetworkNeuronType, optional
+            Neuron type preset ('HH', 'IZHIKEVICH_RS', etc.).
+        parameters : HHParameters or IzhikevichParameters, optional
+            Custom neuron parameters (overrides neuron_type).
+        """
+        if parameters is not None:
+            self._rnet.add_population(name, count, parameters)
+        elif neuron_type is not None:
+            if isinstance(neuron_type, str):
+                neuron_type = _NEURON_TYPE_MAP[neuron_type.upper()]
+            self._rnet.add_population(name, count, neuron_type)
+        else:
+            # Default to HH
+            self._rnet.add_population(name, count, NetworkNeuronType.HH)
+
+    def connect(
+        self,
+        src: str,
+        dst: str,
+        pattern,
+        weight=0.0,
+        delay: float = 0.0,
+        synapse: "SynapseSpec | None" = None,
+        shift: int = 1,
+        probability: float = 0.1,
+        allow_self: bool = False,
+        seed: int = 0,
+    ) -> None:
+        """
+        Connect two populations.
+
+        Parameters
+        ----------
+        src : str
+            Source population name.
+        dst : str
+            Destination population name.
+        pattern : str, ConnectivityPattern, or callable
+            Connectivity pattern. String presets: 'all_to_all', 'one_to_one',
+            'shifted', 'random_sparse', 'random_permutation'.
+            Or a callable: f(src_size, dst_size) -> list of (i, j) tuples.
+        weight : float, tuple, or WeightDistribution
+            Synaptic weight. Float for constant, (min, max) for uniform.
+        delay : float
+            Axonal delay in ms.
+        synapse : SynapseSpec, optional
+            Synapse type/kinetics. Default: SynapseSpec.ampa().
+        shift : int
+            Shift offset for SHIFTED pattern.
+        probability : float
+            Connection probability for RANDOM_SPARSE pattern.
+        allow_self : bool
+            Allow self-connections within same population.
+        seed : int
+            RNG seed (0 = random).
+        """
+        synapse = synapse or SynapseSpec.ampa()
+        wdist = _resolve_weight(weight)
+
+        if callable(pattern):
+            # Custom pattern: call Python function, add connections individually
+            src_size = self._rnet.population_size(src)
+            dst_size = self._rnet.population_size(dst)
+            pairs = pattern(src_size, dst_size)
+            rng = np.random.default_rng(seed if seed != 0 else None)
+            for (i, j) in pairs:
+                if wdist.type == WeightDistType.CONSTANT:
+                    w = wdist.param1
+                elif wdist.type == WeightDistType.UNIFORM:
+                    w = rng.uniform(wdist.param1, wdist.param2)
+                else:  # NORMAL
+                    w = rng.normal(wdist.param1, wdist.param2)
+                self._rnet.add_connection(src, int(i), dst, int(j),
+                                          float(w), synapse, delay)
+        else:
+            # Preset pattern: delegate to C++
+            if isinstance(pattern, str):
+                pattern = _PATTERN_MAP[pattern.upper()]
+            self._rnet.connect(src, dst, pattern, synapse, wdist, delay,
+                               shift, probability, allow_self, seed)
+
+    def add_connection(
+        self,
+        src: str,
+        src_local: int,
+        dst: str,
+        dst_local: int,
+        weight: float,
+        synapse: "SynapseSpec | None" = None,
+        delay: float = 0.0,
+    ) -> None:
+        """Add a single synapse between two populations using local indices."""
+        synapse = synapse or SynapseSpec.ampa()
+        self._rnet.add_connection(src, src_local, dst, dst_local, weight,
+                                  synapse, delay)
+
+    def randomize_membrane_potentials(
+        self, name: str, V_mean: float, V_std: float, seed: int = 0
+    ) -> None:
+        """Randomize membrane potentials for a population."""
+        self._rnet.randomize_membrane_potentials(name, V_mean, V_std, seed)
+
+    # ---- Population queries ----
+
+    def population_names(self) -> list:
+        """Get names of all populations in order."""
+        return self._rnet.population_names()
+
+    def population_size(self, name: str) -> int:
+        """Get the number of neurons in a population."""
+        return self._rnet.population_size(name)
+
+    def population_start(self, name: str) -> int:
+        """Get the global start index of a population."""
+        return self._rnet.population_start(name)
+
+    @property
+    def num_populations(self) -> int:
+        return self._rnet.num_populations()
+
+    @property
+    def num_neurons(self) -> int:
+        return self._rnet.num_neurons
+
+    @property
+    def num_synapses(self) -> int:
+        return self._rnet.num_synapses
+
+    @property
+    def fast_math(self) -> bool:
+        return self._rnet.fast_math
+
+    @fast_math.setter
+    def fast_math(self, enabled: bool) -> None:
+        self._rnet.fast_math = enabled
+
+    def reset(self) -> None:
+        """Reset all neurons to resting state."""
+        self._rnet.reset()
+
+    @property
+    def network(self) -> _Network:
+        """Access the underlying Network object."""
+        return self._rnet.network()
+
+    def simulate(
+        self,
+        duration: float,
+        dt: float,
+        I_ext: "dict | ArrayLike" = None,
+    ) -> "dict[str, NDArray[np.float64]]":
+        """
+        Run a network simulation.
+
+        Parameters
+        ----------
+        duration : float
+            Simulation duration in milliseconds.
+        dt : float
+            Time step in milliseconds.
+        I_ext : dict or array-like
+            External currents. Can be:
+            - dict {pop_name: value} where value is:
+              - scalar float: constant current for all neurons/timesteps
+              - 1D array (num_steps,): broadcast to all neurons in population
+              - 2D array (pop_size, num_steps): per-neuron current
+            - Missing populations get zero current
+            - Or a flat 2D array (num_neurons, num_steps) for raw access
+
+        Returns
+        -------
+        dict[str, NDArray[np.float64]]
+            Voltage traces keyed by population name, each shape
+            (pop_size, num_steps+1).
+        """
+        num_neurons = self._rnet.num_neurons
+        num_steps = int(duration / dt)
+
+        if I_ext is None:
+            I_ext = {}
+
+        if isinstance(I_ext, dict):
+            # Build flat I_ext array from dict
+            flat = np.zeros((num_neurons, num_steps), dtype=np.float64)
+            pop_names = self._rnet.population_names()
+            for name in pop_names:
+                if name not in I_ext:
+                    continue
+                val = I_ext[name]
+                start = self._rnet.population_start(name)
+                size = self._rnet.population_size(name)
+                val = np.asarray(val, dtype=np.float64)
+                if val.ndim == 0:
+                    # Scalar: constant for all neurons and timesteps
+                    flat[start:start + size, :] = val.item()
+                elif val.ndim == 1:
+                    # 1D: broadcast to all neurons
+                    flat[start:start + size, :] = val[np.newaxis, :num_steps]
+                elif val.ndim == 2:
+                    # 2D: per-neuron
+                    flat[start:start + size, :] = val[:, :num_steps]
+                else:
+                    raise ValueError(
+                        f"I_ext['{name}'] must be scalar, 1D, or 2D, "
+                        f"got {val.ndim}D"
+                    )
+            I_ext_list = flat.tolist()
+        else:
+            I_ext_arr = np.asarray(I_ext, dtype=np.float64)
+            I_ext_list = I_ext_arr.tolist()
+
+        traces = self._rnet.simulate(duration, dt, I_ext_list)
+        traces_arr = np.array(traces, dtype=np.float64)
+
+        # Slice result by population
+        result = {}
+        pop_names = self._rnet.population_names()
+        for name in pop_names:
+            start = self._rnet.population_start(name)
+            size = self._rnet.population_size(name)
+            result[name] = traces_arr[start:start + size, :]
+
+        return result
+
+    def __len__(self) -> int:
+        return self.num_neurons
+
+    def __repr__(self) -> str:
+        return (
+            f"<RegionalNetwork populations={self.num_populations} "
+            f"neurons={self.num_neurons} synapses={self.num_synapses}>"
+        )
