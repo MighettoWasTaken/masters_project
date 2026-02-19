@@ -1,5 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/stl_bind.h>
 #include <pybind11/numpy.h>
 
 #include "hodgkin_huxley/neuron_base.hpp"
@@ -7,9 +8,14 @@
 #include "hodgkin_huxley/izhikevich.hpp"
 #include "hodgkin_huxley/network.hpp"
 #include "hodgkin_huxley/regional_network.hpp"
+#include "hodgkin_huxley/ion_channels.hpp"
+#include "hodgkin_huxley/composable_neuron.hpp"
 
 namespace py = pybind11;
 using namespace hodgkin_huxley;
+
+PYBIND11_MAKE_OPAQUE(std::vector<GateSpec>);
+PYBIND11_MAKE_OPAQUE(std::vector<ChannelSpec>);
 
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Neural simulation library - C++ backend";
@@ -206,6 +212,7 @@ PYBIND11_MODULE(_core, m) {
         .value("IZHIKEVICH_CH", Network::NeuronType::IZHIKEVICH_CH)
         .value("IZHIKEVICH_LTS", Network::NeuronType::IZHIKEVICH_LTS)
         .value("IZHIKEVICH_CUSTOM", Network::NeuronType::IZHIKEVICH_CUSTOM)
+        .value("COMPOSABLE", Network::NeuronType::COMPOSABLE)
         .export_values();
 
     py::class_<Network>(m, "Network")
@@ -231,6 +238,10 @@ PYBIND11_MODULE(_core, m) {
              py::overload_cast<const IzhikevichNeuron::Parameters&>(&Network::add_neuron),
              "Add an Izhikevich neuron with custom parameters, returns index",
              py::arg("parameters"))
+        .def("add_neuron",
+             py::overload_cast<const NeuronModelSpec&>(&Network::add_neuron),
+             "Add a composable neuron from a model spec, returns index",
+             py::arg("spec"))
 
         // Explicit typed add methods
         .def("add_hh_neuron",
@@ -428,6 +439,11 @@ PYBIND11_MODULE(_core, m) {
                  &RegionalNetwork::add_population),
              "Add a population with custom Izhikevich parameters",
              py::arg("name"), py::arg("count"), py::arg("parameters"))
+        .def("add_population",
+             py::overload_cast<const std::string&, size_t, const NeuronModelSpec&>(
+                 &RegionalNetwork::add_population),
+             "Add a population with a composable neuron model spec",
+             py::arg("name"), py::arg("count"), py::arg("spec"))
 
         // Connectivity
         .def("connect", &RegionalNetwork::connect,
@@ -476,6 +492,158 @@ PYBIND11_MODULE(_core, m) {
                    " synapses=" + std::to_string(rn.num_synapses()) + ">";
         });
 
+    // =========================================================================
+    // Ion Channel / Composable Neuron types
+    // =========================================================================
+
+    // BoltzmannParams
+    py::class_<BoltzmannParams>(m, "BoltzmannParams")
+        .def(py::init<>())
+        .def_readwrite("v_half", &BoltzmannParams::v_half)
+        .def_readwrite("k", &BoltzmannParams::k)
+        .def("__repr__", [](const BoltzmannParams& p) {
+            return "<BoltzmannParams v_half=" + std::to_string(p.v_half) +
+                   " k=" + std::to_string(p.k) + ">";
+        });
+
+    // TauParams
+    py::enum_<TauParams::Form>(m, "TauForm")
+        .value("CONSTANT", TauParams::Form::CONSTANT)
+        .value("BOLTZMANN", TauParams::Form::BOLTZMANN)
+        .value("DOUBLE_EXP_SUM", TauParams::Form::DOUBLE_EXP_SUM)
+        .value("OFFSET_DOUBLE_EXP", TauParams::Form::OFFSET_DOUBLE_EXP)
+        .value("SCALED_EXP", TauParams::Form::SCALED_EXP)
+        .value("COMPOUND_AB", TauParams::Form::COMPOUND_AB)
+        .export_values();
+
+    py::class_<TauParams>(m, "TauParams")
+        .def(py::init<>())
+        .def_readwrite("form", &TauParams::form)
+        .def("get_param", [](const TauParams& t, int i) { return t.params[i]; })
+        .def("set_param", [](TauParams& t, int i, double v) { t.params[i] = v; })
+        .def("__repr__", [](const TauParams& t) {
+            return "<TauParams form=" + std::to_string(static_cast<int>(t.form)) + ">";
+        });
+
+    // RateFuncParams
+    py::enum_<RateFuncParams::Form>(m, "RateFuncForm")
+        .value("LINEAR_OVER_EXP", RateFuncParams::Form::LINEAR_OVER_EXP)
+        .value("EXP_DECAY", RateFuncParams::Form::EXP_DECAY)
+        .value("LINEAR_OVER_EXPM1", RateFuncParams::Form::LINEAR_OVER_EXPM1)
+        .value("SIGMOID", RateFuncParams::Form::SIGMOID)
+        .export_values();
+
+    py::class_<RateFuncParams>(m, "RateFuncParams")
+        .def(py::init<>())
+        .def_readwrite("form", &RateFuncParams::form)
+        .def_readwrite("A", &RateFuncParams::A)
+        .def_readwrite("B", &RateFuncParams::B)
+        .def_readwrite("C", &RateFuncParams::C)
+        .def("__repr__", [](const RateFuncParams& r) {
+            return "<RateFuncParams A=" + std::to_string(r.A) +
+                   " B=" + std::to_string(r.B) +
+                   " C=" + std::to_string(r.C) + ">";
+        });
+
+    // Opaque vector bindings — must come before any class that uses these vectors
+    py::bind_vector<std::vector<GateSpec>>(m, "GateSpecVector");
+    py::bind_vector<std::vector<ChannelSpec>>(m, "ChannelSpecVector");
+
+    // GateSpec
+    py::enum_<GateSpec::UpdateForm>(m, "GateUpdateForm")
+        .value("INF_TAU", GateSpec::UpdateForm::INF_TAU)
+        .value("ALPHA_BETA", GateSpec::UpdateForm::ALPHA_BETA)
+        .value("INSTANT", GateSpec::UpdateForm::INSTANT)
+        .value("DERIVED", GateSpec::UpdateForm::DERIVED)
+        .export_values();
+
+    py::enum_<GateSpec::Dependency>(m, "GateDependency")
+        .value("VOLTAGE", GateSpec::Dependency::VOLTAGE)
+        .value("CALCIUM", GateSpec::Dependency::CALCIUM)
+        .export_values();
+
+    py::class_<GateSpec>(m, "GateSpec")
+        .def(py::init<>())
+        .def_readwrite("name", &GateSpec::name)
+        .def_readwrite("update_form", &GateSpec::update_form)
+        .def_readwrite("dependency", &GateSpec::dependency)
+        .def_readwrite("scale", &GateSpec::scale)
+        .def_readwrite("initial_value", &GateSpec::initial_value)
+        .def_readwrite("inf", &GateSpec::inf)
+        .def_readwrite("tau", &GateSpec::tau)
+        .def_readwrite("alpha", &GateSpec::alpha)
+        .def_readwrite("beta", &GateSpec::beta)
+        .def_readwrite("derived_source_gate", &GateSpec::derived_source_gate)
+        .def_readwrite("derived_a", &GateSpec::derived_a)
+        .def_readwrite("derived_b", &GateSpec::derived_b)
+        .def_readwrite("derived_c", &GateSpec::derived_c)
+        .def("__repr__", [](const GateSpec& g) {
+            return "<GateSpec '" + g.name + "'>";
+        });
+
+    // ChannelSpec
+    py::class_<ChannelSpec>(m, "ChannelSpec")
+        .def(py::init<>())
+        .def_readwrite("name", &ChannelSpec::name)
+        .def_readwrite("g", &ChannelSpec::g)
+        .def_readwrite("E_rev", &ChannelSpec::E_rev)
+        .def_readwrite("use_calcium_nernst", &ChannelSpec::use_calcium_nernst)
+        .def_readwrite("gates", &ChannelSpec::gates)
+        .def_readwrite("is_ahp", &ChannelSpec::is_ahp)
+        .def_readwrite("ahp_k1", &ChannelSpec::ahp_k1)
+        .def("__repr__", [](const ChannelSpec& c) {
+            return "<ChannelSpec '" + c.name + "' g=" + std::to_string(c.g) + ">";
+        });
+
+    // CalciumSpec
+    py::class_<CalciumSpec>(m, "CalciumSpec")
+        .def(py::init<>())
+        .def_readwrite("enabled", &CalciumSpec::enabled)
+        .def_readwrite("use_nernst", &CalciumSpec::use_nernst)
+        .def_readwrite("epsilon", &CalciumSpec::epsilon)
+        .def_readwrite("K_Ca", &CalciumSpec::K_Ca)
+        .def_readwrite("Ca_init", &CalciumSpec::Ca_init)
+        .def_readwrite("Ca_o", &CalciumSpec::Ca_o)
+        .def_readwrite("z", &CalciumSpec::z)
+        .def_readwrite("F", &CalciumSpec::F)
+        .def_readwrite("R", &CalciumSpec::R)
+        .def_readwrite("T", &CalciumSpec::T)
+        .def_readwrite("source_channels", &CalciumSpec::source_channels)
+        .def("__repr__", [](const CalciumSpec& c) {
+            return "<CalciumSpec enabled=" + std::string(c.enabled ? "true" : "false") + ">";
+        });
+
+    // NeuronModelSpec
+    py::class_<NeuronModelSpec>(m, "NeuronModelSpec")
+        .def(py::init<>())
+        .def_readwrite("name", &NeuronModelSpec::name)
+        .def_readwrite("C_m", &NeuronModelSpec::C_m)
+        .def_readwrite("V_init", &NeuronModelSpec::V_init)
+        .def_readwrite("gates", &NeuronModelSpec::gates)
+        .def_readwrite("channels", &NeuronModelSpec::channels)
+        .def_readwrite("calcium", &NeuronModelSpec::calcium)
+        .def_static("thalamic", &NeuronModelSpec::thalamic)
+        .def_static("stn", &NeuronModelSpec::stn)
+        .def_static("gpe", &NeuronModelSpec::gpe)
+        .def_static("gpi", &NeuronModelSpec::gpi)
+        .def_static("striatum", &NeuronModelSpec::striatum, py::arg("pd") = 0.0)
+        .def("__repr__", [](const NeuronModelSpec& s) {
+            return "<NeuronModelSpec '" + s.name + "' gates=" +
+                   std::to_string(s.gates.size()) + " channels=" +
+                   std::to_string(s.channels.size()) + ">";
+        });
+
+    // ComposableNeuron (inherits from NeuronBase)
+    py::class_<ComposableNeuron, NeuronBase>(m, "ComposableNeuron")
+        .def(py::init<const NeuronModelSpec&>(), py::arg("spec"))
+        .def_property_readonly("model_spec", &ComposableNeuron::model_spec)
+        .def_property_readonly("gate_states", &ComposableNeuron::gate_states)
+        .def_property_readonly("calcium", &ComposableNeuron::calcium)
+        .def("__repr__", [](const ComposableNeuron& n) {
+            return "<ComposableNeuron " + n.type_name() +
+                   " V=" + std::to_string(n.membrane_potential()) + " mV>";
+        });
+
     // Module version
-    m.attr("__version__") = "0.4.0";
+    m.attr("__version__") = "0.5.0";
 }

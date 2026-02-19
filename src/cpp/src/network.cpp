@@ -3,6 +3,7 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <map>
 
 namespace hodgkin_huxley {
 
@@ -54,6 +55,8 @@ size_t Network::add_neuron(NeuronType type) {
             return add_izhikevich_neuron(IzhikevichNeuron::Type::LOW_THRESHOLD_SPIKING);
         case NeuronType::IZHIKEVICH_CUSTOM:
             return add_izhikevich_neuron(IzhikevichNeuron::Type::CUSTOM);
+        case NeuronType::COMPOSABLE:
+            throw std::runtime_error("COMPOSABLE type requires NeuronModelSpec overload");
         default:
             return add_hh_neuron();
     }
@@ -61,6 +64,11 @@ size_t Network::add_neuron(NeuronType type) {
 
 size_t Network::add_neuron(const IzhikevichNeuron::Parameters& params) {
     neurons_.push_back(std::make_unique<IzhikevichNeuron>(params));
+    return neurons_.size() - 1;
+}
+
+size_t Network::add_neuron(const NeuronModelSpec& spec) {
+    neurons_.push_back(std::make_unique<ComposableNeuron>(spec));
     return neurons_.size() - 1;
 }
 
@@ -686,19 +694,43 @@ std::vector<std::vector<double>> Network::simulate(
     // Build batched neuron pools — classify via dynamic_cast once
     // =========================================================================
     size_t n_hh = 0, n_iz = 0;
+    std::map<std::string, size_t> composable_counts;
     for (size_t i = 0; i < n_neurons; ++i) {
         if (dynamic_cast<HHNeuron*>(neurons_[i].get())) ++n_hh;
         else if (dynamic_cast<IzhikevichNeuron*>(neurons_[i].get())) ++n_iz;
+        else if (auto* cn = dynamic_cast<ComposableNeuron*>(neurons_[i].get())) {
+            composable_counts[cn->model_spec().name]++;
+        }
     }
 
     HHPool hh_pool(n_hh, fast_math_);
     IzPool iz_pool(n_iz);
+
+    // Create one ComposablePool per distinct model name
+    std::map<std::string, ComposablePool> comp_pools;
+    for (const auto& kv : composable_counts) {
+        // Find first neuron with this model to get the spec
+        for (size_t i = 0; i < n_neurons; ++i) {
+            auto* cn = dynamic_cast<ComposableNeuron*>(neurons_[i].get());
+            if (cn && cn->model_spec().name == kv.first) {
+                comp_pools.emplace(kv.first,
+                    ComposablePool(cn->model_spec(), kv.second, fast_math_));
+                break;
+            }
+        }
+    }
 
     for (size_t i = 0; i < n_neurons; ++i) {
         if (auto* hh = dynamic_cast<HHNeuron*>(neurons_[i].get())) {
             hh_pool.add(i, hh->parameters(), hh->state());
         } else if (auto* iz = dynamic_cast<IzhikevichNeuron*>(neurons_[i].get())) {
             iz_pool.add(i, iz->parameters(), iz->state());
+        } else if (auto* cn = dynamic_cast<ComposableNeuron*>(neurons_[i].get())) {
+            auto it = comp_pools.find(cn->model_spec().name);
+            if (it != comp_pools.end()) {
+                it->second.add(i, cn->membrane_potential(),
+                               cn->gate_states(), cn->calcium());
+            }
         }
     }
 
@@ -712,6 +744,7 @@ std::vector<std::vector<double>> Network::simulate(
         // Read voltages from pools into V_cache_
         hh_pool.scatter_voltages(V_cache_.data());
         iz_pool.scatter_voltages(V_cache_.data());
+        for (auto& kv : comp_pools) kv.second.scatter_voltages(V_cache_.data());
 
         // Record traces + gather external currents into I_syn_buffer_
         // (reuse I_syn_buffer_ as combined I buffer — compute_synaptic_currents
@@ -735,14 +768,17 @@ std::vector<std::vector<double>> Network::simulate(
         // Feed combined currents to pools
         hh_pool.gather_currents(I_syn_buffer_.data());
         iz_pool.gather_currents(I_syn_buffer_.data());
+        for (auto& kv : comp_pools) kv.second.gather_currents(I_syn_buffer_.data());
 
         // Step pools (batched SIMD — the main performance win)
         hh_pool.step_rk4(dt);
         iz_pool.step_euler(dt);
+        for (auto& kv : comp_pools) kv.second.step(dt);
 
         // Re-read voltages for spike detection
         hh_pool.scatter_voltages(V_cache_.data());
         iz_pool.scatter_voltages(V_cache_.data());
+        for (auto& kv : comp_pools) kv.second.scatter_voltages(V_cache_.data());
 
         // Type-separated synapse update (no switch in inner loops)
         update_synapses_grouped(dt);
@@ -753,6 +789,7 @@ std::vector<std::vector<double>> Network::simulate(
     // =========================================================================
     hh_pool.sync_to_neurons(neurons_);
     iz_pool.sync_to_neurons(neurons_);
+    for (const auto& kv : comp_pools) kv.second.sync_to_neurons(neurons_);
     sync_soa_to_objects();
 
     return traces;

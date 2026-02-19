@@ -41,6 +41,19 @@ from ._core import (
     WeightDistType,
     # Enums
     IntegrationMethod,
+    # Composable neuron types
+    BoltzmannParams,
+    TauParams,
+    TauForm,
+    RateFuncParams,
+    RateFuncForm,
+    GateSpec,
+    GateUpdateForm,
+    GateDependency,
+    ChannelSpec,
+    CalciumSpec,
+    NeuronModelSpec,
+    ComposableNeuron as _ComposableNeuron,
     # Version
     __version__,
     # Backwards compatibility
@@ -76,6 +89,22 @@ __all__ = [
     "WeightDistType",
     # Enums
     "IntegrationMethod",
+    # Composable neuron types
+    "BoltzmannParams",
+    "TauParams",
+    "TauForm",
+    "RateFuncParams",
+    "RateFuncForm",
+    "GateSpec",
+    "GateUpdateForm",
+    "GateDependency",
+    "ChannelSpec",
+    "CalciumSpec",
+    "NeuronModelSpec",
+    "NeuronModel",
+    "Boltzmann",
+    "Tau",
+    "RateFunc",
     # Version
     "__version__",
     # Backwards compatibility
@@ -361,24 +390,30 @@ class Network:
 
     def add_neuron(
         self,
-        parameters: Union[HHParameters, IzhikevichParameters, None] = None,
+        parameters: "Union[HHParameters, IzhikevichParameters, NeuronModelSpec, None]" = None,
         neuron_type: NetworkNeuronType | None = None,
+        model: "NeuronModelSpec | NeuronModel | None" = None,
     ) -> int:
         """
         Add a neuron to the network.
 
         Parameters
         ----------
-        parameters : HHParameters or IzhikevichParameters, optional
+        parameters : HHParameters, IzhikevichParameters, or NeuronModelSpec, optional
             Custom parameters for the neuron.
         neuron_type : NetworkNeuronType, optional
             Type of neuron to add.
+        model : NeuronModelSpec or NeuronModel, optional
+            Composable neuron model specification.
 
         Returns
         -------
         int
             Index of the added neuron.
         """
+        if model is not None:
+            spec = model.to_spec() if isinstance(model, NeuronModel) else model
+            return self._network.add_neuron(spec)
         if neuron_type is not None:
             return self._network.add_neuron(neuron_type)
         elif parameters is not None:
@@ -786,6 +821,7 @@ class RegionalNetwork:
         count: int,
         neuron_type: "str | NetworkNeuronType | None" = None,
         parameters: "HHParameters | IzhikevichParameters | None" = None,
+        model: "NeuronModelSpec | NeuronModel | None" = None,
     ) -> None:
         """
         Add a population of neurons.
@@ -800,8 +836,13 @@ class RegionalNetwork:
             Neuron type preset ('HH', 'IZHIKEVICH_RS', etc.).
         parameters : HHParameters or IzhikevichParameters, optional
             Custom neuron parameters (overrides neuron_type).
+        model : NeuronModelSpec or NeuronModel, optional
+            Composable neuron model specification.
         """
-        if parameters is not None:
+        if model is not None:
+            spec = model.to_spec() if isinstance(model, NeuronModel) else model
+            self._rnet.add_population(name, count, spec)
+        elif parameters is not None:
             self._rnet.add_population(name, count, parameters)
         elif neuron_type is not None:
             if isinstance(neuron_type, str):
@@ -1027,4 +1068,252 @@ class RegionalNetwork:
         return (
             f"<RegionalNetwork populations={self.num_populations} "
             f"neurons={self.num_neurons} synapses={self.num_synapses}>"
+        )
+
+
+# =============================================================================
+# Python helper classes for composable neuron model building
+# =============================================================================
+
+class Boltzmann:
+    """Helper to create BoltzmannParams."""
+    def __init__(self, v_half: float, k: float):
+        self.v_half = v_half
+        self.k = k
+
+    def to_params(self) -> BoltzmannParams:
+        p = BoltzmannParams()
+        p.v_half = self.v_half
+        p.k = self.k
+        return p
+
+
+class Tau:
+    """Helper to create TauParams."""
+
+    @staticmethod
+    def constant(value: float) -> TauParams:
+        t = TauParams()
+        t.form = TauForm.CONSTANT
+        t.set_param(0, value)
+        return t
+
+    @staticmethod
+    def boltzmann(base: float, amp: float, v_half: float, k: float) -> TauParams:
+        t = TauParams()
+        t.form = TauForm.BOLTZMANN
+        t.set_param(0, base)
+        t.set_param(1, amp)
+        t.set_param(2, v_half)
+        t.set_param(3, k)
+        return t
+
+    @staticmethod
+    def scaled_exp(scale: float, v_half: float, k: float) -> TauParams:
+        t = TauParams()
+        t.form = TauForm.SCALED_EXP
+        t.set_param(0, scale)
+        t.set_param(1, v_half)
+        t.set_param(2, k)
+        return t
+
+    @staticmethod
+    def double_exp_sum(base, amp, v1, s1, v2, s2) -> TauParams:
+        t = TauParams()
+        t.form = TauForm.DOUBLE_EXP_SUM
+        t.set_param(0, base)
+        t.set_param(1, amp)
+        t.set_param(2, v1)
+        t.set_param(3, s1)
+        t.set_param(5, v2)
+        t.set_param(6, s2)
+        return t
+
+
+class RateFunc:
+    """Helper to create RateFuncParams."""
+
+    @staticmethod
+    def linear_over_exp(A: float, B: float, C: float) -> RateFuncParams:
+        r = RateFuncParams()
+        r.form = RateFuncForm.LINEAR_OVER_EXP
+        r.A = A
+        r.B = B
+        r.C = C
+        return r
+
+    @staticmethod
+    def exp_decay(A: float, B: float, C: float) -> RateFuncParams:
+        r = RateFuncParams()
+        r.form = RateFuncForm.EXP_DECAY
+        r.A = A
+        r.B = B
+        r.C = C
+        return r
+
+    @staticmethod
+    def linear_over_expm1(A: float, B: float, C: float) -> RateFuncParams:
+        r = RateFuncParams()
+        r.form = RateFuncForm.LINEAR_OVER_EXPM1
+        r.A = A
+        r.B = B
+        r.C = C
+        return r
+
+    @staticmethod
+    def sigmoid(A: float, B: float, C: float) -> RateFuncParams:
+        r = RateFuncParams()
+        r.form = RateFuncForm.SIGMOID
+        r.A = A
+        r.B = B
+        r.C = C
+        return r
+
+
+class NeuronModel:
+    """
+    Ergonomic builder for NeuronModelSpec.
+
+    Examples
+    --------
+    >>> model = NeuronModel("custom", C_m=1.0, V_init=-65.0)
+    >>> model.add_gate("m", update_form="instant", inf=Boltzmann(-37, 7))
+    >>> model.add_channel("Leak", g=0.3, E_rev=-54.3)
+    >>> spec = model.to_spec()
+    """
+
+    def __init__(self, name: str = "custom", C_m: float = 1.0, V_init: float = -65.0):
+        self._spec = NeuronModelSpec()
+        self._spec.name = name
+        self._spec.C_m = C_m
+        self._spec.V_init = V_init
+
+    def add_gate(
+        self,
+        name: str,
+        update_form: str = "inf_tau",
+        dependency: str = "voltage",
+        scale: float = 1.0,
+        initial_value: float = 0.0,
+        inf: "Boltzmann | BoltzmannParams | None" = None,
+        tau: "TauParams | None" = None,
+        alpha: "RateFuncParams | None" = None,
+        beta: "RateFuncParams | None" = None,
+        derived_source_gate: int = -1,
+        derived_a: float = 1.0,
+        derived_b: float = 0.0,
+        derived_c: float = 1.0,
+    ) -> int:
+        """Add a gate and return its index."""
+        g = GateSpec()
+        g.name = name
+        g.update_form = {
+            "inf_tau": GateUpdateForm.INF_TAU,
+            "alpha_beta": GateUpdateForm.ALPHA_BETA,
+            "instant": GateUpdateForm.INSTANT,
+            "derived": GateUpdateForm.DERIVED,
+        }[update_form.lower()]
+        g.dependency = (GateDependency.CALCIUM if dependency.lower() == "calcium"
+                        else GateDependency.VOLTAGE)
+        g.scale = scale
+        g.initial_value = initial_value
+        if inf is not None:
+            g.inf = inf.to_params() if isinstance(inf, Boltzmann) else inf
+        if tau is not None:
+            g.tau = tau
+        if alpha is not None:
+            g.alpha = alpha
+        if beta is not None:
+            g.beta = beta
+        g.derived_source_gate = derived_source_gate
+        g.derived_a = derived_a
+        g.derived_b = derived_b
+        g.derived_c = derived_c
+        self._spec.gates.append(g)
+        return len(self._spec.gates) - 1
+
+    def add_channel(
+        self,
+        name: str,
+        g: float,
+        E_rev: float,
+        gates: "list[tuple[int, int]] | None" = None,
+        use_calcium_nernst: bool = False,
+        is_ahp: bool = False,
+        ahp_k1: float = 0.0,
+    ) -> int:
+        """Add a channel and return its index."""
+        ch = ChannelSpec()
+        ch.name = name
+        ch.g = g
+        ch.E_rev = E_rev
+        ch.gates = gates or []
+        ch.use_calcium_nernst = use_calcium_nernst
+        ch.is_ahp = is_ahp
+        ch.ahp_k1 = ahp_k1
+        self._spec.channels.append(ch)
+        return len(self._spec.channels) - 1
+
+    def add_leak(self, g: float, E_rev: float) -> int:
+        """Add a leak channel (no gates)."""
+        return self.add_channel("Leak", g, E_rev)
+
+    def set_calcium(
+        self,
+        epsilon: float = 1e-4,
+        K_Ca: float = 15.0,
+        Ca_init: float = 0.1,
+        use_nernst: bool = False,
+        Ca_o: float = 2000.0,
+        source_channels: "list[int] | None" = None,
+    ) -> None:
+        """Configure calcium dynamics."""
+        ca = self._spec.calcium
+        ca.enabled = True
+        ca.epsilon = epsilon
+        ca.K_Ca = K_Ca
+        ca.Ca_init = Ca_init
+        ca.use_nernst = use_nernst
+        ca.Ca_o = Ca_o
+        ca.source_channels = source_channels or []
+
+    def to_spec(self) -> NeuronModelSpec:
+        """Build and return the NeuronModelSpec."""
+        return self._spec
+
+    @staticmethod
+    def thalamic() -> "NeuronModel":
+        m = NeuronModel.__new__(NeuronModel)
+        m._spec = NeuronModelSpec.thalamic()
+        return m
+
+    @staticmethod
+    def stn() -> "NeuronModel":
+        m = NeuronModel.__new__(NeuronModel)
+        m._spec = NeuronModelSpec.stn()
+        return m
+
+    @staticmethod
+    def gpe() -> "NeuronModel":
+        m = NeuronModel.__new__(NeuronModel)
+        m._spec = NeuronModelSpec.gpe()
+        return m
+
+    @staticmethod
+    def gpi() -> "NeuronModel":
+        m = NeuronModel.__new__(NeuronModel)
+        m._spec = NeuronModelSpec.gpi()
+        return m
+
+    @staticmethod
+    def striatum(pd: float = 0.0) -> "NeuronModel":
+        m = NeuronModel.__new__(NeuronModel)
+        m._spec = NeuronModelSpec.striatum(pd)
+        return m
+
+    def __repr__(self) -> str:
+        return (
+            f"<NeuronModel '{self._spec.name}' "
+            f"gates={len(self._spec.gates)} "
+            f"channels={len(self._spec.channels)}>"
         )

@@ -76,6 +76,8 @@ public:
                         const HHNeuron::Parameters& params);
     void add_population(const std::string& name, size_t count,
                         const IzhikevichNeuron::Parameters& params);
+    void add_population(const std::string& name, size_t count,
+                        const NeuronModelSpec& spec);
 
     // Bulk connectivity (preset pattern, dispatched to C++)
     void connect(const std::string& src, const std::string& dst,

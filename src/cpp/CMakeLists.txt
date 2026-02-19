@@ -8,6 +8,9 @@ add_library(hodgkin_huxley_core STATIC
     src/iz_pool.cpp
     src/network.cpp
     src/regional_network.cpp
+    src/ion_channels.cpp
+    src/composable_neuron.cpp
+    src/composable_pool.cpp
 )
 
 target_include_directories(hodgkin_huxley_core PUBLIC

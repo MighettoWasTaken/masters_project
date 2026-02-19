@@ -6,6 +6,8 @@
 #include "synapse.hpp"
 #include "hh_pool.hpp"
 #include "iz_pool.hpp"
+#include "composable_neuron.hpp"
+#include "composable_pool.hpp"
 #include <vector>
 #include <memory>
 #include <string>
@@ -44,7 +46,8 @@ public:
         IZHIKEVICH_IB,
         IZHIKEVICH_CH,
         IZHIKEVICH_LTS,
-        IZHIKEVICH_CUSTOM
+        IZHIKEVICH_CUSTOM,
+        COMPOSABLE
     };
 
     Network() = default;
@@ -68,6 +71,7 @@ public:
     size_t add_neuron(const HHNeuron::Parameters& params);
     size_t add_neuron(NeuronType type);
     size_t add_neuron(const IzhikevichNeuron::Parameters& params);
+    size_t add_neuron(const NeuronModelSpec& spec);
 
     /**
      * @brief Add a neuron with explicit type specification
