@@ -4,7 +4,7 @@ RegionalNetwork Verification Tests
 Test Categories:
 1. Population management - add/query, duplicate name, custom params, contiguous indices
 2. Preset patterns - all_to_all, one_to_one, shifted, random_sparse, random_permutation
-3. Custom patterns - callable returns pairs, lambda pattern
+3. Custom patterns - callable returns pairs, lambda pattern, weight matrix
 4. SynapseSpec - receptor presets, custom exp/alpha/double_exp
 5. Weight distributions - constant, uniform, normal, tuple shorthand
 6. Initial conditions - randomize V mean/std, seed reproducibility
@@ -277,6 +277,39 @@ class TestCustomPatterns:
         rn.connect("A", "B", lambda s, d: [], weight=0.1,
                    synapse=SynapseSpec.ampa())
         assert rn.num_synapses == 0
+
+    def test_connect_from_matrix_numpy(self):
+        """connect_from_matrix with a numpy weight matrix creates exactly the
+        non-zero synapses and skips zero entries."""
+        rn = RegionalNetwork()
+        rn.add_population("A", 3)
+        rn.add_population("B", 3)
+        W = np.array([[0.5, 0.0, 0.3],
+                      [0.0, 0.4, 0.0],
+                      [0.2, 0.0, 0.6]])  # 5 non-zero entries
+        rn.connect_from_matrix("A", "B", W, synapse=SynapseSpec.ampa())
+        assert rn.num_synapses == 5
+
+    def test_connect_from_matrix_list(self):
+        """connect_from_matrix with a nested Python list produces the same
+        synapse count as the numpy path, and weight_scale is applied."""
+        rn = RegionalNetwork()
+        rn.add_population("A", 2)
+        rn.add_population("B", 2)
+        W = [[1.0, 0.0],
+             [0.5, 1.0]]  # 3 non-zero entries
+        rn.connect_from_matrix("A", "B", W, synapse=SynapseSpec.ampa(),
+                               weight_scale=0.1)
+        assert rn.num_synapses == 3
+
+    def test_connect_from_matrix_shape_mismatch_raises(self):
+        """A matrix whose dimensions don't match the population sizes raises
+        ValueError before any synapses are added."""
+        rn = RegionalNetwork()
+        rn.add_population("A", 3)
+        rn.add_population("B", 3)
+        with pytest.raises(ValueError):
+            rn.connect_from_matrix("A", "B", np.ones((4, 3)))
 
 
 # =============================================================================

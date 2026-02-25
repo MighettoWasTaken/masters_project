@@ -933,6 +933,84 @@ class RegionalNetwork:
         self._rnet.add_connection(src, src_local, dst, dst_local, weight,
                                   synapse, delay)
 
+    def connect_from_matrix(
+        self,
+        src: str,
+        dst: str,
+        matrix,
+        synapse: "SynapseSpec | None" = None,
+        delay: float = 0.0,
+        weight_scale: float = 1.0,
+    ) -> None:
+        """Connect two populations using a weight matrix.
+
+        Each non-zero entry ``matrix[i][j]`` creates a synapse from neuron
+        ``i`` in *src* to neuron ``j`` in *dst* with that weight (multiplied
+        by *weight_scale*).  Zero entries are skipped.
+
+        Parameters
+        ----------
+        src : str
+            Source population name.
+        dst : str
+            Destination population name.
+        matrix : 2-D array-like
+            Weight matrix of shape ``(src_size, dst_size)``.  Accepts numpy
+            arrays, nested Python lists, or any object that supports
+            ``matrix[i][j]`` indexing.  A zero value means no connection.
+        synapse : SynapseSpec, optional
+            Synapse type for all created connections.  Defaults to AMPA.
+        delay : float
+            Synaptic delay in ms applied to all connections.
+        weight_scale : float
+            Scalar multiplier applied to every weight before adding the
+            synapse.  Useful for unit conversions or gain tuning without
+            modifying the matrix.
+        """
+        synapse = synapse or SynapseSpec.ampa()
+        src_size = self._rnet.population_size(src)
+        dst_size = self._rnet.population_size(dst)
+
+        # Support numpy arrays via the buffer protocol, plain lists, or any
+        # other 2-D indexable.  We avoid importing numpy at the top level so
+        # the library stays usable without it as a hard dep at import time.
+        try:
+            import numpy as np
+            if isinstance(matrix, np.ndarray):
+                if matrix.ndim != 2:
+                    raise ValueError(
+                        f"connect_from_matrix: matrix must be 2-D, got shape {matrix.shape}"
+                    )
+                rows, cols = matrix.shape
+                if rows != src_size or cols != dst_size:
+                    raise ValueError(
+                        f"connect_from_matrix: matrix shape ({rows}, {cols}) does not match "
+                        f"population sizes src='{src}'({src_size}), dst='{dst}'({dst_size})"
+                    )
+                # Iterate only non-zero entries for speed
+                nz_i, nz_j = matrix.nonzero()
+                for i, j in zip(nz_i, nz_j):
+                    w = float(matrix[i, j]) * weight_scale
+                    self._rnet.add_connection(src, int(i), dst, int(j), w, synapse, delay)
+                return
+        except ImportError:
+            pass
+
+        # Plain Python list path
+        rows = len(matrix)
+        if rows != src_size:
+            raise ValueError(
+                f"connect_from_matrix: matrix has {rows} rows but src='{src}' has {src_size} neurons"
+            )
+        for i, row in enumerate(matrix):
+            if len(row) != dst_size:
+                raise ValueError(
+                    f"connect_from_matrix: row {i} has {len(row)} entries but dst='{dst}' has {dst_size} neurons"
+                )
+            for j, w in enumerate(row):
+                if w:
+                    self._rnet.add_connection(src, i, dst, j, float(w) * weight_scale, synapse, delay)
+
     def randomize_membrane_potentials(
         self, name: str, V_mean: float, V_std: float, seed: int = 0
     ) -> None:
