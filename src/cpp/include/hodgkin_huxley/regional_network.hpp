@@ -96,6 +96,12 @@ public:
                         double weight, const SynapseSpec& synapse,
                         double delay = 0.0);
 
+    // Add a kinetic synapse between two populations using local indices
+    void add_kinetic_connection(const std::string& src, size_t i,
+                                const std::string& dst, size_t j,
+                                double weight, const KineticSynapseSpec& spec,
+                                double delay = 0.0);
+
     // Heterogeneous initial conditions
     void randomize_membrane_potentials(const std::string& name,
                                        double mean, double std_dev,

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <cmath>
 
 namespace hodgkin_huxley {
 
@@ -98,6 +99,121 @@ struct NeuronModelSpec {
     static NeuronModelSpec gpe();
     static NeuronModelSpec gpi();
     static NeuronModelSpec striatum(double pd = 0.0);
+};
+
+// =============================================================================
+// Free math helpers — shared between composable_neuron.cpp and network.cpp
+// =============================================================================
+
+inline double boltzmann_scalar(double x, const BoltzmannParams& p) {
+    double arg = -(x - p.v_half) / p.k;
+    if (arg > 500.0) return 0.0;
+    if (arg < -500.0) return 1.0;
+    return 1.0 / (1.0 + std::exp(arg));
+}
+
+inline double compute_tau_scalar(double V, const TauParams& p) {
+    switch (p.form) {
+        case TauParams::Form::CONSTANT:
+            return p.params[0];
+        case TauParams::Form::BOLTZMANN: {
+            double arg = -(V - p.params[2]) / p.params[3];
+            arg = std::max(-500.0, std::min(500.0, arg));
+            return p.params[0] + p.params[1] / (1.0 + std::exp(arg));
+        }
+        case TauParams::Form::DOUBLE_EXP_SUM: {
+            double e1 = std::exp((V + p.params[2]) / p.params[3]);
+            double e2 = std::exp(-(V + p.params[5]) / p.params[6]);
+            double denom = e1 + e2;
+            if (denom < 1e-10) denom = 1e-10;
+            return p.params[0] + p.params[1] / denom;
+        }
+        case TauParams::Form::OFFSET_DOUBLE_EXP: {
+            double x1 = (V + p.params[2]) / p.params[3];
+            double x2 = (V + p.params[5]) / p.params[6];
+            return p.params[0] + p.params[1] * std::exp(-x1 * x1)
+                               + p.params[4] * std::exp(-x2 * x2);
+        }
+        case TauParams::Form::SCALED_EXP: {
+            double arg = (V - p.params[1]) / (2.0 * p.params[2]);
+            arg = std::max(-500.0, std::min(500.0, arg));
+            double ch = std::cosh(arg);
+            if (ch < 1e-10) ch = 1e-10;
+            return p.params[0] / ch;
+        }
+        case TauParams::Form::COMPOUND_AB: {
+            double alpha = p.params[0] * std::exp((V + p.params[1]) / p.params[2]);
+            double beta  = p.params[3] * std::exp((V + p.params[4]) / p.params[5]);
+            double sum = alpha + beta;
+            if (sum < 1e-10) sum = 1e-10;
+            return 1.0 / sum;
+        }
+    }
+    return 1.0;
+}
+
+inline double compute_rate_scalar(double V, const RateFuncParams& p) {
+    switch (p.form) {
+        case RateFuncParams::Form::LINEAR_OVER_EXP: {
+            double x = V + p.B;
+            double xc = x / p.C;
+            if (std::abs(xc) < 1e-6) return p.A * p.C * (1.0 + xc * 0.5);
+            return p.A * x / (std::exp(xc) - 1.0);
+        }
+        case RateFuncParams::Form::EXP_DECAY: {
+            double arg = (V + p.B) / p.C;
+            arg = std::max(-500.0, std::min(500.0, arg));
+            return p.A * std::exp(arg);
+        }
+        case RateFuncParams::Form::LINEAR_OVER_EXPM1: {
+            double x = V + p.B;
+            double xc = x / p.C;
+            if (std::abs(xc) < 1e-6) return p.A * p.C * (1.0 + xc * 0.5);
+            return p.A * x / (1.0 - std::exp(-xc));
+        }
+        case RateFuncParams::Form::SIGMOID: {
+            double arg = (V + p.B) / p.C;
+            arg = std::max(-500.0, std::min(500.0, arg));
+            return p.A / (1.0 + std::exp(arg));
+        }
+    }
+    return 0.0;
+}
+
+// =============================================================================
+// KineticSynapseSpec — composable kinetic synapse
+// =============================================================================
+
+struct KineticSynapseSpec {
+    std::string name;
+
+    enum class UpdateForm { ALPHA_BETA, TANH_GATE, BOLTZMANN_GATE };
+    UpdateForm update_form = UpdateForm::TANH_GATE;
+
+    // ALPHA_BETA: dS/dt = alpha(V)*(1-S) - beta(V)*S
+    RateFuncParams alpha, beta;
+
+    // TANH_GATE: dS/dt = tanh_amp*(1+tanh((V-tanh_vh)/tanh_k))*(1-S) - S/tau_decay
+    double tanh_amp = 2.0, tanh_vh = 0.0, tanh_k = 4.0, tau_decay = 13.0;
+
+    // BOLTZMANN_GATE: dS/dt = (S_inf(V) - S) / tau(V)
+    BoltzmannParams s_inf;
+    TauParams tau;
+
+    enum class CurrentForm { LINEAR, MG_BLOCK };
+    CurrentForm current_form = CurrentForm::LINEAR;
+
+    double g = 0.1, E_syn = -80.0;
+    int power = 1;
+
+    // MG_BLOCK (NMDA)
+    double mg_conc = 1.0, mg_scale = 0.062, mg_denom = 3.57;
+
+    double S_init = 0.0;
+
+    static KineticSynapseSpec gaba_kinetic();  // Kumaravelu 2016
+    static KineticSynapseSpec nmda_kinetic();  // NMDA + Mg block
+    static KineticSynapseSpec gaba_b();        // slow GABA-B
 };
 
 } // namespace hodgkin_huxley

@@ -216,6 +216,31 @@ void RegionalNetwork::add_connection(const std::string& src, size_t src_local,
 }
 
 // =============================================================================
+// Kinetic connection (single, between two populations)
+// =============================================================================
+
+void RegionalNetwork::add_kinetic_connection(const std::string& src, size_t i,
+                                              const std::string& dst, size_t j,
+                                              double weight, const KineticSynapseSpec& spec,
+                                              double delay) {
+    const auto& src_pop = population(src);
+    const auto& dst_pop = population(dst);
+    if (i >= src_pop.count) {
+        throw std::out_of_range("Source local index " + std::to_string(i) +
+                                " out of range for population '" + src + "' (size " +
+                                std::to_string(src_pop.count) + ")");
+    }
+    if (j >= dst_pop.count) {
+        throw std::out_of_range("Destination local index " + std::to_string(j) +
+                                " out of range for population '" + dst + "' (size " +
+                                std::to_string(dst_pop.count) + ")");
+    }
+    size_t pre  = src_pop.start_idx + i;
+    size_t post = dst_pop.start_idx + j;
+    net_.add_kinetic_synapse(pre, post, weight, spec, delay);
+}
+
+// =============================================================================
 // Bulk connectivity
 // =============================================================================
 

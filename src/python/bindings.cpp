@@ -215,7 +215,7 @@ PYBIND11_MODULE(_core, m) {
         .value("COMPOSABLE", Network::NeuronType::COMPOSABLE)
         .export_values();
 
-    py::class_<Network>(m, "Network")
+    auto netCls = py::class_<Network>(m, "Network")
         .def(py::init<>(), "Create an empty network")
         .def(py::init<size_t>(), "Create a network with n HH neurons", py::arg("num_neurons"))
         .def(py::init<size_t, Network::NeuronType>(),
@@ -319,6 +319,14 @@ PYBIND11_MODULE(_core, m) {
              py::return_value_policy::reference_internal,
              "Get synapse by index (polymorphic)", py::arg("idx"))
 
+        // Kinetic state accessors
+        .def("get_kin_S", &Network::get_kin_S,
+             "Get kinetic gating variable S for a synapse by index",
+             py::arg("synapse_idx"))
+        .def("get_kin_g", &Network::get_kin_g,
+             "Get effective conductance g for a synapse by index",
+             py::arg("synapse_idx"))
+
         // Simulation
         .def("get_potentials", &Network::get_potentials,
              "Get membrane potentials of all neurons")
@@ -420,7 +428,7 @@ PYBIND11_MODULE(_core, m) {
     // =========================================================================
     // RegionalNetwork
     // =========================================================================
-    py::class_<RegionalNetwork>(m, "RegionalNetwork")
+    auto rnetCls = py::class_<RegionalNetwork>(m, "RegionalNetwork")
         .def(py::init<>())
 
         // Add populations (three overloads)
@@ -644,6 +652,64 @@ PYBIND11_MODULE(_core, m) {
                    " V=" + std::to_string(n.membrane_potential()) + " mV>";
         });
 
+    // =========================================================================
+    // KineticSynapseSpec
+    // =========================================================================
+
+    py::enum_<KineticSynapseSpec::UpdateForm>(m, "KineticUpdateForm")
+        .value("ALPHA_BETA",     KineticSynapseSpec::UpdateForm::ALPHA_BETA)
+        .value("TANH_GATE",      KineticSynapseSpec::UpdateForm::TANH_GATE)
+        .value("BOLTZMANN_GATE", KineticSynapseSpec::UpdateForm::BOLTZMANN_GATE)
+        .export_values();
+
+    py::enum_<KineticSynapseSpec::CurrentForm>(m, "KineticCurrentForm")
+        .value("LINEAR",   KineticSynapseSpec::CurrentForm::LINEAR)
+        .value("MG_BLOCK", KineticSynapseSpec::CurrentForm::MG_BLOCK)
+        .export_values();
+
+    py::class_<KineticSynapseSpec>(m, "KineticSynapseSpec")
+        .def(py::init<>())
+        .def_readwrite("name",         &KineticSynapseSpec::name)
+        .def_readwrite("update_form",  &KineticSynapseSpec::update_form)
+        .def_readwrite("alpha",        &KineticSynapseSpec::alpha)
+        .def_readwrite("beta",         &KineticSynapseSpec::beta)
+        .def_readwrite("tanh_amp",     &KineticSynapseSpec::tanh_amp)
+        .def_readwrite("tanh_vh",      &KineticSynapseSpec::tanh_vh)
+        .def_readwrite("tanh_k",       &KineticSynapseSpec::tanh_k)
+        .def_readwrite("tau_decay",    &KineticSynapseSpec::tau_decay)
+        .def_readwrite("s_inf",        &KineticSynapseSpec::s_inf)
+        .def_readwrite("tau",          &KineticSynapseSpec::tau)
+        .def_readwrite("current_form", &KineticSynapseSpec::current_form)
+        .def_readwrite("g",            &KineticSynapseSpec::g)
+        .def_readwrite("E_syn",        &KineticSynapseSpec::E_syn)
+        .def_readwrite("power",        &KineticSynapseSpec::power)
+        .def_readwrite("mg_conc",      &KineticSynapseSpec::mg_conc)
+        .def_readwrite("mg_scale",     &KineticSynapseSpec::mg_scale)
+        .def_readwrite("mg_denom",     &KineticSynapseSpec::mg_denom)
+        .def_readwrite("S_init",       &KineticSynapseSpec::S_init)
+        .def_static("gaba_kinetic", &KineticSynapseSpec::gaba_kinetic)
+        .def_static("nmda_kinetic", &KineticSynapseSpec::nmda_kinetic)
+        .def_static("gaba_b",       &KineticSynapseSpec::gaba_b)
+        .def("__repr__", [](const KineticSynapseSpec& s) {
+            return "<KineticSynapseSpec '" + s.name + "'>";
+        });
+
+    // Network.add_kinetic_synapse (added after KineticSynapseSpec is registered)
+    netCls.def("add_kinetic_synapse",
+        [](Network& net, size_t pre, size_t post, double weight,
+           const KineticSynapseSpec& spec, double delay) {
+            return net.add_kinetic_synapse(pre, post, weight, spec, delay);
+        },
+        py::arg("pre"), py::arg("post"), py::arg("weight"),
+        py::arg("spec"), py::arg("delay") = 0.0);
+
+    // RegionalNetwork.add_kinetic_connection
+    rnetCls.def("add_kinetic_connection",
+        &RegionalNetwork::add_kinetic_connection,
+        py::arg("src"), py::arg("i"),
+        py::arg("dst"), py::arg("j"),
+        py::arg("weight"), py::arg("spec"), py::arg("delay") = 0.0);
+
     // Module version
-    m.attr("__version__") = "0.5.0";
+    m.attr("__version__") = "0.6.0";
 }

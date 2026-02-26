@@ -54,6 +54,10 @@ from ._core import (
     CalciumSpec,
     NeuronModelSpec,
     ComposableNeuron as _ComposableNeuron,
+    # Kinetic synapse
+    KineticSynapseSpec,
+    KineticUpdateForm,
+    KineticCurrentForm,
     # Version
     __version__,
     # Backwards compatibility
@@ -105,6 +109,11 @@ __all__ = [
     "Boltzmann",
     "Tau",
     "RateFunc",
+    # Kinetic synapse
+    "KineticSynapseSpec",
+    "KineticUpdateForm",
+    "KineticCurrentForm",
+    "KineticSynapseModel",
     # Version
     "__version__",
     # Backwards compatibility
@@ -665,6 +674,25 @@ class Network:
         """
         self._network.add_receptor_synapse(pre_idx, post_idx, weight, receptor, delay)
 
+    def add_kinetic_synapse(
+        self,
+        pre: int,
+        post: int,
+        weight: float,
+        spec: "KineticSynapseSpec",
+        delay: float = 0.0,
+    ) -> int:
+        """Add a kinetic (continuous V_pre-dependent) synapse. Returns synapse index."""
+        return self._network.add_kinetic_synapse(pre, post, weight, spec, delay)
+
+    def get_kin_S(self, synapse_idx: int) -> float:
+        """Get the current kinetic gating variable S for a synapse."""
+        return self._network.get_kin_S(synapse_idx)
+
+    def get_kin_g(self, synapse_idx: int) -> float:
+        """Get the current effective conductance g for a synapse."""
+        return self._network.get_kin_g(synapse_idx)
+
     def synapse(self, idx: int) -> SynapseBase:
         """Get a synapse by index (polymorphic access)."""
         return self._network.synapse(idx)
@@ -795,6 +823,40 @@ def _resolve_weight(weight) -> WeightDistribution:
     )
 
 
+def _generate_pairs(pattern, src_size, dst_size, shift, probability, allow_self, rng,
+                    same_pop=False):
+    """Generate (i, j) pairs for a preset connectivity pattern."""
+    pairs = []
+    if pattern == ConnectivityPattern.ALL_TO_ALL:
+        for i in range(src_size):
+            for j in range(dst_size):
+                if not allow_self and same_pop and i == j:
+                    continue
+                pairs.append((i, j))
+    elif pattern == ConnectivityPattern.ONE_TO_ONE:
+        n = min(src_size, dst_size)
+        for k in range(n):
+            pairs.append((k, k))
+    elif pattern == ConnectivityPattern.SHIFTED:
+        n = min(src_size, dst_size)
+        for k in range(n):
+            j = (k + shift) % n
+            pairs.append((k, j))
+    elif pattern == ConnectivityPattern.RANDOM_SPARSE:
+        for i in range(src_size):
+            for j in range(dst_size):
+                if not allow_self and same_pop and i == j:
+                    continue
+                if rng.random() < probability:
+                    pairs.append((i, j))
+    elif pattern == ConnectivityPattern.RANDOM_PERMUTATION:
+        n = min(src_size, dst_size)
+        perm = rng.permutation(n)
+        for k in range(n):
+            pairs.append((k, int(perm[k])))
+    return pairs
+
+
 class RegionalNetwork:
     """
     Population-based network abstraction for multi-region neural simulations.
@@ -864,6 +926,7 @@ class RegionalNetwork:
         probability: float = 0.1,
         allow_self: bool = False,
         seed: int = 0,
+        kinetic_spec: "KineticSynapseSpec | None" = None,
     ) -> None:
         """
         Connect two populations.
@@ -893,8 +956,37 @@ class RegionalNetwork:
         seed : int
             RNG seed (0 = random).
         """
-        synapse = synapse or SynapseSpec.ampa()
         wdist = _resolve_weight(weight)
+
+        if kinetic_spec is not None:
+            # Kinetic synapse path — generate pairs and call add_kinetic_connection
+            rng = np.random.default_rng(seed if seed != 0 else None)
+            src_size = self._rnet.population_size(src)
+            dst_size = self._rnet.population_size(dst)
+            same_pop = (src == dst)
+            if callable(pattern):
+                pairs = pattern(src_size, dst_size)
+            elif isinstance(pattern, str):
+                pattern = _PATTERN_MAP[pattern.upper()]
+                pairs = _generate_pairs(pattern, src_size, dst_size,
+                                        shift, probability, allow_self, rng,
+                                        same_pop=same_pop)
+            else:
+                pairs = _generate_pairs(pattern, src_size, dst_size,
+                                        shift, probability, allow_self, rng,
+                                        same_pop=same_pop)
+            for (i, j) in pairs:
+                if wdist.type == WeightDistType.CONSTANT:
+                    w = wdist.param1
+                elif wdist.type == WeightDistType.UNIFORM:
+                    w = rng.uniform(wdist.param1, wdist.param2)
+                else:
+                    w = rng.normal(wdist.param1, wdist.param2)
+                self._rnet.add_kinetic_connection(src, int(i), dst, int(j),
+                                                  float(w), kinetic_spec, delay)
+            return
+
+        synapse = synapse or SynapseSpec.ampa()
 
         if callable(pattern):
             # Custom pattern: call Python function, add connections individually
@@ -932,6 +1024,19 @@ class RegionalNetwork:
         synapse = synapse or SynapseSpec.ampa()
         self._rnet.add_connection(src, src_local, dst, dst_local, weight,
                                   synapse, delay)
+
+    def add_kinetic_connection(
+        self,
+        src: str,
+        i: int,
+        dst: str,
+        j: int,
+        weight: float,
+        spec: "KineticSynapseSpec",
+        delay: float = 0.0,
+    ) -> None:
+        """Add a kinetic synapse between two populations using local indices."""
+        self._rnet.add_kinetic_connection(src, i, dst, j, weight, spec, delay)
 
     def connect_from_matrix(
         self,
@@ -1395,3 +1500,96 @@ class NeuronModel:
             f"gates={len(self._spec.gates)} "
             f"channels={len(self._spec.channels)}>"
         )
+
+
+class KineticSynapseModel:
+    """
+    Fluent builder for KineticSynapseSpec.
+
+    Examples
+    --------
+    >>> spec = (KineticSynapseModel("GABA_kin")
+    ...         .tanh_gate(amp=2.0, v_half=0.0, k=4.0, tau_decay=13.0)
+    ...         .linear_current(g=0.1, E_syn=-80.0)
+    ...         .to_spec())
+    """
+
+    def __init__(self, name: str):
+        self._spec = KineticSynapseSpec()
+        self._spec.name = name
+
+    def tanh_gate(
+        self,
+        amp: float = 2.0,
+        v_half: float = 0.0,
+        k: float = 4.0,
+        tau_decay: float = 13.0,
+    ) -> "KineticSynapseModel":
+        self._spec.update_form = KineticUpdateForm.TANH_GATE
+        self._spec.tanh_amp = amp
+        self._spec.tanh_vh = v_half
+        self._spec.tanh_k = k
+        self._spec.tau_decay = tau_decay
+        return self
+
+    def boltzmann_gate(
+        self,
+        v_half: float,
+        k: float,
+        tau: float,
+    ) -> "KineticSynapseModel":
+        self._spec.update_form = KineticUpdateForm.BOLTZMANN_GATE
+        s_inf = BoltzmannParams()
+        s_inf.v_half = v_half
+        s_inf.k = k
+        self._spec.s_inf = s_inf
+        t = TauParams()
+        t.form = TauForm.CONSTANT
+        t.set_param(0, tau)
+        self._spec.tau = t
+        return self
+
+    def alpha_beta(
+        self,
+        alpha: "RateFuncParams",
+        beta: "RateFuncParams",
+    ) -> "KineticSynapseModel":
+        self._spec.update_form = KineticUpdateForm.ALPHA_BETA
+        self._spec.alpha = alpha
+        self._spec.beta = beta
+        return self
+
+    def linear_current(
+        self,
+        g: float,
+        E_syn: float,
+        power: int = 1,
+    ) -> "KineticSynapseModel":
+        self._spec.current_form = KineticCurrentForm.LINEAR
+        self._spec.g = g
+        self._spec.E_syn = E_syn
+        self._spec.power = power
+        return self
+
+    def mg_block_current(
+        self,
+        g: float,
+        E_syn: float,
+        mg_conc: float = 1.0,
+        mg_scale: float = 0.062,
+        mg_denom: float = 3.57,
+    ) -> "KineticSynapseModel":
+        self._spec.current_form = KineticCurrentForm.MG_BLOCK
+        self._spec.g = g
+        self._spec.E_syn = E_syn
+        self._spec.mg_conc = mg_conc
+        self._spec.mg_scale = mg_scale
+        self._spec.mg_denom = mg_denom
+        return self
+
+    def to_spec(self) -> KineticSynapseSpec:
+        """Return the built KineticSynapseSpec."""
+        return self._spec
+
+    def __repr__(self) -> str:
+        return f"<KineticSynapseModel '{self._spec.name}'>"

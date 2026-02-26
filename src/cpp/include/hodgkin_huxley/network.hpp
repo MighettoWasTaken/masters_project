@@ -8,6 +8,7 @@
 #include "iz_pool.hpp"
 #include "composable_neuron.hpp"
 #include "composable_pool.hpp"
+#include "ion_channels.hpp"
 #include <vector>
 #include <memory>
 #include <string>
@@ -81,6 +82,10 @@ public:
     size_t add_izhikevich_neuron(IzhikevichNeuron::Type type = IzhikevichNeuron::Type::REGULAR_SPIKING);
     size_t add_izhikevich_neuron(const IzhikevichNeuron::Parameters& params);
 
+    // Add kinetic synapse
+    size_t add_kinetic_synapse(size_t pre, size_t post, double weight,
+                               const KineticSynapseSpec& spec, double delay = 0.0);
+
     // Add synaptic connections
     void add_synapse(size_t pre_idx, size_t post_idx, double weight,
                      double E_syn = 0.0, double tau = 2.0,
@@ -106,6 +111,10 @@ public:
     // Getters
     [[nodiscard]] size_t num_neurons() const { return neurons_.size(); }
     [[nodiscard]] size_t num_synapses() const { return synapses_.size(); }
+
+    // Kinetic synapse state accessor (for testing / inspection)
+    [[nodiscard]] double get_kin_S(size_t synapse_idx) const;
+    [[nodiscard]] double get_kin_g(size_t synapse_idx) const;
 
     /**
      * @brief Get neuron by index (polymorphic access)
@@ -163,7 +172,7 @@ private:
     // Structure-of-Arrays (SoA) synapse data for cache-friendly inner loops.
     // Eliminates pointer chasing and enables SIMD auto-vectorization.
     // =========================================================================
-    enum SynType : uint8_t { SYN_EXP = 0, SYN_ALPHA = 1, SYN_DEXP = 2 };
+    enum class SynType : uint8_t { SYN_EXP = 0, SYN_ALPHA = 1, SYN_DEXP = 2, SYN_KINETIC = 3 };
 
     struct SynArrays {
         // Common fields (all synapse types)
@@ -201,6 +210,10 @@ private:
         std::vector<double> dexp_fall_decay;  // cached exp(-dt/tau_decay)
         std::vector<double> dexp_norm;
 
+        // Kinetic-specific
+        std::vector<double> kin_S;           // gating variable (0 for non-kinetic)
+        std::vector<size_t> kin_spec_idx;    // index into Network::kinetic_specs_
+
         double cached_dt = -1.0;
         size_t size() const { return pre.size(); }
 
@@ -217,6 +230,8 @@ private:
             dexp_rise_decay.push_back(0.0);
             dexp_fall_decay.push_back(0.0);
             dexp_norm.push_back(0.0);
+            kin_S.push_back(0.0);
+            kin_spec_idx.push_back(0);
         }
     } sa_;
 
@@ -229,8 +244,12 @@ private:
         std::vector<size_t> exp;
         std::vector<size_t> alpha;
         std::vector<size_t> dexp;
+        std::vector<size_t> kinetic;
     } syn_groups_;
     std::vector<uint8_t> spike_detected_;  // per-synapse spike flag buffer
+
+    // Kinetic synapse specs (deduped by name)
+    std::vector<KineticSynapseSpec> kinetic_specs_;
 
     // Use fast polynomial exp approximation (~8 digits) vs Eigen's built-in
     bool fast_math_ = true;

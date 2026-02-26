@@ -1,140 +1,335 @@
-# Task 6: Voltage-Dependent GABA Kinetic Synapse
+# Task 6: Composable Kinetic Synapse
 
 ## Priority: 1 (Critical)
 
 ## Overview
-Implement a voltage-dependent GABA kinetic synapse model used for intra-striatal inhibition in the benchmark. Unlike our existing spike-triggered synapses (exponential, alpha, double-exponential), this synapse has **continuously-varying** conductance driven by the presynaptic membrane potential — not by discrete spike events.
+
+The existing spike-triggered synapses (Exponential, Alpha, DoubleExponential) cover discrete-event conductance shapes well. However, many biologically important synapse models are **kinetic** — their gating variable evolves continuously as a function of the presynaptic membrane potential rather than firing in response to a detected spike. The canonical example is the GABA intra-striatal synapse required by the benchmark, but NMDA voltage-dependence, GABA-B metabotropic synapses, and many novel research models fall into this category.
+
+Rather than hardcoding `SYN_GABA_KINETIC` as a fourth fixed type, this task introduces a **composable kinetic synapse** system following the same design philosophy as the composable neuron (Task 5): parameterise the mathematical form, reuse existing structs (`RateFuncParams`, `BoltzmannParams`, `TauParams`), and let researchers configure novel synapses without touching C++.
 
 ---
 
-## 6.1 GABA Kinetic Model
+## 6.1 Design: KineticSynapseSpec
 
-The GABA synapse variable S evolves as:
+A kinetic synapse has two independently configurable parts: how its gating variable **S** evolves, and how **S** is used to produce a postsynaptic current.
+
+### 6.1.1 State Update Forms
+
 ```
-dS/dt = Ggaba(V_pre) * (1 - S) - S / tau_i
-```
-
-Where:
-- `S` is the synaptic gating variable (0 to 1)
-- `V_pre` is the presynaptic neuron's membrane potential (continuous, not spike-triggered)
-- `tau_i = 13 ms` is the decay time constant
-- `Ggaba(V) = 2 * (1 + tanh(V / 4))` is the voltage-dependent opening rate
-
-The resulting synaptic current on the postsynaptic neuron:
-```
-I_GABA = g_GABA * S * (V_post - E_GABA)
-```
-Where `E_GABA = -80 mV`.
-
-### Key Differences from Existing Synapses
-| Feature | Existing (Exp/Alpha/DblExp) | GABA Kinetic |
-|---------|---------------------------|--------------|
-| Trigger | Spike detection (threshold crossing) | Continuous V_pre |
-| Conductance shape | Analytic waveform | ODE-driven (dS/dt) |
-| State variable | g (decaying) | S (driven by V_pre) |
-| Presynaptic access | Only needs spike times | Needs V_pre every step |
-
----
-
-## 6.2 Benchmark Usage
-
-In the benchmark, GABA synapses are used for:
-
-### Cortex_I (inhibitory interneurons) → Striatum D1/D2
-```python
-# D2 striatum receives GABA from cortex inhibitory interneurons
-S1c = S1c + dt * ((Ggaba(V5) * (1 - S1c)) - (S1c / tau_i))
-# where V5 = vstr_indr (D2 striatum voltage)
-# S1c is then permuted and used as:
-Igaba5 = (ggaba / 4) * (V5 - Esyn[6]) * (S11cr + S12cr + S13cr + S14cr)
-# S11cr = S1c[all], S12cr = S1c[bll], etc. (random permutation indices)
+S ∈ [0, 1]  — synaptic gating variable
 ```
 
-**Note:** In the benchmark, the GABA S variable is driven by the **postsynaptic** neuron's own voltage (V5/V6), not the presynaptic cortical interneuron voltage. This represents a simplified local inhibition model where nearby striatal neurons inhibit each other based on their own activity.
+| Form | Equation | When to use |
+|---|---|---|
+| `ALPHA_BETA` | `dS/dt = α(V_pre)·(1-S) − β(V_pre)·S` | Classical receptor kinetics; α, β are `RateFuncParams` |
+| `TANH_GATE` | `dS/dt = amp·(1+tanh((V_pre−vh)/k))·(1-S) − S/τ_decay` | GABA intra-striatal (Kumaravelu 2016) |
+| `BOLTZMANN_GATE` | `dS/dt = (S_inf(V_pre) − S) / τ(V_pre)` | Reuses `BoltzmannParams` + `TauParams`; general first-order |
 
-### Parameters
-| Parameter | Value |
-|-----------|-------|
-| tau_i | 13 ms |
-| g_GABA | 0.1 |
-| E_GABA | -80 mV |
-| Ggaba(V) | 2 * (1 + tanh(V/4)) |
+All three use **exact exponential integration** (same fix applied to INF_TAU gates in Task 5) so numerical stability is guaranteed regardless of dt.
 
----
+### 6.1.2 Current Computation Forms
 
-## 6.3 C++ Implementation
+| Form | Equation | When to use |
+|---|---|---|
+| `LINEAR` | `I = g · S^n · (V_post − E_syn)` | GABA-A, AMPA kinetic, GABA-B |
+| `MG_BLOCK` | `I = g · S^n · (V_post − E_syn) / (1 + [Mg]·exp(−c·V_post)/d)` | NMDA with magnesium block |
 
-### New Synapse Type
-
-Add `SYN_GABA_KINETIC` to the existing SoA synapse system:
+### 6.1.3 C++ Struct
 
 ```cpp
-// In Network:
-enum SynType : uint8_t { SYN_EXP = 0, SYN_ALPHA = 1, SYN_DEXP = 2, SYN_GABA_KINETIC = 3 };
+// in ion_channels.hpp (natural home alongside composable neuron structs)
 
-// New SoA fields for GABA kinetic synapses:
-struct SynArrays {
-    // ... existing fields ...
+struct KineticSynapseSpec {
+    std::string name;
 
-    // GABA kinetic-specific
-    std::vector<double> gaba_S;       // synaptic gating variable
-    std::vector<double> gaba_tau_i;   // decay time constant
+    // ---- State update ------------------------------------------------
+    enum class UpdateForm { ALPHA_BETA, TANH_GATE, BOLTZMANN_GATE };
+    UpdateForm update_form = UpdateForm::TANH_GATE;
+
+    // ALPHA_BETA: α(V) and β(V) as rate functions (reuse existing type)
+    RateFuncParams alpha;
+    RateFuncParams beta;
+
+    // TANH_GATE: dS/dt = tanh_amp*(1+tanh((V-tanh_vh)/tanh_k))*(1-S) - S/tau_decay
+    double tanh_amp   = 2.0;
+    double tanh_vh    = 0.0;   // mV
+    double tanh_k     = 4.0;   // mV
+    double tau_decay  = 13.0;  // ms
+
+    // BOLTZMANN_GATE: dS/dt = (S_inf(V) - S) / tau(V)
+    BoltzmannParams s_inf;
+    TauParams       tau;
+
+    // ---- Current computation -----------------------------------------
+    enum class CurrentForm { LINEAR, MG_BLOCK };
+    CurrentForm current_form = CurrentForm::LINEAR;
+
+    double g      = 0.1;   // max conductance (mS/cm²)
+    double E_syn  = -80.0; // reversal potential (mV)
+    int    power  = 1;     // S^power
+
+    // MG_BLOCK parameters (NMDA)
+    double mg_conc  = 1.0;    // [Mg²⁺] mM
+    double mg_scale = 0.062;  // 1/mV
+    double mg_denom = 3.57;
+
+    // ---- Initial condition -------------------------------------------
+    double S_init = 0.0;
+
+    // ---- Preset factories -------------------------------------------
+    static KineticSynapseSpec gaba_kinetic();  // Kumaravelu 2016 intra-striatal
+    static KineticSynapseSpec nmda_kinetic();  // NMDA with Mg block
+    static KineticSynapseSpec gaba_b();        // slow GABA-B metabotropic
 };
 ```
 
-### New Network Method
+### 6.1.4 Preset Implementations
 
 ```cpp
-void add_gaba_kinetic_synapse(size_t pre_idx, size_t post_idx, double weight,
-                               double E_syn = -80.0, double tau_i = 13.0,
-                               double delay = 0.0);
+KineticSynapseSpec KineticSynapseSpec::gaba_kinetic() {
+    KineticSynapseSpec s;
+    s.name        = "GABA_kinetic";
+    s.update_form = UpdateForm::TANH_GATE;
+    s.tanh_amp    = 2.0;   s.tanh_vh = 0.0;   s.tanh_k = 4.0;
+    s.tau_decay   = 13.0;
+    s.current_form = CurrentForm::LINEAR;
+    s.g = 0.1;   s.E_syn = -80.0;   s.power = 1;
+    return s;
+}
+
+KineticSynapseSpec KineticSynapseSpec::nmda_kinetic() {
+    KineticSynapseSpec s;
+    s.name        = "NMDA_kinetic";
+    s.update_form = UpdateForm::BOLTZMANN_GATE;
+    s.s_inf       = {0.0, 16.0};    // S_inf = 1/(1+exp(-V/16))
+    s.tau.form    = TauParams::Form::CONSTANT;
+    s.tau.params[0] = 80.0;         // ms
+    s.current_form = CurrentForm::MG_BLOCK;
+    s.g = 0.3;   s.E_syn = 0.0;    s.power = 1;
+    s.mg_conc = 1.0;  s.mg_scale = 0.062;  s.mg_denom = 3.57;
+    return s;
+}
 ```
-
-### Update Logic
-
-In the synapse update loop, GABA kinetic synapses:
-1. Read `V_pre` from the presynaptic neuron (or postsynaptic, depending on model variant)
-2. Compute `Ggaba = 2 * (1 + tanh(V / 4))`
-3. Update `S += dt * (Ggaba * (1 - S) - S / tau_i)`
-4. Compute current: `I = weight * S * (V_post - E_syn)`
-
-This must be integrated into the `update_synapses_grouped()` method with a new `SynapseGroups::gaba_kinetic` index list.
 
 ---
 
-## 6.4 SynapseSpec Integration
+## 6.2 Network Integration
 
-Add GABA kinetic as a new SynapseSpec type for use with RegionalNetwork:
+### 6.2.1 SoA Storage
+
+Kinetic synapses live in their own SoA block inside `Network`, separate from the spike-triggered synapses. Each kinetic synapse needs:
 
 ```cpp
-struct SynapseSpec {
-    enum class Type { EXPONENTIAL, ALPHA, DOUBLE_EXPONENTIAL, GABA_KINETIC };
-    // ...
-    double tau_i;  // GABA kinetic decay time
-
-    static SynapseSpec gaba_kinetic(double E_syn = -80.0, double tau_i = 13.0);
+// in Network (private):
+struct KineticSynArrays {
+    std::vector<size_t>             pre_idx;
+    std::vector<size_t>             post_idx;
+    std::vector<double>             weight;
+    std::vector<double>             S;             // gating variable per synapse
+    std::vector<size_t>             spec_idx;      // index into kinetic_specs_
+    std::vector<size_t>             delay_steps;
+    // delay ring buffers (same mechanism as spike-triggered)
+    std::vector<std::vector<double>> delay_buf;
+    std::vector<size_t>             delay_head;
 };
+
+std::vector<KineticSynapseSpec> kinetic_specs_;   // unique specs (deduped by name)
+KineticSynArrays                kinetic_syns_;
 ```
 
-### Python Usage
-```python
-# In RegionalNetwork
-rn.connect("StrD2", "StrD2", "random_permutation",
-           weight=0.025, delay=0.0,
-           synapse=SynapseSpec.gaba_kinetic(E_syn=-80, tau_i=13))
+### 6.2.2 Per-Step Update (in simulate loop)
+
 ```
+for each kinetic synapse k:
+    V_pre  = V_cache_[pre_idx[k]]
+    V_post = V_cache_[post_idx[k]]
+    spec   = kinetic_specs_[spec_idx[k]]
+
+    // 1. Exact exponential integration of S
+    switch spec.update_form:
+        TANH_GATE:
+            rate_open = spec.tanh_amp * (1 + tanh((V_pre - spec.tanh_vh) / spec.tanh_k))
+            rate      = rate_open + 1.0/spec.tau_decay
+            S_inf     = rate_open / rate
+            S[k]      = S_inf + (S[k] - S_inf) * exp(-dt * rate)
+
+        ALPHA_BETA:
+            alpha = compute_rate(V_pre, spec.alpha)
+            beta  = compute_rate(V_pre, spec.beta)
+            rate  = alpha + beta
+            S_inf = alpha / max(rate, 1e-10)
+            S[k]  = S_inf + (S[k] - S_inf) * exp(-dt * rate)
+
+        BOLTZMANN_GATE:
+            S_inf = boltzmann(V_pre, spec.s_inf)
+            tau_s = compute_tau(V_pre, spec.tau)
+            S[k]  = S_inf + (S[k] - S_inf) * exp(-dt / tau_s)
+
+    // 2. Current (added into I_syn_buffer_[post_idx[k]])
+    g_eff = spec.g * weight[k] * S[k]^spec.power
+    switch spec.current_form:
+        LINEAR:   I = g_eff * (V_post - spec.E_syn)
+        MG_BLOCK: I = g_eff * (V_post - spec.E_syn)
+                       / (1 + spec.mg_conc * exp(-spec.mg_scale * V_post) / spec.mg_denom)
+    I_syn_buffer_[post_idx[k]] += I
+```
+
+Note: V_cache_ is already populated before the synapse update in the existing loop, so V_pre access is free.
+
+### 6.2.3 New Network Method
+
+```cpp
+size_t add_kinetic_synapse(size_t pre_idx, size_t post_idx,
+                           double weight,
+                           const KineticSynapseSpec& spec,
+                           double delay = 0.0);
+```
+
+---
+
+## 6.3 Python API
+
+### 6.3.1 Bindings
+
+```python
+# Preset factories
+KineticSynapseSpec.gaba_kinetic()
+KineticSynapseSpec.nmda_kinetic()
+KineticSynapseSpec.gaba_b()
+
+# Manual construction (all fields exposed via def_readwrite)
+spec = KineticSynapseSpec()
+spec.name         = "my_kinetic"
+spec.update_form  = KineticUpdateForm.TANH_GATE
+spec.tanh_amp     = 2.0
+spec.tau_decay    = 13.0
+spec.g            = 0.1
+spec.E_syn        = -80.0
+```
+
+### 6.3.2 Network.add_kinetic_synapse()
+
+```python
+net.add_kinetic_synapse(pre_idx=0, post_idx=1,
+                        weight=0.025,
+                        spec=KineticSynapseSpec.gaba_kinetic(),
+                        delay=0.0)
+```
+
+### 6.3.3 RegionalNetwork.connect() — kinetic path
+
+The existing `connect()` method already accepts `SynapseSpec` for spike-triggered synapses. Add an overload / kwarg to accept `KineticSynapseSpec`:
+
+```python
+rnet.connect("StrD2", "StrD2",
+             pattern="random_permutation",
+             weight=0.025,
+             kinetic_spec=KineticSynapseSpec.gaba_kinetic())
+```
+
+When `kinetic_spec` is provided, connections are added via `add_kinetic_synapse()` instead of `add_synapse()`.
+
+### 6.3.4 Python Builder (KineticSynapseModel)
+
+For researchers who want ergonomic construction without dealing with struct fields:
+
+```python
+class KineticSynapseModel:
+    def __init__(self, name):
+        self._spec = KineticSynapseSpec()
+        self._spec.name = name
+
+    def tanh_gate(self, amp=2.0, v_half=0.0, k=4.0, tau_decay=13.0):
+        self._spec.update_form = KineticUpdateForm.TANH_GATE
+        self._spec.tanh_amp = amp
+        self._spec.tanh_vh = v_half
+        self._spec.tanh_k = k
+        self._spec.tau_decay = tau_decay
+        return self
+
+    def boltzmann_gate(self, v_half, k, tau):
+        self._spec.update_form = KineticUpdateForm.BOLTZMANN_GATE
+        self._spec.s_inf = BoltzmannParams(v_half=v_half, k=k)
+        self._spec.tau.form = TauForm.CONSTANT
+        self._spec.tau.params[0] = tau
+        return self
+
+    def alpha_beta(self, alpha: RateFuncParams, beta: RateFuncParams):
+        self._spec.update_form = KineticUpdateForm.ALPHA_BETA
+        self._spec.alpha = alpha
+        self._spec.beta = beta
+        return self
+
+    def linear_current(self, g, E_syn, power=1):
+        self._spec.current_form = KineticCurrentForm.LINEAR
+        self._spec.g = g
+        self._spec.E_syn = E_syn
+        self._spec.power = power
+        return self
+
+    def mg_block_current(self, g, E_syn, mg_conc=1.0, mg_scale=0.062, mg_denom=3.57):
+        self._spec.current_form = KineticCurrentForm.MG_BLOCK
+        self._spec.g = g
+        self._spec.E_syn = E_syn
+        self._spec.mg_conc = mg_conc
+        self._spec.mg_scale = mg_scale
+        self._spec.mg_denom = mg_denom
+        return self
+
+    def to_spec(self) -> KineticSynapseSpec:
+        return self._spec
+```
+
+Usage:
+```python
+gaba = (KineticSynapseModel("my_GABA")
+        .tanh_gate(amp=2.0, v_half=0.0, k=4.0, tau_decay=13.0)
+        .linear_current(g=0.1, E_syn=-80.0)
+        .to_spec())
+```
+
+---
+
+## 6.4 What This Enables
+
+| Model | How to express |
+|---|---|
+| GABA intra-striatal (Kumaravelu 2016) | `KineticSynapseSpec.gaba_kinetic()` |
+| NMDA with Mg block | `KineticSynapseSpec.nmda_kinetic()` |
+| GABA-B slow (τ=200ms) | `KineticSynapseModel().boltzmann_gate(...).linear_current(E_syn=-95)` |
+| Novel first-order kinetic | `BOLTZMANN_GATE` with custom `BoltzmannParams` + `TauParams` |
+| Classical receptor kinetics | `ALPHA_BETA` with `RateFuncParams` α and β |
+| Custom Mg-like block | `MG_BLOCK` with tuned `mg_scale`, `mg_denom` |
 
 ---
 
 ## 6.5 Implementation Checklist
-- [ ] Add `SYN_GABA_KINETIC` to SynType enum
-- [ ] Add GABA-specific SoA fields (gaba_S, gaba_tau_i)
-- [ ] Implement `Network::add_gaba_kinetic_synapse()`
-- [ ] Implement GABA kinetic update in synapse grouped loop
-- [ ] Add `gaba_kinetic` to SynapseGroups index list
-- [ ] Add `GABA_KINETIC` to SynapseSpec::Type
-- [ ] Implement `SynapseSpec::gaba_kinetic()` factory
-- [ ] Update `add_synapse_from_spec()` in RegionalNetwork
-- [ ] Python bindings for new synapse type
-- [ ] Unit tests: S variable dynamics, steady-state at different V_pre, current sign/magnitude
-- [ ] Integration test: GABA inhibition suppresses postsynaptic firing
+
+### C++
+- [ ] Add `KineticSynapseSpec` struct to `ion_channels.hpp`
+- [ ] Implement `gaba_kinetic()`, `nmda_kinetic()`, `gaba_b()` presets in `ion_channels.cpp`
+- [ ] Add `KineticSynArrays` SoA block to `Network` (private)
+- [ ] Implement `Network::add_kinetic_synapse()`
+- [ ] Integrate kinetic synapse update into `Network::simulate()` loop
+- [ ] Integrate kinetic synapse update into `Network::step()` loop
+- [ ] Handle delay ring buffers for kinetic synapses (or defer: note delay=0 is valid for most kinetic models)
+- [ ] `Network::reset()` resets kinetic S values to `spec.S_init`
+
+### Python bindings
+- [ ] Expose `KineticSynapseSpec` fields via `def_readwrite`
+- [ ] Expose `KineticUpdateForm` and `KineticCurrentForm` enums
+- [ ] Expose preset factories
+- [ ] Expose `Network.add_kinetic_synapse()`
+- [ ] Add `kinetic_spec` kwarg to `RegionalNetwork.connect()`
+- [ ] Implement `KineticSynapseModel` builder in `__init__.py`
+- [ ] Export all new symbols from `__init__.py`
+
+### Tests
+- [ ] S variable converges to correct steady state for each update form
+- [ ] TANH_GATE: at V_pre=0, S_steady ≈ tanh_amp*2/(tanh_amp*2 + 1/tau_decay)
+- [ ] MG_BLOCK: current is reduced relative to LINEAR at hyperpolarised V_post
+- [ ] GABA kinetic preset suppresses postsynaptic firing
+- [ ] NMDA preset passes current only when postsynaptic neuron is depolarised
+- [ ] KineticSynapseModel builder round-trips to same spec as direct construction
+- [ ] `reset()` returns S to S_init
