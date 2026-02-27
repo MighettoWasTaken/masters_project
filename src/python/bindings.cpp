@@ -10,6 +10,7 @@
 #include "hodgkin_huxley/regional_network.hpp"
 #include "hodgkin_huxley/ion_channels.hpp"
 #include "hodgkin_huxley/composable_neuron.hpp"
+#include "hodgkin_huxley/dbs_stimulator.hpp"
 
 namespace py = pybind11;
 using namespace hodgkin_huxley;
@@ -334,8 +335,40 @@ PYBIND11_MODULE(_core, m) {
         .def("step", &Network::step, "Advance simulation by dt",
              py::arg("dt"), py::arg("I_ext"))
         .def("simulate", &Network::simulate,
-             "Run network simulation",
+             "Run network simulation (returns voltage traces as nested list)",
              py::arg("duration"), py::arg("dt"), py::arg("I_ext"))
+
+        // Recording-capable simulation
+        .def("max_gate_count", &Network::max_gate_count,
+             "Max gate variables across all composable neurons")
+        .def("get_synapse_pre_indices",  &Network::get_synapse_pre_indices,
+             "Flat presynaptic neuron index vector")
+        .def("get_synapse_post_indices", &Network::get_synapse_post_indices,
+             "Flat postsynaptic neuron index vector")
+        .def("_simulate_into_buffers",
+            [](Network& net, double dur, double dt,
+               const std::vector<std::vector<double>>& I_ext,
+               py::array_t<double> V_buf,
+               py::array_t<double> gate_buf,
+               py::array_t<double> calcium_buf,
+               py::array_t<double> g_syn_buf,
+               py::array_t<double> I_syn_buf,
+               size_t interval) {
+                size_t n_rec = (static_cast<size_t>(dur / dt) + interval - 1) / interval;
+                size_t max_gates = (gate_buf.ndim() == 3)
+                                   ? static_cast<size_t>(gate_buf.shape(1)) : 0;
+                net.simulate_into_buffers(
+                    dur, dt, I_ext,
+                    V_buf.size()       ? V_buf.mutable_data()       : nullptr,
+                    gate_buf.size()    ? gate_buf.mutable_data()    : nullptr, max_gates,
+                    calcium_buf.size() ? calcium_buf.mutable_data() : nullptr,
+                    g_syn_buf.size()   ? g_syn_buf.mutable_data()   : nullptr,
+                    I_syn_buf.size()   ? I_syn_buf.mutable_data()   : nullptr,
+                    interval, n_rec);
+            },
+            py::arg("duration"), py::arg("dt"), py::arg("I_ext"),
+            py::arg("V_buf"), py::arg("gate_buf"), py::arg("calcium_buf"),
+            py::arg("g_syn_buf"), py::arg("I_syn_buf"), py::arg("interval"))
 
         // Python special methods
         .def("__repr__", [](const Network& net) {
@@ -452,6 +485,11 @@ PYBIND11_MODULE(_core, m) {
                  &RegionalNetwork::add_population),
              "Add a population with a composable neuron model spec",
              py::arg("name"), py::arg("count"), py::arg("spec"))
+        .def("add_population",
+             py::overload_cast<const std::string&, const std::vector<NeuronModelSpec>&>(
+                 &RegionalNetwork::add_population),
+             "Add a heterogeneous population from a list of per-neuron specs",
+             py::arg("name"), py::arg("specs"))
 
         // Connectivity
         .def("connect", &RegionalNetwork::connect,
@@ -489,9 +527,8 @@ PYBIND11_MODULE(_core, m) {
         .def("reset", &RegionalNetwork::reset)
         .def("network", py::overload_cast<>(&RegionalNetwork::network),
              py::return_value_policy::reference_internal)
-
-        // Simulate
         .def("simulate", &RegionalNetwork::simulate,
+             "Run simulation (returns voltage traces as nested list)",
              py::arg("duration"), py::arg("dt"), py::arg("I_ext"))
 
         .def("__repr__", [](const RegionalNetwork& rn) {
@@ -635,6 +672,10 @@ PYBIND11_MODULE(_core, m) {
         .def_static("gpe", &NeuronModelSpec::gpe)
         .def_static("gpi", &NeuronModelSpec::gpi)
         .def_static("striatum", &NeuronModelSpec::striatum, py::arg("pd") = 0.0)
+        .def("validate", &NeuronModelSpec::validate,
+             "Validate spec — raises ValueError on structural errors")
+        .def("__copy__",  [](const NeuronModelSpec& s) { return NeuronModelSpec(s); })
+        .def("__deepcopy__", [](const NeuronModelSpec& s, py::dict) { return NeuronModelSpec(s); })
         .def("__repr__", [](const NeuronModelSpec& s) {
             return "<NeuronModelSpec '" + s.name + "' gates=" +
                    std::to_string(s.gates.size()) + " channels=" +
@@ -710,6 +751,47 @@ PYBIND11_MODULE(_core, m) {
         py::arg("dst"), py::arg("j"),
         py::arg("weight"), py::arg("spec"), py::arg("delay") = 0.0);
 
+    // =========================================================================
+    // DBSStimulator
+    // =========================================================================
+
+    py::class_<DBSStimulator::Parameters>(m, "DBSParameters")
+        .def(py::init<>())
+        .def_readwrite("frequency",   &DBSStimulator::Parameters::frequency,
+                       "Stimulation frequency in Hz (0 = off)")
+        .def_readwrite("amplitude",   &DBSStimulator::Parameters::amplitude,
+                       "Pulse amplitude in uA/cm^2")
+        .def_readwrite("pulse_width", &DBSStimulator::Parameters::pulse_width,
+                       "Pulse width in ms")
+        .def("__repr__", [](const DBSStimulator::Parameters& p) {
+            return "<DBSParameters freq=" + std::to_string(p.frequency) +
+                   "Hz amp=" + std::to_string(p.amplitude) +
+                   " PW=" + std::to_string(p.pulse_width) + "ms>";
+        });
+
+    py::class_<DBSStimulator>(m, "DBSStimulator")
+        .def(py::init<>(), "Create a DBS stimulator with default parameters")
+        .def(py::init<const DBSStimulator::Parameters&>(),
+             "Create a DBS stimulator with given parameters",
+             py::arg("params"))
+        .def("generate", &DBSStimulator::generate,
+             "Generate full current trace (length ≈ duration/dt + 1)",
+             py::arg("duration"), py::arg("dt"))
+        .def("current_at", &DBSStimulator::current_at,
+             "Get current value at a specific step index",
+             py::arg("step_index"), py::arg("dt"))
+        .def("set_parameters", &DBSStimulator::set_parameters,
+             "Update stimulator parameters (validates on assignment)",
+             py::arg("params"))
+        .def_property_readonly("parameters", &DBSStimulator::parameters,
+                               "Current stimulator parameters")
+        .def("__repr__", [](const DBSStimulator& d) {
+            const auto& p = d.parameters();
+            return "<DBSStimulator freq=" + std::to_string(p.frequency) +
+                   "Hz amp=" + std::to_string(p.amplitude) +
+                   " PW=" + std::to_string(p.pulse_width) + "ms>";
+        });
+
     // Module version
-    m.attr("__version__") = "0.6.0";
+    m.attr("__version__") = "0.7.0";
 }

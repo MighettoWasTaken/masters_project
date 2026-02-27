@@ -215,8 +215,10 @@ void ComposablePool::step(double dt) {
 
             case GateSpec::UpdateForm::ALPHA_BETA: {
                 Eigen::ArrayXd alpha = compute_rate_vec(V_, gs.alpha, tmp_);
-                Eigen::ArrayXd beta = compute_rate_vec(V_, gs.beta, tmp2_);
-                X += dt * (alpha * (1.0 - X) - beta * X);
+                Eigen::ArrayXd beta  = compute_rate_vec(V_, gs.beta,  tmp2_);
+                Eigen::ArrayXd rate  = (alpha + beta).max(1e-10);
+                Eigen::ArrayXd x_inf = alpha / rate;
+                X = x_inf + (X - x_inf) * (-dt * rate).exp();
                 break;
             }
 
@@ -314,6 +316,23 @@ void ComposablePool::step(double dt) {
                     / (model_.calcium.z * model_.calcium.F)
                     * (model_.calcium.Ca_o / ca_safe).log();
         }
+    }
+}
+
+void ComposablePool::scatter_gate_states_into(double* buf, size_t max_gates,
+                                               size_t n_rec, size_t t_rec) const {
+    const size_t ng = model_.gates.size();
+    for (size_t i = 0; i < N_; ++i) {
+        size_t net_i = net_idx_[i];
+        for (size_t g = 0; g < ng; ++g) {
+            buf[net_i * max_gates * n_rec + g * n_rec + t_rec] = gate_states_[g](i);
+        }
+    }
+}
+
+void ComposablePool::scatter_calcium_into(double* buf, size_t n_rec, size_t t_rec) const {
+    for (size_t i = 0; i < N_; ++i) {
+        buf[net_idx_[i] * n_rec + t_rec] = Ca_(i);
     }
 }
 

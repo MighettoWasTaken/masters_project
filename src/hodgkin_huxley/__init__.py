@@ -11,6 +11,11 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from typing import Union
 
+from .recording import RecordingConfig, MetricsResult, PopulationMetricsResult
+from .spectral import mtspectrumpt, beta_band_power, analyze_beta_power
+from .pulse import PulseStimulator
+from .noise import NoiseInjector
+
 from ._core import (
     # Base class
     NeuronBase as _NeuronBase,
@@ -58,6 +63,9 @@ from ._core import (
     KineticSynapseSpec,
     KineticUpdateForm,
     KineticCurrentForm,
+    # DBS stimulator
+    DBSStimulator as _DBSStimulator,
+    DBSParameters,
     # Version
     __version__,
     # Backwards compatibility
@@ -114,6 +122,21 @@ __all__ = [
     "KineticUpdateForm",
     "KineticCurrentForm",
     "KineticSynapseModel",
+    # DBS stimulator
+    "DBSStimulator",
+    "DBSParameters",
+    # Recording system
+    "RecordingConfig",
+    "MetricsResult",
+    "PopulationMetricsResult",
+    # Spectral analysis
+    "mtspectrumpt",
+    "beta_band_power",
+    "analyze_beta_power",
+    # Pulse stimulator
+    "PulseStimulator",
+    # Noise injection adapter
+    "NoiseInjector",
     # Version
     "__version__",
     # Backwards compatibility
@@ -759,7 +782,8 @@ class Network:
         duration: float,
         dt: float,
         I_ext: ArrayLike,
-    ) -> NDArray[np.float64]:
+        record: "RecordingConfig | None" = None,
+    ) -> "NDArray[np.float64] | MetricsResult":
         """
         Run a network simulation.
 
@@ -771,15 +795,26 @@ class Network:
             Time step in milliseconds.
         I_ext : array-like
             External currents, shape (num_neurons, num_timesteps).
+        record : RecordingConfig, optional
+            Recording configuration. If None (default), returns voltage
+            traces as a plain ndarray (backward compatible). If provided,
+            returns a MetricsResult with the requested metrics.
 
         Returns
         -------
         NDArray[np.float64]
-            Voltage traces, shape (num_neurons, num_timesteps).
+            Voltage traces (num_neurons, num_timesteps) when record=None.
+        MetricsResult
+            When record is a RecordingConfig.
         """
-        I_ext = np.asarray(I_ext, dtype=np.float64)
-        traces = self._network.simulate(duration, dt, I_ext.tolist())
-        return np.array(traces, dtype=np.float64)
+        from .recording import _run_recording, RecordingConfig as _RC
+        I_ext_arr = np.asarray(I_ext, dtype=np.float64)
+        I_ext_list = I_ext_arr.tolist()
+        cfg = record if record is not None else _RC(["V"])
+        result = _run_recording(self._network, duration, dt, I_ext_list, cfg)
+        if record is None:
+            return result["V"]
+        return result
 
     def __len__(self) -> int:
         return self.num_neurons
@@ -857,6 +892,75 @@ def _generate_pairs(pattern, src_size, dst_size, shift, probability, allow_self,
     return pairs
 
 
+# ---------------------------------------------------------------------------
+# Heterogeneity helpers (used by RegionalNetwork.add_population)
+# ---------------------------------------------------------------------------
+
+def _het_sample(dist: str, p1: float, p2: float, rng) -> float:
+    """Sample a multiplicative scale factor from the given distribution."""
+    if dist == "normal":
+        return float(rng.normal(p1, p2))
+    elif dist == "uniform":
+        return float(rng.uniform(p1, p2))
+    else:
+        raise ValueError(
+            f"Unknown heterogeneity distribution '{dist}'; "
+            f"expected 'normal' or 'uniform'"
+        )
+
+
+def _het_get(spec, path: str):
+    """Read a field from a NeuronModelSpec via a dotted path."""
+    import re
+    m = re.match(r'^(channels|gates)\[(\d+)\]\.(\w+)$', path)
+    if m:
+        col, idx, attr = m.group(1), int(m.group(2)), m.group(3)
+        return getattr(getattr(spec, col)[idx], attr)
+    if hasattr(spec, path):
+        return getattr(spec, path)
+    raise ValueError(
+        f"Unknown heterogeneity field path '{path}'.  "
+        f"Supported: 'channels[i].g', 'gates[i].initial_value', 'C_m', 'V_init'"
+    )
+
+
+def _het_set(spec, path: str, value: float) -> None:
+    """Write a field on a NeuronModelSpec via a dotted path."""
+    import re
+    m = re.match(r'^(channels|gates)\[(\d+)\]\.(\w+)$', path)
+    if m:
+        col, idx, attr = m.group(1), int(m.group(2)), m.group(3)
+        items = getattr(spec, col)   # get as Python list
+        setattr(items[idx], attr, value)
+        setattr(spec, col, items)    # write back (safe for copy or reference semantics)
+        return
+    if hasattr(spec, path):
+        setattr(spec, path, value)
+        return
+    raise ValueError(
+        f"Unknown heterogeneity field path '{path}'.  "
+        f"Supported: 'channels[i].g', 'gates[i].initial_value', 'C_m', 'V_init'"
+    )
+
+
+def _build_heterogeneous_specs(base_spec, count: int, heterogeneity: dict, seed) -> list:
+    """
+    Return a list of *count* NeuronModelSpec copies, each with independent
+    parameter samples drawn from *heterogeneity*.
+    """
+    import copy
+    rng = np.random.default_rng(seed)
+    specs = []
+    for _ in range(count):
+        s = copy.copy(base_spec)   # C++ copy constructor via __copy__
+        for path, (dist, p1, p2) in heterogeneity.items():
+            base_val = _het_get(s, path)
+            scale    = _het_sample(dist, p1, p2, rng)
+            _het_set(s, path, base_val * scale)
+        specs.append(s)
+    return specs
+
+
 class RegionalNetwork:
     """
     Population-based network abstraction for multi-region neural simulations.
@@ -876,6 +980,7 @@ class RegionalNetwork:
 
     def __init__(self):
         self._rnet = _RegionalNetwork()
+        self._stimulators: dict = {}  # {pop_name: DBSStimulator}
 
     def add_population(
         self,
@@ -884,6 +989,8 @@ class RegionalNetwork:
         neuron_type: "str | NetworkNeuronType | None" = None,
         parameters: "HHParameters | IzhikevichParameters | None" = None,
         model: "NeuronModelSpec | NeuronModel | None" = None,
+        heterogeneity: "dict | None" = None,
+        seed: "int | None" = None,
     ) -> None:
         """
         Add a population of neurons.
@@ -900,8 +1007,27 @@ class RegionalNetwork:
             Custom neuron parameters (overrides neuron_type).
         model : NeuronModelSpec or NeuronModel, optional
             Composable neuron model specification.
+        heterogeneity : dict, optional
+            Per-neuron parameter scatter.  Maps dotted field paths to
+            ``(distribution, param1, param2)`` triples, where:
+
+            * ``"normal"``  → scale factor ~ N(param1, param2)
+            * ``"uniform"`` → scale factor ~ Uniform(param1, param2)
+
+            Supported paths: ``"channels[i].g"``, ``"C_m"``, ``"V_init"``,
+            ``"gates[i].initial_value"``.  Requires ``model=`` to be set.
+        seed : int, optional
+            RNG seed for reproducible heterogeneity.
         """
-        if model is not None:
+        if heterogeneity is not None:
+            if model is None:
+                raise ValueError(
+                    "heterogeneity requires 'model' (NeuronModelSpec or NeuronModel)"
+                )
+            spec = model.to_spec() if isinstance(model, NeuronModel) else model
+            specs = _build_heterogeneous_specs(spec, count, heterogeneity, seed)
+            self._rnet.add_population(name, specs)
+        elif model is not None:
             spec = model.to_spec() if isinstance(model, NeuronModel) else model
             self._rnet.add_population(name, count, spec)
         elif parameters is not None:
@@ -1160,6 +1286,29 @@ class RegionalNetwork:
         """Reset all neurons to resting state."""
         self._rnet.reset()
 
+    def attach_stimulator(self, pop_name: str, stimulator: "DBSStimulator") -> None:
+        """
+        Attach a DBS stimulator to a population.
+
+        The stimulator current is automatically added to that population's
+        I_ext on every call to simulate(). If an I_ext entry for the same
+        population is also supplied to simulate(), the two are summed.
+
+        Parameters
+        ----------
+        pop_name : str
+            Name of the target population.
+        stimulator : DBSStimulator
+            Stimulator to attach.
+        """
+        if pop_name not in self._rnet.population_names():
+            raise ValueError(f"Unknown population: '{pop_name}'")
+        self._stimulators[pop_name] = stimulator
+
+    def detach_stimulator(self, pop_name: str) -> None:
+        """Remove any attached stimulator from a population."""
+        self._stimulators.pop(pop_name, None)
+
     @property
     def network(self) -> _Network:
         """Access the underlying Network object."""
@@ -1170,7 +1319,8 @@ class RegionalNetwork:
         duration: float,
         dt: float,
         I_ext: "dict | ArrayLike" = None,
-    ) -> "dict[str, NDArray[np.float64]]":
+        record: "RecordingConfig | None" = None,
+    ) -> "dict[str, NDArray[np.float64]] | PopulationMetricsResult":
         """
         Run a network simulation.
 
@@ -1180,7 +1330,7 @@ class RegionalNetwork:
             Simulation duration in milliseconds.
         dt : float
             Time step in milliseconds.
-        I_ext : dict or array-like
+        I_ext : dict or array-like, optional
             External currents. Can be:
             - dict {pop_name: value} where value is:
               - scalar float: constant current for all neurons/timesteps
@@ -1188,13 +1338,19 @@ class RegionalNetwork:
               - 2D array (pop_size, num_steps): per-neuron current
             - Missing populations get zero current
             - Or a flat 2D array (num_neurons, num_steps) for raw access
+        record : RecordingConfig, optional
+            Recording configuration. If None (default), returns a dict of
+            voltage traces keyed by population (backward compatible).
 
         Returns
         -------
         dict[str, NDArray[np.float64]]
-            Voltage traces keyed by population name, each shape
-            (pop_size, num_steps+1).
+            Voltage traces by population when record=None.
+        PopulationMetricsResult
+            When record is a RecordingConfig.
         """
+        from .recording import _run_recording, RecordingConfig as _RC, PopulationMetricsResult as _PMR
+
         num_neurons = self._rnet.num_neurons
         num_steps = int(duration / dt)
 
@@ -1202,7 +1358,6 @@ class RegionalNetwork:
             I_ext = {}
 
         if isinstance(I_ext, dict):
-            # Build flat I_ext array from dict
             flat = np.zeros((num_neurons, num_steps), dtype=np.float64)
             pop_names = self._rnet.population_names()
             for name in pop_names:
@@ -1213,36 +1368,44 @@ class RegionalNetwork:
                 size = self._rnet.population_size(name)
                 val = np.asarray(val, dtype=np.float64)
                 if val.ndim == 0:
-                    # Scalar: constant for all neurons and timesteps
                     flat[start:start + size, :] = val.item()
                 elif val.ndim == 1:
-                    # 1D: broadcast to all neurons
                     flat[start:start + size, :] = val[np.newaxis, :num_steps]
                 elif val.ndim == 2:
-                    # 2D: per-neuron
                     flat[start:start + size, :] = val[:, :num_steps]
                 else:
                     raise ValueError(
                         f"I_ext['{name}'] must be scalar, 1D, or 2D, "
                         f"got {val.ndim}D"
                     )
+            for pop_name, stim in self._stimulators.items():
+                stim_trace = stim.generate(duration, dt)
+                start = self._rnet.population_start(pop_name)
+                size  = self._rnet.population_size(pop_name)
+                flat[start:start + size, :] += np.array(
+                    stim_trace[:num_steps], dtype=np.float64
+                )[np.newaxis, :]
             I_ext_list = flat.tolist()
         else:
             I_ext_arr = np.asarray(I_ext, dtype=np.float64)
             I_ext_list = I_ext_arr.tolist()
 
-        traces = self._rnet.simulate(duration, dt, I_ext_list)
-        traces_arr = np.array(traces, dtype=np.float64)
+        pop_info = {
+            name: (self._rnet.population_start(name),
+                   self._rnet.population_size(name))
+            for name in self._rnet.population_names()
+        }
+        cfg = record if record is not None else _RC(["V"])
+        result = _run_recording(
+            self._rnet.network(), duration, dt, I_ext_list, cfg, pop_info)
 
-        # Slice result by population
-        result = {}
-        pop_names = self._rnet.population_names()
-        for name in pop_names:
-            start = self._rnet.population_start(name)
-            size = self._rnet.population_size(name)
-            result[name] = traces_arr[start:start + size, :]
+        if record is None:
+            # Backward compat: return {pop_name: ndarray}
+            V = result["V"]  # shape (n_neurons, n_steps) since neurons="all"
+            return {name: V[start:start + size, :]
+                    for name, (start, size) in pop_info.items()}
 
-        return result
+        return _PMR(result, pop_info, record)
 
     def __len__(self) -> int:
         return self.num_neurons
@@ -1593,3 +1756,127 @@ class KineticSynapseModel:
 
     def __repr__(self) -> str:
         return f"<KineticSynapseModel '{self._spec.name}'>"
+
+
+# =============================================================================
+# DBSStimulator — Deep Brain Stimulation pulse-train generator
+# =============================================================================
+
+class DBSStimulator:
+    """
+    Deep Brain Stimulation current generator.
+
+    Produces a periodic rectangular pulse train:
+
+        I(t) = amplitude   if  t mod (1000/frequency) < pulse_width
+                0           otherwise
+
+    Pulses begin at t=0 and are spaced by the inter-stimulus interval
+    (ISI = 1000/frequency ms), exactly matching the benchmark creatdbs().
+
+    Parameters
+    ----------
+    frequency : float
+        Stimulation frequency in Hz. Use 0 to disable (all zeros). Default: 130.
+    amplitude : float
+        Pulse amplitude in uA/cm^2. Default: 0.
+    pulse_width : float
+        Pulse width in ms. Default: 0.06.
+
+    Raises
+    ------
+    ValueError
+        If frequency < 0, pulse_width <= 0, or pulse_width >= ISI.
+
+    Examples
+    --------
+    >>> dbs = DBSStimulator(frequency=130, amplitude=300, pulse_width=0.06)
+    >>> trace = dbs.generate(duration=1000, dt=0.01)  # numpy array, length ~100001
+    >>> rn.attach_stimulator("STN", dbs)
+    >>> traces = rn.simulate(1000, 0.01, {})
+    """
+
+    def __init__(
+        self,
+        frequency: float = 130.0,
+        amplitude: float = 0.0,
+        pulse_width: float = 0.06,
+    ):
+        p = DBSParameters()
+        p.frequency   = frequency
+        p.amplitude   = amplitude
+        p.pulse_width = pulse_width
+        self._dbs = _DBSStimulator(p)
+
+    def generate(self, duration: float, dt: float) -> "NDArray[np.float64]":
+        """
+        Generate the full DBS current trace.
+
+        Returns a numpy array of length ceil((duration + dt) / dt),
+        matching np.arange(0, duration+dt, dt).
+
+        Parameters
+        ----------
+        duration : float
+            Total duration in ms.
+        dt : float
+            Time step in ms.
+        """
+        return np.array(self._dbs.generate(duration, dt), dtype=np.float64)
+
+    def current_at(self, step_index: int, dt: float) -> float:
+        """
+        Get the DBS current at a specific simulation step index.
+
+        Parameters
+        ----------
+        step_index : int
+            Zero-based step index.
+        dt : float
+            Time step in ms.
+        """
+        return self._dbs.current_at(step_index, dt)
+
+    @property
+    def parameters(self) -> DBSParameters:
+        """Current stimulator parameters."""
+        return self._dbs.parameters
+
+    @property
+    def frequency(self) -> float:
+        """Stimulation frequency in Hz."""
+        return self._dbs.parameters.frequency
+
+    @property
+    def amplitude(self) -> float:
+        """Pulse amplitude in uA/cm^2."""
+        return self._dbs.parameters.amplitude
+
+    @property
+    def pulse_width(self) -> float:
+        """Pulse width in ms."""
+        return self._dbs.parameters.pulse_width
+
+    def set_parameters(
+        self,
+        frequency: float | None = None,
+        amplitude: float | None = None,
+        pulse_width: float | None = None,
+    ) -> None:
+        """
+        Update stimulator parameters. Validates on assignment.
+
+        Only provided keyword arguments are changed; omitted ones keep their
+        current value.
+        """
+        p = DBSParameters()
+        p.frequency   = frequency   if frequency   is not None else self.frequency
+        p.amplitude   = amplitude   if amplitude   is not None else self.amplitude
+        p.pulse_width = pulse_width if pulse_width is not None else self.pulse_width
+        self._dbs.set_parameters(p)
+
+    def __repr__(self) -> str:
+        return (
+            f"<DBSStimulator freq={self.frequency}Hz "
+            f"amp={self.amplitude} PW={self.pulse_width}ms>"
+        )

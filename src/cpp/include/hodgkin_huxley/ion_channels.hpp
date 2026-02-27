@@ -99,6 +99,9 @@ struct NeuronModelSpec {
     static NeuronModelSpec gpe();
     static NeuronModelSpec gpi();
     static NeuronModelSpec striatum(double pd = 0.0);
+
+    // Validation — throws std::invalid_argument on structural errors
+    void validate() const;
 };
 
 // =============================================================================

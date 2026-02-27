@@ -1,4 +1,6 @@
 #include "hodgkin_huxley/ion_channels.hpp"
+#include <iostream>
+#include <stdexcept>
 
 namespace hodgkin_huxley {
 
@@ -43,8 +45,8 @@ NeuronModelSpec NeuronModelSpec::thalamic() {
         g.tau.params[2] = 39.7;   // v1 offset
         g.tau.params[3] = 9.32;   // s1
         g.tau.params[4] = 0.0;    // (unused for sum form denominator)
-        g.tau.params[5] = -0.6;   // v2 offset
-        g.tau.params[6] = -7.4;   // s2
+        g.tau.params[5] = 0.6;    // v2 offset  (was -0.6: sign error caused tau~1535ms)
+        g.tau.params[6] = 7.4;    // s2         (was -7.4: double negation -> wrong exponent)
         spec.gates.push_back(g);
     }
 
@@ -242,8 +244,8 @@ NeuronModelSpec NeuronModelSpec::stn() {
         g.tau.params[2] = 39.7;
         g.tau.params[3] = 9.32;
         g.tau.params[4] = 0.0;
-        g.tau.params[5] = -0.6;
-        g.tau.params[6] = -7.4;
+        g.tau.params[5] = 0.6;    // was -0.6: sign error caused tau~1535ms
+        g.tau.params[6] = 7.4;    // was -7.4: double negation -> wrong exponent
         spec.gates.push_back(g);
     }
 
@@ -703,6 +705,59 @@ KineticSynapseSpec KineticSynapseSpec::gaba_b() {
     s.power = 4;         // GABA-B has cooperative gating
     s.S_init = 0.0;
     return s;
+}
+
+void NeuronModelSpec::validate() const {
+    const int n_gates    = static_cast<int>(gates.size());
+    const int n_channels = static_cast<int>(channels.size());
+
+    // C_m must be positive
+    if (C_m <= 0.0)
+        throw std::invalid_argument(
+            "NeuronModelSpec '" + name + "': C_m must be > 0, got " + std::to_string(C_m));
+    if (C_m < 0.01 || C_m > 100.0)
+        std::cerr << "[WARNING] NeuronModelSpec '" << name
+                  << "': C_m=" << C_m << " is outside typical range [0.01, 100]\n";
+
+    // Channel checks
+    for (int ci = 0; ci < n_channels; ++ci) {
+        const auto& ch = channels[ci];
+        if (ch.g < 0.0)
+            throw std::invalid_argument(
+                "NeuronModelSpec '" + name + "': channel '" + ch.name
+                + "' has negative conductance g=" + std::to_string(ch.g));
+        for (const auto& gp : ch.gates) {
+            if (gp.first < 0 || gp.first >= n_gates)
+                throw std::invalid_argument(
+                    "NeuronModelSpec '" + name + "': channel '" + ch.name
+                    + "' references gate index " + std::to_string(gp.first)
+                    + " but spec has only " + std::to_string(n_gates) + " gate(s)");
+        }
+    }
+
+    // Gate checks
+    for (int gi = 0; gi < n_gates; ++gi) {
+        const auto& g = gates[gi];
+        if (g.update_form == GateSpec::UpdateForm::DERIVED) {
+            if (g.derived_source_gate < 0 || g.derived_source_gate >= n_gates)
+                throw std::invalid_argument(
+                    "NeuronModelSpec '" + name + "': gate '" + g.name
+                    + "' derived_source_gate=" + std::to_string(g.derived_source_gate)
+                    + " is out of range [0, " + std::to_string(n_gates) + ")");
+        }
+        if (g.tau.form == TauParams::Form::CONSTANT && g.tau.params[0] <= 0.0)
+            std::cerr << "[WARNING] NeuronModelSpec '" << name << "': gate '" << g.name
+                      << "' CONSTANT tau=" << g.tau.params[0] << " is <= 0\n";
+    }
+
+    // Calcium source channel checks
+    for (int ch_idx : calcium.source_channels) {
+        if (ch_idx < 0 || ch_idx >= n_channels)
+            throw std::invalid_argument(
+                "NeuronModelSpec '" + name + "': calcium.source_channels contains index "
+                + std::to_string(ch_idx) + " but spec has only "
+                + std::to_string(n_channels) + " channel(s)");
+    }
 }
 
 } // namespace hodgkin_huxley

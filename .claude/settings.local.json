@@ -3,7 +3,9 @@
     "allow": [
       "WebSearch",
       "WebFetch(domain:eigen.tuxfamily.org)",
-      "WebFetch(domain:libeigen.gitlab.io)"
+      "WebFetch(domain:libeigen.gitlab.io)",
+      "Bash(pip install:*)",
+      "Bash(py:*)"
     ]
   }
 }

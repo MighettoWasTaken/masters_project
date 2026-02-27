@@ -25,6 +25,15 @@ public:
     void step(double dt);
     void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const;
 
+    // Write gate_states_[g][i] into buf[net_idx_[i] * max_gates * n_rec + g * n_rec + t_rec]
+    void scatter_gate_states_into(double* buf, size_t max_gates,
+                                   size_t n_rec, size_t t_rec) const;
+
+    // Write Ca_[i] into buf[net_idx_[i] * n_rec + t_rec]
+    void scatter_calcium_into(double* buf, size_t n_rec, size_t t_rec) const;
+
+    size_t n_gates() const { return model_.gates.size(); }
+
     const NeuronModelSpec& model() const { return model_; }
 
 private:

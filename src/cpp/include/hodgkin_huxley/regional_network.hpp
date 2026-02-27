@@ -78,6 +78,8 @@ public:
                         const IzhikevichNeuron::Parameters& params);
     void add_population(const std::string& name, size_t count,
                         const NeuronModelSpec& spec);
+    void add_population(const std::string& name,
+                        const std::vector<NeuronModelSpec>& specs);
 
     // Bulk connectivity (preset pattern, dispatched to C++)
     void connect(const std::string& src, const std::string& dst,

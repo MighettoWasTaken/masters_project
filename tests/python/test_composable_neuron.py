@@ -337,16 +337,17 @@ class TestSafety:
             trace = simulate_composable(spec, duration=10.0, dt=0.01, I_ext=0.0)
             assert np.all(np.isfinite(trace)), f"NaN/Inf with RateFuncForm {form}"
 
-    def test_derived_gate_invalid_source_graceful(self):
-        """DERIVED gate with derived_source_gate=-1 should not crash."""
+    def test_derived_gate_invalid_source_raises(self):
+        """DERIVED gate with derived_source_gate=-1 is caught by validation (10.6)."""
+        import pytest
         spec = make_empty_spec()
         g = GateSpec()
         g.name = "derived"
         g.update_form = GateUpdateForm.DERIVED
         g.derived_source_gate = -1
         spec.gates.append(g)
-        trace = simulate_composable(spec, duration=5.0, dt=0.01, I_ext=0.0)
-        assert np.all(np.isfinite(trace))
+        with pytest.raises(ValueError, match="derived_source_gate"):
+            simulate_composable(spec, duration=5.0, dt=0.01, I_ext=0.0)
 
     def test_ahp_channel_zero_calcium(self):
         """AHP channel with Ca=0: no division by zero."""
@@ -655,6 +656,168 @@ class TestCorrectness:
         # Fast (small C_m) should spike at least as much as slow (large C_m)
         assert spikes_fast >= spikes_slow, (
             f"Lower C_m should produce more spikes: {spikes_fast} vs {spikes_slow}"
+        )
+
+    # ------------------------------------------------------------------
+    # Bug-regression: Task 10.1 — ALPHA_BETA forward-Euler instability
+    # ------------------------------------------------------------------
+
+    def test_alpha_beta_euler_instability(self):
+        """
+        ALPHA_BETA forward Euler is unstable when dt*(alpha+beta) > 1.
+
+        Setup: isolated neuron (no channels → V clamped at -65 mV) with one
+        ALPHA_BETA gate.  EXP_DECAY rates with A=3.0, B=65 give alpha=beta=3
+        at V=-65, so dt*(alpha+beta) = 1.0*6 = 6 >> 1.
+
+        With forward Euler the gate diverges within a few steps.
+        The fix (exact exponential integration) converges smoothly to
+        X_inf = alpha/(alpha+beta) = 0.5 within milliseconds.
+
+        This test FAILS while the bug is present (Task 10.1).
+        """
+        spec = make_empty_spec("ab_stability_pool", V_init=-65.0)
+        g = GateSpec()
+        g.name = "m"
+        g.update_form = GateUpdateForm.ALPHA_BETA
+        g.initial_value = 0.0   # start far from X_inf = 0.5
+
+        # EXP_DECAY: alpha = A * exp(-(V+B)/C)
+        # At V=-65, B=65: V+B = 0 → exp(0/C) = 1 → alpha = A = 3.0
+        r = RateFuncParams()
+        r.form = RateFuncForm.EXP_DECAY
+        r.A = 3.0
+        r.B = 65.0
+        r.C = 10.0
+        g.alpha = r
+        g.beta = r   # symmetric → X_inf = 0.5, alpha+beta = 6.0
+
+        spec.gates.append(g)
+        net = Network()
+        net.add_neuron(spec)
+
+        # dt=1ms pool path (simulate uses ComposablePool)
+        n_steps = 50
+        net.simulate(50.0, 1.0, [[0.0] * n_steps])
+        gate = net.neuron(0).gate_states[0]
+
+        assert np.isfinite(gate) and abs(gate - 0.5) < 0.05, (
+            f"ALPHA_BETA gate (pool) must converge to X_inf=0.5 with dt=1 ms. "
+            f"Got {gate!r}. Euler: update factor 6 >> 1 → diverges; "
+            f"exact-exp fix required. (Task 10.1)"
+        )
+
+    def test_alpha_beta_euler_instability_step(self):
+        """
+        Same instability check via step() — exercises composable_neuron.cpp
+        (scalar path) rather than composable_pool.cpp.
+
+        This test FAILS while the bug is present (Task 10.1).
+        """
+        spec = make_empty_spec("ab_stability_step", V_init=-65.0)
+        g = GateSpec()
+        g.name = "m"
+        g.update_form = GateUpdateForm.ALPHA_BETA
+        g.initial_value = 0.0
+
+        r = RateFuncParams()
+        r.form = RateFuncForm.EXP_DECAY
+        r.A = 3.0
+        r.B = 65.0
+        r.C = 10.0
+        g.alpha = r
+        g.beta = r
+
+        spec.gates.append(g)
+        net = Network()
+        net.add_neuron(spec)
+
+        for _ in range(50):
+            net.step(1.0, [0.0])   # dt=1 ms via scalar step()
+
+        gate = net.neuron(0).gate_states[0]
+        assert np.isfinite(gate) and abs(gate - 0.5) < 0.05, (
+            f"ALPHA_BETA gate (step) must converge to X_inf=0.5 with dt=1 ms. "
+            f"Got {gate!r}. (Task 10.1)"
+        )
+
+    # ------------------------------------------------------------------
+    # Bug-regression: Task 10.2 — h_T tau parameter sign error
+    # ------------------------------------------------------------------
+
+    def test_th_h_T_tau_correct(self):
+        """
+        TH h_T gate tau at V=-65 should be ~20 ms, NOT ~1535 ms.
+
+        Bug: DOUBLE_EXP_SUM params[5]=-0.6 and params[6]=-7.4 cause a
+        double sign negation, making the exp denominators nearly zero and
+        tau ~ 1535 ms at V=-65.
+        Fix: params[5]=0.6, params[6]=7.4 → tau ~ 20 ms.
+
+        Test strategy: build an isolated spec containing only h_T (no
+        channels → V clamped at -65 mV).  Start h_T from 0.0 and from 1.0
+        separately.  After 100 ms:
+          - correct tau (~20 ms) → both converge to X_inf (diff < 0.05)
+          - buggy  tau (~1535 ms) → gate barely moves (diff > 0.5)
+
+        This test FAILS while the bug is present (Task 10.2).
+        """
+        def run_with_h_T_init(initial_value):
+            th = NeuronModelSpec.thalamic()
+            h_T_gate = th.gates[1]        # h_T is gate index 1 in TH
+            h_T_gate.initial_value = initial_value
+            spec = make_empty_spec("th_h_T_tau_test", V_init=-65.0)
+            spec.gates.append(h_T_gate)
+            net = Network()
+            net.add_neuron(spec)
+            n_steps = int(100.0 / 0.01)  # 100 ms at dt=0.01 ms
+            net.simulate(100.0, 0.01, [[0.0] * n_steps])
+            return net.neuron(0).gate_states[0]
+
+        gate_from_zero = run_with_h_T_init(0.0)
+        gate_from_one  = run_with_h_T_init(1.0)
+
+        diff = abs(gate_from_zero - gate_from_one)
+        assert diff < 0.05, (
+            f"TH h_T gate must converge to X_inf within 100 ms (tau~20 ms). "
+            f"From initial=0: {gate_from_zero:.4f}, from initial=1: {gate_from_one:.4f}, "
+            f"diff={diff:.4f} (expected <0.05). "
+            f"Likely cause: tau~1535 ms due to params sign error. (Task 10.2)"
+        )
+
+    def test_stn_h_T_tau_correct(self):
+        """
+        STN h_T gate tau at V=-65 should be ~20 ms, NOT ~1535 ms.
+        Same sign-error bug as TH h_T.
+
+        This test FAILS while the bug is present (Task 10.2).
+        """
+        def run_with_stn_h_T_init(initial_value):
+            stn = NeuronModelSpec.stn()
+            h_T_idx = next(
+                (i for i, gate in enumerate(stn.gates) if gate.name == "h_T"),
+                None
+            )
+            assert h_T_idx is not None, "STN preset must contain a gate named 'h_T'"
+            h_T_gate = stn.gates[h_T_idx]
+            h_T_gate.initial_value = initial_value
+            spec = make_empty_spec("stn_h_T_tau_test", V_init=-65.0)
+            spec.gates.append(h_T_gate)
+            net = Network()
+            net.add_neuron(spec)
+            n_steps = int(100.0 / 0.01)
+            net.simulate(100.0, 0.01, [[0.0] * n_steps])
+            return net.neuron(0).gate_states[0]
+
+        gate_from_zero = run_with_stn_h_T_init(0.0)
+        gate_from_one  = run_with_stn_h_T_init(1.0)
+
+        diff = abs(gate_from_zero - gate_from_one)
+        assert diff < 0.05, (
+            f"STN h_T gate must converge to X_inf within 100 ms (tau~20 ms). "
+            f"From initial=0: {gate_from_zero:.4f}, from initial=1: {gate_from_one:.4f}, "
+            f"diff={diff:.4f} (expected <0.05). "
+            f"Likely cause: tau~1535 ms due to params sign error. (Task 10.2)"
         )
 
 

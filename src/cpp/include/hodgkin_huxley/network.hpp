@@ -164,6 +164,33 @@ public:
         const std::vector<std::vector<double>>& I_ext
     );
 
+    // Max number of gate variables across all composable neurons
+    size_t max_gate_count() const;
+
+    // Flat synapse pre/post index vectors
+    std::vector<size_t> get_synapse_pre_indices()  const;
+    std::vector<size_t> get_synapse_post_indices() const;
+
+    // Fill caller-allocated numpy buffers during simulation.
+    // Any buffer pointer may be nullptr to skip that metric.
+    // Buffer shapes (all C-contiguous, pre-allocated by Python):
+    //   V_buf:       (n_neurons, n_rec)
+    //   gate_buf:    (n_neurons, max_gates, n_rec)
+    //   calcium_buf: (n_neurons, n_rec)
+    //   g_syn_buf:   (n_synapses, n_rec)
+    //   I_syn_buf:   (n_neurons, n_rec)
+    void simulate_into_buffers(
+        double duration, double dt,
+        const std::vector<std::vector<double>>& I_ext,
+        double* V_buf,
+        double* gate_buf,   size_t max_gates,
+        double* calcium_buf,
+        double* g_syn_buf,
+        double* I_syn_buf,
+        size_t  interval,
+        size_t  n_rec
+    );
+
 private:
     std::vector<std::unique_ptr<NeuronBase>> neurons_;
     std::vector<std::unique_ptr<SynapseBase>> synapses_;  // API access only

@@ -68,6 +68,7 @@ size_t Network::add_neuron(const IzhikevichNeuron::Parameters& params) {
 }
 
 size_t Network::add_neuron(const NeuronModelSpec& spec) {
+    spec.validate();
     neurons_.push_back(std::make_unique<ComposableNeuron>(spec));
     return neurons_.size() - 1;
 }
@@ -917,6 +918,179 @@ std::vector<std::vector<double>> Network::simulate(
     sync_soa_to_objects();
 
     return traces;
+}
+
+// =============================================================================
+// max_gate_count / get_synapse_pre/post_indices
+// =============================================================================
+
+size_t Network::max_gate_count() const {
+    size_t max_gates = 0;
+    for (const auto& n : neurons_) {
+        if (auto* cn = dynamic_cast<ComposableNeuron*>(n.get())) {
+            max_gates = std::max(max_gates, cn->gate_states().size());
+        }
+    }
+    return max_gates;
+}
+
+std::vector<size_t> Network::get_synapse_pre_indices() const {
+    return sa_.pre;
+}
+
+std::vector<size_t> Network::get_synapse_post_indices() const {
+    return sa_.post;
+}
+
+// =============================================================================
+// simulate_into_buffers — batched pools + recording into caller-allocated bufs
+// =============================================================================
+
+void Network::simulate_into_buffers(
+    double duration, double dt,
+    const std::vector<std::vector<double>>& I_ext,
+    double* V_buf,
+    double* gate_buf,   size_t max_gates,
+    double* calcium_buf,
+    double* g_syn_buf,
+    double* I_syn_buf,
+    size_t  interval,
+    size_t  n_rec
+) {
+    size_t num_steps = static_cast<size_t>(duration / dt);
+    size_t n_neurons = neurons_.size();
+
+    if (I_ext.size() != n_neurons) {
+        throw std::invalid_argument("I_ext outer size must match number of neurons");
+    }
+    for (const auto& curr : I_ext) {
+        if (curr.size() < num_steps) {
+            throw std::invalid_argument("I_ext vectors too short for simulation duration");
+        }
+    }
+
+    sort_synapses_by_pre();
+    build_synapse_groups();
+
+    // Build batched neuron pools
+    size_t n_hh = 0, n_iz = 0;
+    std::map<std::string, size_t> composable_counts;
+    for (size_t i = 0; i < n_neurons; ++i) {
+        if (dynamic_cast<HHNeuron*>(neurons_[i].get())) ++n_hh;
+        else if (dynamic_cast<IzhikevichNeuron*>(neurons_[i].get())) ++n_iz;
+        else if (auto* cn = dynamic_cast<ComposableNeuron*>(neurons_[i].get())) {
+            composable_counts[cn->model_spec().name]++;
+        }
+    }
+
+    HHPool hh_pool(n_hh, fast_math_);
+    IzPool iz_pool(n_iz);
+
+    std::map<std::string, ComposablePool> comp_pools;
+    for (const auto& kv : composable_counts) {
+        for (size_t i = 0; i < n_neurons; ++i) {
+            auto* cn = dynamic_cast<ComposableNeuron*>(neurons_[i].get());
+            if (cn && cn->model_spec().name == kv.first) {
+                comp_pools.emplace(kv.first,
+                    ComposablePool(cn->model_spec(), kv.second, fast_math_));
+                break;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < n_neurons; ++i) {
+        if (auto* hh = dynamic_cast<HHNeuron*>(neurons_[i].get())) {
+            hh_pool.add(i, hh->parameters(), hh->state());
+        } else if (auto* iz = dynamic_cast<IzhikevichNeuron*>(neurons_[i].get())) {
+            iz_pool.add(i, iz->parameters(), iz->state());
+        } else if (auto* cn = dynamic_cast<ComposableNeuron*>(neurons_[i].get())) {
+            auto it = comp_pools.find(cn->model_spec().name);
+            if (it != comp_pools.end()) {
+                it->second.add(i, cn->membrane_potential(),
+                               cn->gate_states(), cn->calcium());
+            }
+        }
+    }
+
+    ensure_buffers();
+
+    const size_t S = sa_.size();
+
+    // Hot loop
+    for (size_t t = 0; t < num_steps; ++t) {
+        // Scatter pool voltages into V_cache_
+        hh_pool.scatter_voltages(V_cache_.data());
+        iz_pool.scatter_voltages(V_cache_.data());
+        for (auto& kv : comp_pools) kv.second.scatter_voltages(V_cache_.data());
+
+        // RECORDING BLOCK 1: V, gates, calcium, g_syn (pre-step state)
+        if (t % interval == 0) {
+            size_t tr = t / interval;
+
+            if (V_buf) {
+                for (size_t i = 0; i < n_neurons; ++i)
+                    V_buf[i * n_rec + tr] = V_cache_[i];
+            }
+
+            if (gate_buf && max_gates > 0) {
+                for (auto& kv : comp_pools)
+                    kv.second.scatter_gate_states_into(gate_buf, max_gates, n_rec, tr);
+            }
+
+            if (calcium_buf) {
+                for (auto& kv : comp_pools)
+                    kv.second.scatter_calcium_into(calcium_buf, n_rec, tr);
+            }
+
+            if (g_syn_buf) {
+                const double* g = sa_.g.data();
+                for (size_t i = 0; i < S; ++i)
+                    g_syn_buf[i * n_rec + tr] = g[i];
+            }
+        }
+
+        // Seed I_syn_buffer_ with I_ext, then add synaptic currents
+        for (size_t i = 0; i < n_neurons; ++i)
+            I_syn_buffer_[i] = I_ext[i][t];
+
+        const double* g = sa_.g.data();
+        const double* E_syn_data = sa_.E_syn.data();
+        const size_t* post = sa_.post.data();
+        const double* V = V_cache_.data();
+        double* I_buf = I_syn_buffer_.data();
+        for (size_t i = 0; i < S; ++i)
+            I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
+
+        // RECORDING BLOCK 2: I_syn (pure synaptic, after currents added)
+        if (I_syn_buf && t % interval == 0) {
+            size_t tr = t / interval;
+            for (size_t i = 0; i < n_neurons; ++i)
+                I_syn_buf[i * n_rec + tr] = I_syn_buffer_[i] - I_ext[i][t];
+        }
+
+        // Feed combined currents to pools
+        hh_pool.gather_currents(I_syn_buffer_.data());
+        iz_pool.gather_currents(I_syn_buffer_.data());
+        for (auto& kv : comp_pools) kv.second.gather_currents(I_syn_buffer_.data());
+
+        // Step pools (batched SIMD)
+        hh_pool.step_rk4(dt);
+        iz_pool.step_euler(dt);
+        for (auto& kv : comp_pools) kv.second.step(dt);
+
+        // Re-scatter for spike detection
+        hh_pool.scatter_voltages(V_cache_.data());
+        iz_pool.scatter_voltages(V_cache_.data());
+        for (auto& kv : comp_pools) kv.second.scatter_voltages(V_cache_.data());
+
+        update_synapses_grouped(dt);
+    }
+
+    // Sync pool state back to API objects
+    hh_pool.sync_to_neurons(neurons_);
+    iz_pool.sync_to_neurons(neurons_);
+    for (const auto& kv : comp_pools) kv.second.sync_to_neurons(neurons_);
+    sync_soa_to_objects();
 }
 
 } // namespace hodgkin_huxley

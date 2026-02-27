@@ -11,6 +11,7 @@ ComposableNeuron::ComposableNeuron(const NeuronModelSpec& spec)
       Ca_(spec.calcium.Ca_init),
       E_Ca_(120.0)
 {
+    spec_.validate();
     for (size_t i = 0; i < spec_.gates.size(); ++i) {
         gate_states_[i] = spec_.gates[i].initial_value;
     }
@@ -193,8 +194,11 @@ void ComposableNeuron::update_gates(double dt) {
 
             case GateSpec::UpdateForm::ALPHA_BETA: {
                 double alpha = compute_rate(V_, gs.alpha);
-                double beta = compute_rate(V_, gs.beta);
-                gate_states_[i] += dt * (alpha * (1.0 - gate_states_[i]) - beta * gate_states_[i]);
+                double beta  = compute_rate(V_, gs.beta);
+                double rate  = alpha + beta;
+                double x_inf = (rate > 1e-10) ? alpha / rate : gate_states_[i];
+                double tau_x = (rate > 1e-10) ? 1.0 / rate  : 1e10;
+                gate_states_[i] = x_inf + (gate_states_[i] - x_inf) * std::exp(-dt / tau_x);
                 break;
             }
 

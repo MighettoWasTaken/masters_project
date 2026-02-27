@@ -121,6 +121,19 @@ void RegionalNetwork::add_population(const std::string& name, size_t count,
     populations_.push_back({name, start, count});
 }
 
+void RegionalNetwork::add_population(const std::string& name,
+                                     const std::vector<NeuronModelSpec>& specs) {
+    if (pop_index_.count(name)) {
+        throw std::runtime_error("Population '" + name + "' already exists");
+    }
+    size_t start = net_.num_neurons();
+    for (const auto& spec : specs) {
+        net_.add_neuron(spec);
+    }
+    pop_index_[name] = populations_.size();
+    populations_.push_back({name, start, specs.size()});
+}
+
 // =============================================================================
 // Population queries
 // =============================================================================
