@@ -27,7 +27,7 @@ from hodgkin_huxley import (
     IzhikevichParameters, IzhikevichType,
     DBSStimulator, DBSParameters,
     RecordingConfig,
-    mtspectrumpt, beta_band_power,
+    mtspectrumpt,
 )
 
 
@@ -182,122 +182,165 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
     net.add_population("CTX_i", n, parameters=iz_fs)
 
     # Randomise initial membrane potentials (matches benchmark scatter)
+    # Benchmark: TH/STN/GPe/GPi/Str are randomised; CTX_e/CTX_i are NOT (all at -65).
     net.randomize_membrane_potentials("TH",     -62.0, 5.0, seed=seed)
     net.randomize_membrane_potentials("STN",    -62.0, 5.0, seed=seed + 1)
     net.randomize_membrane_potentials("GPe",    -62.0, 5.0, seed=seed + 2)
     net.randomize_membrane_potentials("GPi",    -62.0, 5.0, seed=seed + 3)
-    net.randomize_membrane_potentials("Str_D2", -63.8, 5.0, seed=seed + 4)
-    net.randomize_membrane_potentials("Str_D1", -63.8, 5.0, seed=seed + 5)
+    # Str: randomise V AND reset gate steady states to avoid V/gate mismatch transient.
+    net.randomize_membrane_potentials("Str_D2", -63.8, 5.0, seed=seed + 4, reset_gates=True)
+    net.randomize_membrane_potentials("Str_D1", -63.8, 5.0, seed=seed + 5, reset_gates=True)
 
     # ---- Synapse parameter shorthands (from benchmark) --------------------
     tau    = 5.0    # ms — alpha-function time constant
-    gpeak  = 0.43
-    gpeak1 = 0.3
+    gpeak  = 0.43   # peak of excitatory alpha kernel (const = gpeak/(tau*exp(-1)))
+    gpeak1 = 0.3    # peak of inhibitory alpha kernel (const1 = gpeak1/(tau*exp(-1)))
+    # Note: benchmark stores synapse kernels normalized to peak at gpeak/gpeak1.
+    # Benchmark conductance: g_ij * S(t), where S peaks at gpeak or gpeak1.
+    # Library conductance: weight * kernel(t), where kernel peaks at 1.
+    # Therefore: weight = g_ij * gpeak (or gpeak1) to match benchmark effective conductance.
 
-    # ---- GPi → TH  (inhibitory alpha-function, delay=5ms) -----------------
-    net.connect("GPi", "TH", "all_to_all",
-                weight=0.112 / n,
+    # ---- GPi → TH  (one-to-one, delay=5ms) --------------------------------
+    # Benchmark: Igith = ggith*(V1-Esyn[5])*S4, element-wise → TH[k] ← GPi[k]
+    # ggith=0.112, S4 peaks at gpeak1=0.3 → weight = 0.112*0.3 = 0.0336
+    net.connect("GPi", "TH", "one_to_one",
+                weight=0.112 * gpeak1,
                 synapse=SynapseSpec.alpha(-85.0, tau), delay=5.0)
 
-    # ---- GPe → STN  (inhibitory double-exponential, delay=4ms) ------------
-    # Two cyclic-shifted copies: STN[j] receives from GPe[j+1] and GPe[j+2]
-    for shift in (1, 2):
-        net.connect("GPe", "STN", "shifted",
-                    weight=0.5 / 2,
-                    synapse=SynapseSpec.double_exponential(-85.0, tau_rise=0.4, tau_decay=7.7),
-                    delay=4.0, shift=shift)
+    # ---- GPe → STN  (shift=0 and shift=1, delay=4ms) ----------------------
+    # Benchmark: Igesn = ggesn*(V2-Esyn[0])*(S3a+S31a)
+    #   S3a[k] from GPe[k] → shift=0; S31a[k]=S3a[k+1] from GPe[k+1] → shift=1
+    # ggesn=0.5, kernel peaks at gpeak1=0.3 → weight = 0.5*0.3 = 0.15 per connection
+    net.connect("GPe", "STN", "one_to_one",
+                weight=0.5 * gpeak1,
+                synapse=SynapseSpec.double_exponential(-85.0, tau_rise=0.4, tau_decay=7.7),
+                delay=4.0)
+    net.connect("GPe", "STN", "shifted",
+                weight=0.5 * gpeak1,
+                synapse=SynapseSpec.double_exponential(-85.0, tau_rise=0.4, tau_decay=7.7),
+                delay=4.0, shift=1)
 
-    # ---- STN → GPe  (excitatory AMPA + NMDA, sparse, delay=2ms) -----------
-    # 2 of n STN neurons active per synapse type; each hits GPe[j] & GPe[j+1]
-    ampa_idx = rng.permutation(n)[:2]
-    nmda_idx = rng.permutation(n)[:2]
-    gsngea   = 0.3  * rng.random(2)
-    gsngen   = 0.002 * rng.random(2)
-    for k, i in enumerate(ampa_idx):
-        for j_off in (0, 1):
-            net.add_connection("STN", int(i), "GPe", (int(i) + j_off) % n,
-                               float(gsngea[k]),
+    # ---- STN → GPe  (sparse receiver-selected AMPA + NMDA, delay=2ms) ----
+    # Benchmark: gsngea[k]*(S2a[k]+S21a[k]) where S21a[k]=S2a[k-1]
+    #   gsngea = zeros(n), 2 GPe RECEIVERS nonzero (0 to 0.3 each)
+    #   GPe[k] ← STN[k] and STN[k-1] with weight gsngea[k]*gpeak
+    gsngea = np.zeros(n)
+    gsngea[rng.permutation(n)[:2]] = 0.3 * rng.random(2)
+    gsngen = np.zeros(n)
+    gsngen[rng.permutation(n)[:2]] = 0.002 * rng.random(2)
+    for k in range(n):
+        if gsngea[k] > 0:
+            net.add_connection("STN", k,          "GPe", k, float(gsngea[k]) * gpeak,
                                SynapseSpec.double_exponential(0.0, 0.4, 2.5), delay=2.0)
-    for k, i in enumerate(nmda_idx):
-        for j_off in (0, 1):
-            net.add_connection("STN", int(i), "GPe", (int(i) + j_off) % n,
-                               float(gsngen[k]),
+            net.add_connection("STN", (k-1)%n,    "GPe", k, float(gsngea[k]) * gpeak,
+                               SynapseSpec.double_exponential(0.0, 0.4, 2.5), delay=2.0)
+        if gsngen[k] > 0:
+            net.add_connection("STN", k,          "GPe", k, float(gsngen[k]) * gpeak,
+                               SynapseSpec.double_exponential(0.0, 2.0, 67.0), delay=2.0)
+            net.add_connection("STN", (k-1)%n,    "GPe", k, float(gsngen[k]) * gpeak,
                                SynapseSpec.double_exponential(0.0, 2.0, 67.0), delay=2.0)
 
-    # ---- STN → GPi  (excitatory alpha, 5 of n neurons, delay=1.5ms) -------
-    stn_gpi_idx = rng.permutation(n)[:5]
-    for i in stn_gpi_idx:
-        for j_off in (0, 1):
-            net.add_connection("STN", int(i), "GPi", (int(i) + j_off) % n,
-                               0.15, SynapseSpec.alpha(0.0, tau), delay=1.5)
+    # ---- STN → GPi  (sparse receiver-selected alpha, delay=1.5ms) ---------
+    # Benchmark: gsngi[k]*(S2b[k]+S21b[k]) where S21b[k]=S2b[k-1]
+    #   gsngi = zeros(n), 5 GPi RECEIVERS = 0.15 each
+    #   GPi[k] ← STN[k] and STN[k-1] with weight gsngi[k]*gpeak = 0.15*0.43 = 0.0645
+    gsngi = np.zeros(n)
+    gsngi[rng.permutation(n)[:5]] = 0.15
+    for k in range(n):
+        if gsngi[k] > 0:
+            net.add_connection("STN", k,       "GPi", k, float(gsngi[k]) * gpeak,
+                               SynapseSpec.alpha(0.0, tau), delay=1.5)
+            net.add_connection("STN", (k-1)%n, "GPi", k, float(gsngi[k]) * gpeak,
+                               SynapseSpec.alpha(0.0, tau), delay=1.5)
 
-    # ---- GPe → GPi  (inhibitory alpha, shifted, delay=3ms) ----------------
+    # ---- GPe → GPi  (shift=1 and shift=n-2, delay=3ms) --------------------
+    # Benchmark: Igigi = ggigi*(V4-Esyn[4])*(S31b+S32b)
+    #   S31b[k]=S3b[k+1] → GPi[k]←GPe[k+1] (shift=1)
+    #   S32b[k]=S3b[k-2] → GPi[k]←GPe[k-2] (shift=n-2)
+    # ggigi=0.5, kernel peaks at gpeak1=0.3 → weight = 0.5*0.3 = 0.15 each
     for shift in (1, -2 % n):
         net.connect("GPe", "GPi", "shifted",
-                    weight=gpeak1 / 2,
+                    weight=0.5 * gpeak1,
                     synapse=SynapseSpec.alpha(-85.0, tau), delay=3.0, shift=shift)
 
-    # ---- GPe → GPe  (inhibitory alpha, PD-scaled random weights) ----------
+    # ---- GPe → GPe  (receiver-indexed random weights, delay=1ms) ----------
+    # Benchmark: Igege = ggege_scale * ggege[k] * (S31c[k]+S32c[k])
+    #   S31c[k]=S3c[k+1] → GPe[k]←GPe[k+1]; S32c[k]=S3c[k-2] → GPe[k]←GPe[k-2]
+    #   Weight is per RECEIVER: ggege_scale * ggege[k] * gpeak1
     ggege_scale   = 0.25 * (pd * 3 + 1)
-    ggege_weights = ggege_scale * rng.random(n)
-    for i in range(n):
-        for j_off, shift_sign in ((1, 1), (-2, -1)):
-            net.add_connection("GPe", i, "GPe", (i + j_off) % n,
-                               float(ggege_weights[i]) * gpeak1 / 2,
-                               SynapseSpec.alpha(-85.0, tau), delay=1.0)
+    ggege_weights = rng.random(n)   # ggege[k] per receiver
+    for k in range(n):
+        net.add_connection("GPe", (k+1) % n,    "GPe", k,
+                           float(ggege_weights[k]) * ggege_scale * gpeak1,
+                           SynapseSpec.alpha(-85.0, tau), delay=1.0)
+        net.add_connection("GPe", (k-2+n) % n,  "GPe", k,
+                           float(ggege_weights[k]) * ggege_scale * gpeak1,
+                           SynapseSpec.alpha(-85.0, tau), delay=1.0)
 
     # ---- Str_D2 → GPe  (inhibitory alpha, all-to-all, delay=5ms) ----------
+    # Benchmark: gstrgpe=0.5, S peaks at gpeak1=0.3 → weight=0.5*gpeak1/n per connection
     net.connect("Str_D2", "GPe", "all_to_all",
-                weight=0.5 / n,
+                weight=0.5 * gpeak1 / n,
                 synapse=SynapseSpec.alpha(-85.0, tau), delay=5.0)
 
     # ---- Str_D1 → GPi  (inhibitory alpha, all-to-all, delay=4ms) ----------
+    # Benchmark: gstrgpi=0.5, kernel peaks at gpeak1=0.3
     net.connect("Str_D1", "GPi", "all_to_all",
-                weight=0.5 / n,
+                weight=0.5 * gpeak1 / n,
                 synapse=SynapseSpec.alpha(-85.0, tau), delay=4.0)
 
     # ---- CTX_e → Str_D2  (excitatory alpha, one-to-one, delay=5.1ms) -----
+    # Benchmark: Icorstr5 = gcorindrstr*(V5-Esyn[1])*S6a, one-to-one
+    # gcorindrstr=0.07, S6a peaks at gpeak=0.43 → weight=0.07*0.43=0.0301
     net.connect("CTX_e", "Str_D2", "one_to_one",
-                weight=0.07,
+                weight=0.07 * gpeak,
                 synapse=SynapseSpec.alpha(0.0, tau), delay=5.1)
 
-    # ---- CTX_e → Str_D1  (excitatory alpha, per-neuron weight) ------------
+    # ---- CTX_e → Str_D1  (excitatory alpha, one-to-one, per-neuron weight) -
+    # Benchmark: Icorstr6 = gcordrstr[k]*(V6-Esyn[1])*S6a, gcordrstr peaks at gpeak
     gcordrstr = (0.07 - 0.044 * pd) + 0.001 * rng.random(n)
     for i in range(n):
         net.add_connection("CTX_e", i, "Str_D1", i,
-                           float(gcordrstr[i]),
+                           float(gcordrstr[i]) * gpeak,
                            SynapseSpec.alpha(0.0, tau), delay=5.1)
 
-    # ---- CTX_e → STN  (AMPA + NMDA double-exp, per-neuron, delay=5.9ms) --
-    gcorsna = 0.3   * rng.random(n)   # AMPA
-    gcorsnn = 0.003 * rng.random(n)   # NMDA
-    for i in range(n):
-        for j_off in (0, 1):
-            j = (i + j_off) % n
-            net.add_connection("CTX_e", i, "STN", j, float(gcorsna[i]),
-                               SynapseSpec.double_exponential(0.0, 0.5, 2.49), delay=5.9)
-            net.add_connection("CTX_e", i, "STN", j, float(gcorsnn[i]),
-                               SynapseSpec.double_exponential(0.0, 2.0, 90.0), delay=5.9)
+    # ---- CTX_e → STN  (receiver-indexed AMPA + NMDA, delay=5.9ms) --------
+    # Benchmark: gcorsna[k]*(S6b[k]+S61b[k]) where S61b[k]=S6b[k+1]
+    #   gcorsna is (n,1), all neurons nonzero (0 to 0.3)
+    #   STN[k] ← CTX[k] and CTX[k+1], weight = gcorsna[k]*gpeak (receiver-indexed)
+    gcorsna = 0.3   * rng.random(n)   # per receiver STN
+    gcorsnn = 0.003 * rng.random(n)   # per receiver STN
+    for k in range(n):
+        net.add_connection("CTX_e", k,        "STN", k, float(gcorsna[k]) * gpeak,
+                           SynapseSpec.double_exponential(0.0, 0.5, 2.49), delay=5.9)
+        net.add_connection("CTX_e", (k+1)%n,  "STN", k, float(gcorsna[k]) * gpeak,
+                           SynapseSpec.double_exponential(0.0, 0.5, 2.49), delay=5.9)
+        net.add_connection("CTX_e", k,        "STN", k, float(gcorsnn[k]) * gpeak,
+                           SynapseSpec.double_exponential(0.0, 2.0, 90.0), delay=5.9)
+        net.add_connection("CTX_e", (k+1)%n,  "STN", k, float(gcorsnn[k]) * gpeak,
+                           SynapseSpec.double_exponential(0.0, 2.0, 90.0), delay=5.9)
 
-    # ---- TH → CTX_e  (excitatory alpha, random permutation, delay=5ms) ---
-    perm = rng.permutation(n)
-    for i in range(n):
-        net.add_connection("TH", i, "CTX_e", int(perm[i]),
-                           0.15, SynapseSpec.alpha(0.0, tau), delay=5.0)
+    # ---- TH → CTX_e  (one-to-one, no permutation, delay=5ms) --------------
+    # MATLAB uses standard alpha functions peaking at 1.0; gthcor=0.15 → weight=0.15.
+    # (Python benchmark normalises to gpeak=0.43, but MATLAB does not — use MATLAB convention.)
+    net.connect("TH", "CTX_e", "one_to_one", weight=0.15 *gpeak,
+                synapse=SynapseSpec.alpha(0.0, tau), delay=5.6)
 
-    # ---- CTX_i → CTX_e  (inhibitory, 4 random permutations) ---------------
+    # ---- CTX_i → CTX_e  (4 random permutations) ---------------------------
+    # gie=0.2, 4 permutations → weight per connection = 0.2 (MATLAB convention, peak=1.0)
     for _ in range(4):
         perm = rng.permutation(n)
         for i in range(n):
             net.add_connection("CTX_i", i, "CTX_e", int(perm[i]),
-                               0.2 / 4, SynapseSpec.alpha(-85.0, tau))
+                               0.2 * gpeak, SynapseSpec.alpha(-85.0, tau), delay=1)
 
-    # ---- CTX_e → CTX_i  (excitatory, 4 random permutations) ---------------
+    # ---- CTX_e → CTX_i  (4 random permutations) ---------------------------
+    # gei=0.1, 4 permutations → weight per connection = 0.1 (MATLAB convention, peak=1.0)
     for _ in range(4):
         perm = rng.permutation(n)
         for i in range(n):
             net.add_connection("CTX_e", i, "CTX_i", int(perm[i]),
-                               0.1 / 4, SynapseSpec.alpha(0.0, tau))
+                               0.1 * gpeak, SynapseSpec.alpha(0.0, tau), delay=1)
 
     # ---- Intra-striatal GABA-A  (kinetic, Ggaba(V) gate) ------------------
     gaba_kin = _gaba_kinetic(tau_i=13.0, E_syn=-80.0)
@@ -365,23 +408,27 @@ def simulate_ctxbgth(
     # targets for each population in the healthy state:
     #   TH ~8-12 Hz, STN ~5-10 Hz, GPe/GPi ~25 Hz, CTX ~20-30 Hz
     n_steps = int(tmax / dt)
+    # I_ext values match benchmark exactly:
+    #   Iappth=1.2, (no Iappstn — STN fires spontaneously), Iappgpe=3, Iappgpi=3
+    #   CTX and Str receive NO constant drive — cortex is driven only by TH synaptic input
+    #   Benchmark: Iappgpe = 3 - 2*corstim*(not pd)  [only reduced during corstim in healthy]
     I_ext: dict = {
-        "TH":    0.5,                                # thalamic relay: ~8-12 Hz (lower than benchmark Iappth=1.2 — h_Na recovers faster in alpha_beta form)
-        "STN":   5.0,                                # STN: needs extra drive to overcome GPe inhibition
-        "GPe":   float(1.0 - 0.3 * pd),             # GPe: healthy 1.0, PD 0.7
-        "GPi":   1.0,                                # GPi: ~25 Hz
-        "CTX_e": 5.0,                                # RS cortical drive
-        "CTX_i": 2.0,                                # FS interneuron drive
+        "TH":    1.2,
+        "GPe":   float(3.0 - 2.0 * corstim * (1 - pd)),
+        "GPi":   3.0,
     }
 
     # Cortical stimulus pulse at t=1000ms (if corstim=1)
+    # Benchmark: CTX has zero constant Iapp; corstim adds a 350 µA/cm² pulse
     if corstim:
-        I_cortex = np.zeros(n_steps)
+        I_cortex_e = np.zeros(n_steps)
+        I_cortex_i = np.zeros(n_steps)
         s0 = int(1000.0 / dt)
         s1 = int((1000.0 + 0.3) / dt)
-        I_cortex[s0:s1] = 350.0
-        I_ext["CTX_e"] = I_cortex
-        I_ext["CTX_i"] = I_cortex
+        I_cortex_e[s0:s1] = 350.0
+        I_cortex_i[s0:s1] = 350.0
+        I_ext["CTX_e"] = I_cortex_e
+        I_ext["CTX_i"] = I_cortex_i
 
     # DBS on STN via built-in stimulator
     if dbs_freq > 0:
@@ -394,7 +441,10 @@ def simulate_ctxbgth(
     # ---- Simulate ----------------------------------------------------------
     start = timer()
     result = net.simulate(tmax, dt, I_ext,
-                          record=RecordingConfig.spike_stats())
+                          record=RecordingConfig(
+                              ["spikes", "spike_count", "firing_rate",
+                               "ISI_mean", "ISI_cv", "spike_events"],
+                              interval=1, spike_threshold=-10.0))
     elapsed = timer() - start
 
     # ---- Spectral analysis of GPi (multitaper, matches benchmark) ----------
@@ -408,15 +458,15 @@ def simulate_ctxbgth(
         fpass=(1, 100),
         tapers=(3, 5),
     )
+    
     beta_mask = (gpi_f > 7) & (gpi_f < 35)
     gpi_alpha_beta_area = float(np.trapezoid(gpi_S[beta_mask], gpi_f[beta_mask]))
 
-    spike_times = {
-        pop: result[pop]["spikes"]
-        for pop in ("TH", "STN", "GPe", "GPi", "Str_D2", "Str_D1", "CTX_e", "CTX_i")
-    }
+    pops_ordered = ("TH", "STN", "GPe", "GPi", "Str_D2", "Str_D1", "CTX_e", "CTX_i")
+    spike_times = {pop: result[pop]["spikes"] for pop in pops_ordered}
+    spike_events = {pop: result[pop]["spike_events"] for pop in pops_ordered}
 
-    return gpi_alpha_beta_area, gpi_S, gpi_f, spike_times, elapsed
+    return gpi_alpha_beta_area, gpi_S, gpi_f, spike_times, spike_events, elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -424,11 +474,76 @@ def simulate_ctxbgth(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    time = 1 # seconds  
+    time = 2 # seconds
+    window_s = 0.25  # time window for rate-over-time reporting (seconds)
+
     print(f"Building CTX-BG-TH network (healthy, no DBS, n=10, {time}s) ...")
-    area, S, f, spikes, t_sim = simulate_ctxbgth(n=10, pd=0, tmax=time*1000, dt=0.01)
+    area, S, f, spikes, syn_events, t_sim = simulate_ctxbgth(n=10, pd=0, tmax=time*1000, dt=0.01, corstim=0)
     print(f"  Simulation time : {t_sim:.2f} s")
     print(f"  GPi β-band power: {area:.4f}")
+
+    # Overall mean rates
+    print("\n  Overall mean firing rates:")
     for pop, sp_list in spikes.items():
         rates = [len(s) / time for s in sp_list]
-        print(f"  {pop:8s}: mean rate = {np.mean(rates):.1f} spk/s")
+        print(f"    {pop:8s}: {np.mean(rates):.1f} spk/s")
+
+    # Rates in successive time windows to check for drift/transients
+    tmax_ms   = time * 1000.0
+    win_ms    = window_s * 1000.0
+    n_windows = int(tmax_ms / win_ms)
+    edges_ms  = [i * win_ms for i in range(n_windows + 1)]
+
+    pops = list(spikes.keys())
+    hdr  = f"  {'Window':>16s} | " + " | ".join(f"{p:>8s}" for p in pops)
+    print(f"\n  Firing rates by {window_s*1000:.0f} ms window (spk/s):")
+    print("  " + "-" * (len(hdr) - 2))
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for w in range(n_windows):
+        t0, t1 = edges_ms[w], edges_ms[w + 1]
+        label  = f"{t0/1000:.2f}–{t1/1000:.2f} s"
+        row_rates = []
+        for pop in pops:
+            sp_list = spikes[pop]
+            count = sum(np.sum((s >= t0) & (s < t1)) for s in sp_list)
+            mean_rate = count / len(sp_list) / window_s if sp_list else 0.0
+            row_rates.append(mean_rate)
+        print(f"  {label:>16s} | " + " | ".join(f"{r:>8.1f}" for r in row_rates))
+    print("  " + "-" * (len(hdr) - 2))
+
+    # Synapse-detected vs voltage-based spike count comparison
+    # syn_events[pop] shape: (n_neurons, n_rec); each value = #steps neuron fired (synapse view)
+    # spikes[pop] is list of spike-time arrays (voltage view)
+    dt_ms = 0.01
+    t_axis = np.arange(0, time * 1000, dt_ms * 1)  # interval=1, so n_rec = n_steps
+
+    print(f"\n  Synapse-detected vs voltage-based spike counts by {window_s*1000:.0f} ms window:")
+    print(f"  (syn = sum of synapse-detected firing steps; V = voltage-threshold crossings)")
+    for pop in pops:
+        ev = syn_events[pop]          # (n_neurons, n_rec)
+        sp_list = spikes[pop]
+        n_pop = ev.shape[0]
+        tmax_ms_val = time * 1000.0
+        # time axis for syn_events: each column j covers t = j * dt_ms (interval=1)
+        t_rec = np.arange(ev.shape[1]) * dt_ms
+
+        syn_row = []
+        v_row = []
+        for w in range(n_windows):
+            t0, t1 = edges_ms[w], edges_ms[w + 1]
+            # synapse count: sum of event steps in window, averaged over neurons
+            mask = (t_rec >= t0) & (t_rec < t1)
+            syn_count = float(ev[:, mask].sum()) / n_pop
+            # voltage count: spike events in window
+            v_count = sum(np.sum((s >= t0) & (s < t1)) for s in sp_list) / n_pop
+            syn_row.append(syn_count)
+            v_row.append(v_count)
+
+        print(f"\n    {pop}:")
+        win_labels = [f"{edges_ms[w]/1000:.2f}-{edges_ms[w+1]/1000:.2f}s" for w in range(n_windows)]
+        label_w = max(len(l) for l in win_labels)
+        for w, lbl in enumerate(win_labels):
+            delta = syn_row[w] - v_row[w]
+            print(f"      {lbl:{label_w}s}  syn={syn_row[w]:6.1f}  V={v_row[w]:6.1f}  Δ={delta:+.1f}")
+    print()

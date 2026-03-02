@@ -1243,10 +1243,11 @@ class RegionalNetwork:
                     self._rnet.add_connection(src, i, dst, j, float(w) * weight_scale, synapse, delay)
 
     def randomize_membrane_potentials(
-        self, name: str, V_mean: float, V_std: float, seed: int = 0
+        self, name: str, V_mean: float, V_std: float, seed: int = 0,
+        reset_gates: bool = False
     ) -> None:
         """Randomize membrane potentials for a population."""
-        self._rnet.randomize_membrane_potentials(name, V_mean, V_std, seed)
+        self._rnet.randomize_membrane_potentials(name, V_mean, V_std, seed, reset_gates)
 
     # ---- Population queries ----
 

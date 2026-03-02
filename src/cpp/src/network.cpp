@@ -487,7 +487,7 @@ void Network::update_synapses(double dt) {
     update_decay_factors(dt);
 
     const size_t S = sa_.size();
-    const double spike_threshold = 0.0;
+    const double spike_threshold = spike_threshold_;
     static constexpr double E_CONST = 2.718281828459045;
 
     for (size_t i = 0; i < S; ++i) {
@@ -679,7 +679,7 @@ void Network::update_synapses_grouped(double dt) {
     update_decay_factors(dt);
 
     const size_t S = sa_.size();
-    const double spike_threshold = 0.0;
+    const double spike_threshold = spike_threshold_;
     static constexpr double E_CONST = 2.718281828459045;
 
     // Phase 1: spike detection + delay processing for ALL synapses
@@ -954,9 +954,13 @@ void Network::simulate_into_buffers(
     double* calcium_buf,
     double* g_syn_buf,
     double* I_syn_buf,
+    double* spike_event_buf,
     size_t  interval,
-    size_t  n_rec
+    size_t  n_rec,
+    double  spike_threshold
 ) {
+    spike_threshold_ = spike_threshold;
+
     size_t num_steps = static_cast<size_t>(duration / dt);
     size_t n_neurons = neurons_.size();
 
@@ -1016,6 +1020,9 @@ void Network::simulate_into_buffers(
 
     const size_t S = sa_.size();
 
+    // Accumulator for synapse-detected incoming spike events per neuron
+    std::vector<double> syn_spike_accum(n_neurons, 0.0);
+
     // Hot loop
     for (size_t t = 0; t < num_steps; ++t) {
         // Scatter pool voltages into V_cache_
@@ -1046,6 +1053,14 @@ void Network::simulate_into_buffers(
                 const double* g = sa_.g.data();
                 for (size_t i = 0; i < S; ++i)
                     g_syn_buf[i * n_rec + tr] = g[i];
+            }
+
+            // Synapse-detected spike event counts accumulated since previous recording step
+            if (spike_event_buf) {
+                for (size_t i = 0; i < n_neurons; ++i) {
+                    spike_event_buf[i * n_rec + tr] = syn_spike_accum[i];
+                    syn_spike_accum[i] = 0.0;
+                }
             }
         }
 
@@ -1084,6 +1099,12 @@ void Network::simulate_into_buffers(
         for (auto& kv : comp_pools) kv.second.scatter_voltages(V_cache_.data());
 
         update_synapses_grouped(dt);
+
+        // Accumulate synapse-detected incoming spikes per post-synaptic neuron
+        if (spike_event_buf) {
+            for (size_t j = 0; j < S; ++j)
+                if (spike_detected_[j]) syn_spike_accum[sa_.post[j]] += 1.0;
+        }
     }
 
     // Sync pool state back to API objects

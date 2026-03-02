@@ -35,6 +35,51 @@ void ComposableNeuron::set_gate_states(const std::vector<double>& states) {
         gate_states_[i] = states[i];
     }
 }
+
+void ComposableNeuron::reset_gates_to_steady_state() {
+    const size_t ng = spec_.gates.size();
+
+    // First pass: compute steady-state for INF_TAU, ALPHA_BETA, INSTANT gates
+    for (size_t i = 0; i < ng; ++i) {
+        const auto& gs = spec_.gates[i];
+        switch (gs.update_form) {
+            case GateSpec::UpdateForm::INF_TAU: {
+                double dep = (gs.dependency == GateSpec::Dependency::CALCIUM) ? Ca_ : V_;
+                gate_states_[i] = boltzmann(dep, gs.inf);
+                gate_states_[i] = std::max(0.0, std::min(1.0, gate_states_[i]));
+                break;
+            }
+            case GateSpec::UpdateForm::ALPHA_BETA: {
+                double alpha = compute_rate(V_, gs.alpha);
+                double beta  = compute_rate(V_, gs.beta);
+                double rate  = alpha + beta;
+                if (rate > 1e-10) gate_states_[i] = alpha / rate;
+                gate_states_[i] = std::max(0.0, std::min(1.0, gate_states_[i]));
+                break;
+            }
+            case GateSpec::UpdateForm::INSTANT: {
+                double dep = (gs.dependency == GateSpec::Dependency::CALCIUM) ? Ca_ : V_;
+                gate_states_[i] = boltzmann(dep, gs.inf);
+                gate_states_[i] = std::max(0.0, std::min(1.0, gate_states_[i]));
+                break;
+            }
+            case GateSpec::UpdateForm::DERIVED:
+                break;  // handled in second pass
+        }
+    }
+
+    // Second pass: DERIVED gates (use the just-computed steady states of their sources)
+    for (size_t i = 0; i < ng; ++i) {
+        const auto& gs = spec_.gates[i];
+        if (gs.update_form == GateSpec::UpdateForm::DERIVED) {
+            int src = gs.derived_source_gate;
+            if (src >= 0 && src < static_cast<int>(ng)) {
+                gate_states_[i] = gs.derived_a * (gs.derived_b + gs.derived_c * gate_states_[src]);
+                gate_states_[i] = std::max(0.0, std::min(1.0, gate_states_[i]));
+            }
+        }
+    }
+}
 void ComposableNeuron::set_calcium(double ca) { Ca_ = ca; }
 void ComposableNeuron::set_E_Ca(double e_ca) { E_Ca_ = e_ca; }
 

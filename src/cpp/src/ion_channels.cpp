@@ -128,9 +128,11 @@ NeuronModelSpec NeuronModelSpec::thalamic() {
 
 // =============================================================================
 // Subthalamic Nucleus (STN)
-// Based on Terman et al. (2002) / Rubin & Terman (2004)
-// Channels: Na, K, T-type Ca, Ca-dep K (AHP), L-type Ca, Leak, A-type K(?)
-// Calcium dynamics with Nernst equation
+// Rubin & Terman (2004) / Hahn et al. (2019) parameterisation.
+// All gate inf/tau functions match stn_xinf/stn_taux from benchmark exactly.
+// Channels: Na(m³h), K-DR(n⁴), A(a²b), CaL(c²d1d2), T(p²q), AHP-K(r²), Leak
+// Ca dynamics: dCa/dt = epsilon*(-I_Ca - K_Ca*Ca)
+//   epsilon=alp=5e-5, K_Ca=Kca/alp=0.002/5e-5=40
 // =============================================================================
 
 NeuronModelSpec NeuronModelSpec::stn() {
@@ -139,226 +141,293 @@ NeuronModelSpec NeuronModelSpec::stn() {
     spec.C_m = 1.0;
     spec.V_init = -62.0;
 
-    // Gate 0: h_Na
+    // Gate 0: m_Na — Na activation (dynamic)
+    // stn_minf = 1/(1+exp(-(V+40)/8))
+    // stn_taum = 0.2 + 3/(1+exp((V+53)/0.7))  → BOLTZMANN(0.2, 3, -53, -0.7)
+    {
+        GateSpec g;
+        g.name = "m_Na";
+        g.update_form = GateSpec::UpdateForm::INF_TAU;
+        g.initial_value = 0.060;
+        g.inf = {-40.0, 8.0};
+        g.tau.form = TauParams::Form::BOLTZMANN;
+        g.tau.params[0] = 0.2;    // base
+        g.tau.params[1] = 3.0;    // amp
+        g.tau.params[2] = -53.0;  // v_half
+        g.tau.params[3] = -0.7;   // k
+        spec.gates.push_back(g);
+    }
+
+    // Gate 1: h_Na — Na inactivation (dynamic)
+    // stn_hinf = 1/(1+exp((V+45.5)/6.4))
+    // stn_tauh = 24.5/(exp((V+50)/15) + exp(-(V+50)/16))
     {
         GateSpec g;
         g.name = "h_Na";
         g.update_form = GateSpec::UpdateForm::INF_TAU;
-        g.initial_value = 0.6;
-        g.inf = {-39.0, -3.1};
-        g.tau.form = TauParams::Form::SCALED_EXP;
-        g.tau.params[0] = 1.0;
-        g.tau.params[1] = -39.0;
-        g.tau.params[2] = -3.1;
+        g.initial_value = 0.929;
+        g.inf = {-45.5, -6.4};
+        g.tau.form = TauParams::Form::DOUBLE_EXP_SUM;
+        g.tau.params[0] = 0.0;    // base
+        g.tau.params[1] = 24.5;   // amp
+        g.tau.params[2] = 50.0;   // v1
+        g.tau.params[3] = 15.0;   // s1
+        g.tau.params[4] = 0.0;
+        g.tau.params[5] = 50.0;   // v2
+        g.tau.params[6] = 16.0;   // s2
         spec.gates.push_back(g);
     }
 
-    // Gate 1: n_K
+    // Gate 2: n_K — K-DR activation (dynamic)
+    // stn_ninf = 1/(1+exp(-(V+41)/14))
+    // stn_taun = 11/(exp((V+40)/40) + exp(-(V+40)/50))
     {
         GateSpec g;
         g.name = "n_K";
         g.update_form = GateSpec::UpdateForm::INF_TAU;
-        g.initial_value = 0.1;
-        g.inf = {-32.0, 8.0};
-        g.tau.form = TauParams::Form::SCALED_EXP;
-        g.tau.params[0] = 1.0;
-        g.tau.params[1] = -32.0;
-        g.tau.params[2] = 8.0;
+        g.initial_value = 0.182;
+        g.inf = {-41.0, 14.0};
+        g.tau.form = TauParams::Form::DOUBLE_EXP_SUM;
+        g.tau.params[0] = 0.0;    // base
+        g.tau.params[1] = 11.0;   // amp
+        g.tau.params[2] = 40.0;   // v1
+        g.tau.params[3] = 40.0;   // s1
+        g.tau.params[4] = 0.0;
+        g.tau.params[5] = 40.0;   // v2
+        g.tau.params[6] = 50.0;   // s2
         spec.gates.push_back(g);
     }
 
-    // Gate 2: m_Na (instant)
+    // Gate 3: a_A — A-type K activation (dynamic)
+    // stn_ainf = 1/(1+exp(-(V+45)/14.7))
+    // stn_taua = 1 + 1/(1+exp((V+40)/0.5))  → BOLTZMANN(1, 1, -40, -0.5)
     {
         GateSpec g;
-        g.name = "m_Na";
-        g.update_form = GateSpec::UpdateForm::INSTANT;
-        g.initial_value = 0.05;
-        g.inf = {-30.0, 15.0};
+        g.name = "a_A";
+        g.update_form = GateSpec::UpdateForm::INF_TAU;
+        g.initial_value = 0.239;
+        g.inf = {-45.0, 14.7};
+        g.tau.form = TauParams::Form::BOLTZMANN;
+        g.tau.params[0] = 1.0;    // base
+        g.tau.params[1] = 1.0;    // amp
+        g.tau.params[2] = -40.0;  // v_half
+        g.tau.params[3] = -0.5;   // k
         spec.gates.push_back(g);
     }
 
-    // Gate 3: a_T (T-current activation, dynamic)
+    // Gate 4: b_A — A-type K inactivation (dynamic)
+    // stn_binf = 1/(1+exp((V+90)/7.5))
+    // stn_taub = 200/(exp((V+60)/30) + exp(-(V+40)/10))
     {
         GateSpec g;
-        g.name = "a_T";
+        g.name = "b_A";
+        g.update_form = GateSpec::UpdateForm::INF_TAU;
+        g.initial_value = 0.023;
+        g.inf = {-90.0, -7.5};
+        g.tau.form = TauParams::Form::DOUBLE_EXP_SUM;
+        g.tau.params[0] = 0.0;    // base
+        g.tau.params[1] = 200.0;  // amp
+        g.tau.params[2] = 60.0;   // v1
+        g.tau.params[3] = 30.0;   // s1
+        g.tau.params[4] = 0.0;
+        g.tau.params[5] = 40.0;   // v2
+        g.tau.params[6] = 10.0;   // s2
+        spec.gates.push_back(g);
+    }
+
+    // Gate 5: c_CaL — L-type Ca activation (dynamic)
+    // stn_cinf = 1/(1+exp(-(V+30.6)/5))
+    // stn_tauc = 45 + 10/(exp((V+27)/20) + exp(-(V+50)/15))
+    {
+        GateSpec g;
+        g.name = "c_CaL";
+        g.update_form = GateSpec::UpdateForm::INF_TAU;
+        g.initial_value = 0.002;
+        g.inf = {-30.6, 5.0};
+        g.tau.form = TauParams::Form::DOUBLE_EXP_SUM;
+        g.tau.params[0] = 45.0;   // base
+        g.tau.params[1] = 10.0;   // amp
+        g.tau.params[2] = 27.0;   // v1
+        g.tau.params[3] = 20.0;   // s1
+        g.tau.params[4] = 0.0;
+        g.tau.params[5] = 50.0;   // v2
+        g.tau.params[6] = 15.0;   // s2
+        spec.gates.push_back(g);
+    }
+
+    // Gate 6: d1_CaL — L-type Ca slow voltage inactivation (dynamic)
+    // stn_d1inf = 1/(1+exp((V+60)/7.5))
+    // stn_taud1 = 400 + 500/(exp((V+40)/15) + exp(-(V+20)/20))
+    {
+        GateSpec g;
+        g.name = "d1_CaL";
+        g.update_form = GateSpec::UpdateForm::INF_TAU;
+        g.initial_value = 0.566;
+        g.inf = {-60.0, -7.5};
+        g.tau.form = TauParams::Form::DOUBLE_EXP_SUM;
+        g.tau.params[0] = 400.0;  // base
+        g.tau.params[1] = 500.0;  // amp
+        g.tau.params[2] = 40.0;   // v1
+        g.tau.params[3] = 15.0;   // s1
+        g.tau.params[4] = 0.0;
+        g.tau.params[5] = 20.0;   // v2
+        g.tau.params[6] = 20.0;   // s2
+        spec.gates.push_back(g);
+    }
+
+    // Gate 7: d2_CaL — L-type Ca fast inactivation (voltage-dep, NOT Ca-dep)
+    // stn_d2inf = 1/(1+exp((V-0.1)/0.02))  → Boltzmann(0.1, -0.02)
+    // td2 = 130 ms (constant)
+    {
+        GateSpec g;
+        g.name = "d2_CaL";
+        g.update_form = GateSpec::UpdateForm::INF_TAU;
+        g.initial_value = 1.0;
+        g.inf = {0.1, -0.02};
+        g.dependency = GateSpec::Dependency::VOLTAGE;  // explicitly voltage-dep
+        g.tau.form = TauParams::Form::CONSTANT;
+        g.tau.params[0] = 130.0;
+        spec.gates.push_back(g);
+    }
+
+    // Gate 8: p_T — T-type Ca activation (dynamic)
+    // stn_pinf = 1/(1+exp(-(V+56)/6.7))
+    // stn_taup = 5 + 0.33/(exp((V+27)/10) + exp(-(V+102)/15))
+    {
+        GateSpec g;
+        g.name = "p_T";
+        g.update_form = GateSpec::UpdateForm::INF_TAU;
+        g.initial_value = 0.290;
+        g.inf = {-56.0, 6.7};
+        g.tau.form = TauParams::Form::DOUBLE_EXP_SUM;
+        g.tau.params[0] = 5.0;    // base
+        g.tau.params[1] = 0.33;   // amp
+        g.tau.params[2] = 27.0;   // v1
+        g.tau.params[3] = 10.0;   // s1
+        g.tau.params[4] = 0.0;
+        g.tau.params[5] = 102.0;  // v2
+        g.tau.params[6] = 15.0;   // s2
+        spec.gates.push_back(g);
+    }
+
+    // Gate 9: q_T — T-type Ca inactivation (dynamic)
+    // stn_qinf = 1/(1+exp((V+85)/5.8))
+    // stn_tauq = 400/(exp((V+50)/15) + exp(-(V+50)/16))
+    {
+        GateSpec g;
+        g.name = "q_T";
+        g.update_form = GateSpec::UpdateForm::INF_TAU;
+        g.initial_value = 0.019;
+        g.inf = {-85.0, -5.8};
+        g.tau.form = TauParams::Form::DOUBLE_EXP_SUM;
+        g.tau.params[0] = 0.0;    // base
+        g.tau.params[1] = 400.0;  // amp
+        g.tau.params[2] = 50.0;   // v1
+        g.tau.params[3] = 15.0;   // s1
+        g.tau.params[4] = 0.0;
+        g.tau.params[5] = 50.0;   // v2
+        g.tau.params[6] = 16.0;   // s2
+        spec.gates.push_back(g);
+    }
+
+    // Gate 10: r_AHP — AHP K activation (voltage-dep near AP peak, NOT Ca-dep)
+    // stn_rinf = 1/(1+exp(-(V-0.17)/0.08))  → Boltzmann(0.17, 0.08)
+    // tr2 = 2 ms (constant)
+    {
+        GateSpec g;
+        g.name = "r_AHP";
         g.update_form = GateSpec::UpdateForm::INF_TAU;
         g.initial_value = 0.0;
-        g.inf = {-63.0, 7.8};
-        g.tau.form = TauParams::Form::DOUBLE_EXP_SUM;
-        g.tau.params[0] = 1.0;    // base
-        g.tau.params[1] = 5.0;    // amp
-        g.tau.params[2] = 0.0;    // v1 (numerator over exp sum)
-        g.tau.params[3] = 1e6;    // s1 (very large -> exp term ~ 1)
-        g.tau.params[4] = 0.0;
-        g.tau.params[5] = -68.0;
-        g.tau.params[6] = -2.2;
-        spec.gates.push_back(g);
-    }
-
-    // Gate 4: b_T (T-current inactivation, dynamic)
-    {
-        GateSpec g;
-        g.name = "b_T";
-        g.update_form = GateSpec::UpdateForm::INF_TAU;
-        g.initial_value = 0.4;
-        g.inf = {-0.014, -0.059};  // r_inf uses special calcium-based form
-        g.dependency = GateSpec::Dependency::CALCIUM;
-        g.tau.form = TauParams::Form::CONSTANT;
-        g.tau.params[0] = 0.24;
-        spec.gates.push_back(g);
-    }
-
-    // Gate 5: r (AHP gate, calcium-dependent)
-    {
-        GateSpec g;
-        g.name = "r";
-        g.update_form = GateSpec::UpdateForm::INF_TAU;
-        g.initial_value = 0.17;
-        g.inf = {-0.017, -0.08};  // Boltzmann with Ca as input
-        g.dependency = GateSpec::Dependency::CALCIUM;
+        g.inf = {0.17, 0.08};
+        g.dependency = GateSpec::Dependency::VOLTAGE;  // explicitly voltage-dep
         g.tau.form = TauParams::Form::CONSTANT;
         g.tau.params[0] = 2.0;
         spec.gates.push_back(g);
     }
 
-    // Gate 6: s_CaL (L-type Ca activation, instant)
-    {
-        GateSpec g;
-        g.name = "s_CaL";
-        g.update_form = GateSpec::UpdateForm::INSTANT;
-        g.initial_value = 0.0;
-        g.inf = {-39.0, 8.0};
-        spec.gates.push_back(g);
-    }
-
-    // Gate 7: h_T_stn (T inact, dynamic)
-    {
-        GateSpec g;
-        g.name = "h_T";
-        g.update_form = GateSpec::UpdateForm::INF_TAU;
-        g.initial_value = 0.35;
-        g.inf = {-80.0, -6.0};
-        g.tau.form = TauParams::Form::DOUBLE_EXP_SUM;
-        g.tau.params[0] = 20.0;
-        g.tau.params[1] = 100.0;
-        g.tau.params[2] = 39.7;
-        g.tau.params[3] = 9.32;
-        g.tau.params[4] = 0.0;
-        g.tau.params[5] = 0.6;    // was -0.6: sign error caused tau~1535ms
-        g.tau.params[6] = 7.4;    // was -7.4: double negation -> wrong exponent
-        spec.gates.push_back(g);
-    }
-
-    // Gate 8: m_T (T activation, instant)
-    {
-        GateSpec g;
-        g.name = "m_T_stn";
-        g.update_form = GateSpec::UpdateForm::INSTANT;
-        g.initial_value = 0.0;
-        g.inf = {-57.0, 6.2};
-        spec.gates.push_back(g);
-    }
-
-    // Gate 9: a_stn (A-type K activation, instant)
-    {
-        GateSpec g;
-        g.name = "a_stn";
-        g.update_form = GateSpec::UpdateForm::INSTANT;
-        g.initial_value = 0.0;
-        g.inf = {-45.0, 14.7};
-        spec.gates.push_back(g);
-    }
-
-    // Gate 10: b_stn (A-type K inactivation, dynamic)
-    {
-        GateSpec g;
-        g.name = "b_stn";
-        g.update_form = GateSpec::UpdateForm::INF_TAU;
-        g.initial_value = 0.6;
-        g.inf = {-90.0, -7.5};
-        g.tau.form = TauParams::Form::CONSTANT;
-        g.tau.params[0] = 20.0;
-        spec.gates.push_back(g);
-    }
-
-    // Channel 0: Na
+    // Channel 0: Na — g=49, Ena=60
     {
         ChannelSpec c;
         c.name = "Na";
-        c.g = 37.5;
-        c.E_rev = 55.0;
-        c.gates = {{2, 3}, {0, 1}};  // m^3 * h
+        c.g = 49.0;
+        c.E_rev = 60.0;
+        c.gates = {{0, 3}, {1, 1}};  // m_Na^3 * h_Na
         spec.channels.push_back(c);
     }
 
-    // Channel 1: K
+    // Channel 1: K (delayed rectifier) — g=57, Ek=-90
     {
         ChannelSpec c;
         c.name = "K";
-        c.g = 45.0;
-        c.E_rev = -80.0;
-        c.gates = {{1, 4}};  // n^4
+        c.g = 57.0;
+        c.E_rev = -90.0;
+        c.gates = {{2, 4}};  // n_K^4
         spec.channels.push_back(c);
     }
 
-    // Channel 2: T-type Ca
-    {
-        ChannelSpec c;
-        c.name = "T";
-        c.g = 0.5;
-        c.E_rev = 140.0;
-        c.gates = {{8, 2}, {7, 1}};  // m_T^2 * h_T
-        spec.channels.push_back(c);
-    }
-
-    // Channel 3: L-type Ca
-    {
-        ChannelSpec c;
-        c.name = "CaL";
-        c.g = 15.0;
-        c.E_rev = 140.0;
-        c.gates = {{6, 1}};  // s_CaL
-        spec.channels.push_back(c);
-    }
-
-    // Channel 4: AHP (Ca-dependent K)
-    {
-        ChannelSpec c;
-        c.name = "AHP";
-        c.g = 9.0;
-        c.E_rev = -80.0;
-        c.is_ahp = true;
-        c.ahp_k1 = 15.0;  // I_AHP = g * Ca/(Ca+k1) * (V-E)
-        spec.channels.push_back(c);
-    }
-
-    // Channel 5: A-type K
+    // Channel 2: A-type K — g=5, Ek=-90
     {
         ChannelSpec c;
         c.name = "A";
         c.g = 5.0;
-        c.E_rev = -80.0;
-        c.gates = {{9, 2}, {10, 1}};  // a^2 * b
+        c.E_rev = -90.0;
+        c.gates = {{3, 2}, {4, 1}};  // a_A^2 * b_A
         spec.channels.push_back(c);
     }
 
-    // Channel 6: Leak
+    // Channel 3: L-type Ca — g=0.5, Nernst
+    {
+        ChannelSpec c;
+        c.name = "CaL";
+        c.g = 0.5;
+        c.E_rev = 0.0;
+        c.use_calcium_nernst = true;
+        c.gates = {{5, 2}, {6, 1}, {7, 1}};  // c_CaL^2 * d1_CaL * d2_CaL
+        spec.channels.push_back(c);
+    }
+
+    // Channel 4: T-type Ca — g=5, Nernst
+    {
+        ChannelSpec c;
+        c.name = "T";
+        c.g = 5.0;
+        c.E_rev = 0.0;
+        c.use_calcium_nernst = true;
+        c.gates = {{8, 2}, {9, 1}};  // p_T^2 * q_T
+        spec.channels.push_back(c);
+    }
+
+    // Channel 5: AHP K — g=1, Ek=-90, gate-based r^2 (NOT is_ahp)
+    {
+        ChannelSpec c;
+        c.name = "AHP_K";
+        c.g = 1.0;
+        c.E_rev = -90.0;
+        c.gates = {{10, 2}};  // r_AHP^2
+        spec.channels.push_back(c);
+    }
+
+    // Channel 6: Leak — g=0.35, El=-60
     {
         ChannelSpec c;
         c.name = "Leak";
-        c.g = 2.25;
+        c.g = 0.35;
         c.E_rev = -60.0;
         spec.channels.push_back(c);
     }
 
-    // Calcium dynamics with Nernst
+    // Calcium dynamics: dCa/dt = epsilon*(-I_Ca - K_Ca*Ca)
+    // matches benchmark: dCa/dt = -alp*(IL + IT) - Kca*Ca
+    // alp = 1/(Z*F) = 1/(2*96485) = 5.182e-6   (NOT 5e-5 from fast version)
+    // Kca = 2e-3 = 0.002
+    // K_Ca = Kca / alp = 0.002 / 5.182e-6 ≈ 386
     spec.calcium.enabled = true;
     spec.calcium.use_nernst = true;
-    spec.calcium.epsilon = 5e-6;  // Ca influx scaling
-    spec.calcium.K_Ca = 15.0;     // Ca decay rate
-    spec.calcium.Ca_init = 0.1;
+    spec.calcium.epsilon = 5.182e-6;  // = 1/(2*96485)
+    spec.calcium.K_Ca = 386.0;        // = Kca/alp = 0.002/5.182e-6
+    spec.calcium.Ca_init = 0.005;
     spec.calcium.Ca_o = 2000.0;
-    spec.calcium.source_channels = {2, 3};  // T and CaL channels
+    spec.calcium.source_channels = {3, 4};  // CaL (ch3) and T (ch4)
 
     return spec;
 }
@@ -376,60 +445,55 @@ NeuronModelSpec NeuronModelSpec::gpe() {
     spec.C_m = 1.0;
     spec.V_init = -62.0;
 
-    // Gate 0: h_Na
+    // Gate 0: m_Na (instant Na activation)
+    //   gpe_minf(V) = 1/(1+exp(-(V+37)/10)) = Boltzmann(-37, 10)
+    {
+        GateSpec g;
+        g.name = "m_Na";
+        g.update_form = GateSpec::UpdateForm::INSTANT;
+        g.initial_value = 0.076;
+        g.inf = {-37.0, 10.0};
+        spec.gates.push_back(g);
+    }
+
+    // Gate 1: h_Na (Na inactivation)
+    //   gpe_hinf(V) = 1/(1+exp((V+58)/12)) = Boltzmann(-58, -12)
+    //   tau_h(V) = 0.05 + 0.27/(1+exp((V+40)/12)), phi_h=0.05
     {
         GateSpec g;
         g.name = "h_Na";
         g.update_form = GateSpec::UpdateForm::INF_TAU;
         g.scale = 0.05;  // phi_h = 0.05
-        g.initial_value = 0.6;
-        g.inf = {-58.3, -6.7};
-        g.tau.form = TauParams::Form::SCALED_EXP;
-        g.tau.params[0] = 0.27;
-        g.tau.params[1] = -40.0;
-        g.tau.params[2] = -12.0;
+        g.initial_value = 0.583;
+        g.inf = {-58.0, -12.0};
+        g.tau.form = TauParams::Form::BOLTZMANN;
+        g.tau.params[0] = 0.05;   // base
+        g.tau.params[1] = 0.27;   // amp
+        g.tau.params[2] = -40.0;  // vh
+        g.tau.params[3] = -12.0;  // k
         spec.gates.push_back(g);
     }
 
-    // Gate 1: n_K
+    // Gate 2: n_K (K delayed-rectifier activation)
+    //   gpe_ninf(V) = 1/(1+exp(-(V+50)/14)) = Boltzmann(-50, 14)
+    //   tau_n(V) = 0.05 + 0.27/(1+exp((V+40)/12)), phi_n=0.1
     {
         GateSpec g;
         g.name = "n_K";
         g.update_form = GateSpec::UpdateForm::INF_TAU;
         g.scale = 0.1;  // phi_n = 0.1
-        g.initial_value = 0.1;
-        g.inf = {-32.0, 8.0};
-        g.tau.form = TauParams::Form::SCALED_EXP;
-        g.tau.params[0] = 0.27;
-        g.tau.params[1] = -40.0;
-        g.tau.params[2] = 8.0;
+        g.initial_value = 0.298;
+        g.inf = {-50.0, 14.0};
+        g.tau.form = TauParams::Form::BOLTZMANN;
+        g.tau.params[0] = 0.05;   // base
+        g.tau.params[1] = 0.27;   // amp
+        g.tau.params[2] = -40.0;  // vh
+        g.tau.params[3] = -12.0;  // k
         spec.gates.push_back(g);
     }
 
-    // Gate 2: r (Ca-dependent AHP gate)
-    {
-        GateSpec g;
-        g.name = "r";
-        g.update_form = GateSpec::UpdateForm::INF_TAU;
-        g.initial_value = 0.1;
-        g.inf = {-0.017, -0.08};
-        g.dependency = GateSpec::Dependency::CALCIUM;
-        g.tau.form = TauParams::Form::CONSTANT;
-        g.tau.params[0] = 2.0;
-        spec.gates.push_back(g);
-    }
-
-    // Gate 3: m_Na (instant)
-    {
-        GateSpec g;
-        g.name = "m_Na";
-        g.update_form = GateSpec::UpdateForm::INSTANT;
-        g.initial_value = 0.05;
-        g.inf = {-37.0, 10.0};
-        spec.gates.push_back(g);
-    }
-
-    // Gate 4: a_T (T-current activation, instant)
+    // Gate 3: a_T (T-type Ca activation, instant)
+    //   gpe_ainf(V) = 1/(1+exp(-(V+57)/2)) = Boltzmann(-57, 2)
     {
         GateSpec g;
         g.name = "a_T";
@@ -439,95 +503,115 @@ NeuronModelSpec NeuronModelSpec::gpe() {
         spec.gates.push_back(g);
     }
 
-    // Gate 5: s_T (T-current slow inactivation, dynamic)
+    // Gate 4: r_T (T-type Ca inactivation)
+    //   gpe_rinf(V) = 1/(1+exp((V+70)/2)) = Boltzmann(-70, -2)
+    //   tau_r = 30 ms (constant), phi=1
     {
         GateSpec g;
-        g.name = "s_T";
+        g.name = "r_T";
         g.update_form = GateSpec::UpdateForm::INF_TAU;
         g.scale = 1.0;
-        g.initial_value = 0.3;
-        g.inf = {-35.0, -2.0};
+        g.initial_value = 0.018;
+        g.inf = {-70.0, -2.0};
         g.tau.form = TauParams::Form::CONSTANT;
-        g.tau.params[0] = 400.0;
+        g.tau.params[0] = 30.0;
         spec.gates.push_back(g);
     }
 
-    // Channel 0: Na
+    // Gate 5: s_CaL (L-type Ca activation, instant)
+    //   gpe_sinf(V) = 1/(1+exp(-(V+35)/2)) = Boltzmann(-35, 2)
+    {
+        GateSpec g;
+        g.name = "s_CaL";
+        g.update_form = GateSpec::UpdateForm::INSTANT;
+        g.initial_value = 0.0;
+        g.inf = {-35.0, 2.0};
+        spec.gates.push_back(g);
+    }
+
+    // Channel 0: Na — m^3 * h
     {
         ChannelSpec c;
         c.name = "Na";
         c.g = 120.0;
         c.E_rev = 55.0;
-        c.gates = {{3, 3}, {0, 1}};  // m^3 * h
+        c.gates = {{0, 3}, {1, 1}};
         spec.channels.push_back(c);
     }
 
-    // Channel 1: K
+    // Channel 1: K — n^4
     {
         ChannelSpec c;
         c.name = "K";
         c.g = 30.0;
         c.E_rev = -80.0;
-        c.gates = {{1, 4}};  // n^4
+        c.gates = {{2, 4}};
         spec.channels.push_back(c);
     }
 
-    // Channel 2: T-type Ca
+    // Channel 2: T-type Ca — a^3 * r
+    //   It = gt[2] * a^3 * r * (V - Eca[2]),  gt[2]=0.5, Eca[2]=120
     {
         ChannelSpec c;
         c.name = "T";
         c.g = 0.5;
         c.E_rev = 120.0;
-        c.gates = {{4, 3}, {5, 1}};  // a_T^3 * s_T
+        c.gates = {{3, 3}, {4, 1}};
         spec.channels.push_back(c);
     }
 
-    // Channel 3: AHP (Ca-dep K)
+    // Channel 3: L-type Ca — s^2
+    //   Ica = gca[2] * s^2 * (V - Eca[2]),  gca[2]=0.15, Eca[2]=120
+    {
+        ChannelSpec c;
+        c.name = "CaL";
+        c.g = 0.15;
+        c.E_rev = 120.0;
+        c.gates = {{5, 2}};
+        spec.channels.push_back(c);
+    }
+
+    // Channel 4: AHP (Ca-dependent K)
+    //   Iahp = gahp[2] * (Ca/(Ca+k1[2])) * (V-Ek),  gahp[2]=10, k1[2]=10
     {
         ChannelSpec c;
         c.name = "AHP";
-        c.g = 30.0;
+        c.g = 10.0;
         c.E_rev = -80.0;
         c.is_ahp = true;
-        c.ahp_k1 = 15.0;
+        c.ahp_k1 = 10.0;
         spec.channels.push_back(c);
     }
 
-    // Channel 4: Leak
+    // Channel 5: Leak
+    //   Il = gl[2] * (V - El[2]),  gl[2]=0.1, El[2]=-65
     {
         ChannelSpec c;
         c.name = "Leak";
         c.g = 0.1;
-        c.E_rev = -55.0;
+        c.E_rev = -65.0;
         spec.channels.push_back(c);
     }
 
-    // Calcium
+    // Calcium dynamics
+    //   dCa/dt = 1e-4 * (-Ica - It - kca[2]*Ca),  kca[2]=15
     spec.calcium.enabled = true;
     spec.calcium.use_nernst = false;
     spec.calcium.epsilon = 1e-4;
     spec.calcium.K_Ca = 15.0;
     spec.calcium.Ca_init = 0.1;
-    spec.calcium.source_channels = {2};  // T-type
+    spec.calcium.source_channels = {2, 3};  // T-type and L-type Ca
 
     return spec;
 }
 
 // =============================================================================
-// GPi - same structure as GPe, different conductance params
+// GPi - identical neuron parameters to GPe (benchmark uses same gna/gk/etc.)
 // =============================================================================
 
 NeuronModelSpec NeuronModelSpec::gpi() {
     NeuronModelSpec spec = gpe();
     spec.name = "GPi";
-
-    // GPi has different maximal conductances
-    spec.channels[0].g = 120.0;  // Na
-    spec.channels[1].g = 30.0;   // K
-    spec.channels[2].g = 0.5;    // T
-    spec.channels[3].g = 20.0;   // AHP (lower than GPe)
-    spec.channels[4].g = 0.1;    // Leak
-
     return spec;
 }
 

@@ -26,6 +26,9 @@ public:
     void set_calcium(double ca);
     void set_E_Ca(double e_ca);
 
+    // Reset all gate variables to their steady-state values at the current V/Ca
+    void reset_gates_to_steady_state();
+
 private:
     NeuronModelSpec spec_;
     double V_;

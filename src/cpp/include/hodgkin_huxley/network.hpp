@@ -187,8 +187,10 @@ public:
         double* calcium_buf,
         double* g_syn_buf,
         double* I_syn_buf,
+        double* spike_event_buf,  // (n_neurons, n_rec): synapse-detected spike counts per interval
         size_t  interval,
-        size_t  n_rec
+        size_t  n_rec,
+        double  spike_threshold = 0.0
     );
 
 private:
@@ -280,6 +282,10 @@ private:
 
     // Use fast polynomial exp approximation (~8 digits) vs Eigen's built-in
     bool fast_math_ = true;
+
+    // Spike threshold used by update_synapses* for pre-synaptic spike detection.
+    // Set by simulate_into_buffers() before the hot loop; default 0.0 (classic HH peak).
+    double spike_threshold_ = 0.0;
 
     // Lazy sync: SoA is source of truth during simulation
     mutable bool soa_dirty_ = false;

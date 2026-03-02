@@ -353,22 +353,26 @@ PYBIND11_MODULE(_core, m) {
                py::array_t<double> calcium_buf,
                py::array_t<double> g_syn_buf,
                py::array_t<double> I_syn_buf,
-               size_t interval) {
+               py::array_t<double> spike_event_buf,
+               size_t interval,
+               double spike_threshold) {
                 size_t n_rec = (static_cast<size_t>(dur / dt) + interval - 1) / interval;
                 size_t max_gates = (gate_buf.ndim() == 3)
                                    ? static_cast<size_t>(gate_buf.shape(1)) : 0;
                 net.simulate_into_buffers(
                     dur, dt, I_ext,
-                    V_buf.size()       ? V_buf.mutable_data()       : nullptr,
-                    gate_buf.size()    ? gate_buf.mutable_data()    : nullptr, max_gates,
-                    calcium_buf.size() ? calcium_buf.mutable_data() : nullptr,
-                    g_syn_buf.size()   ? g_syn_buf.mutable_data()   : nullptr,
-                    I_syn_buf.size()   ? I_syn_buf.mutable_data()   : nullptr,
-                    interval, n_rec);
+                    V_buf.size()            ? V_buf.mutable_data()            : nullptr,
+                    gate_buf.size()         ? gate_buf.mutable_data()         : nullptr, max_gates,
+                    calcium_buf.size()      ? calcium_buf.mutable_data()      : nullptr,
+                    g_syn_buf.size()        ? g_syn_buf.mutable_data()        : nullptr,
+                    I_syn_buf.size()        ? I_syn_buf.mutable_data()        : nullptr,
+                    spike_event_buf.size()  ? spike_event_buf.mutable_data()  : nullptr,
+                    interval, n_rec, spike_threshold);
             },
             py::arg("duration"), py::arg("dt"), py::arg("I_ext"),
             py::arg("V_buf"), py::arg("gate_buf"), py::arg("calcium_buf"),
-            py::arg("g_syn_buf"), py::arg("I_syn_buf"), py::arg("interval"))
+            py::arg("g_syn_buf"), py::arg("I_syn_buf"), py::arg("spike_event_buf"),
+            py::arg("interval"), py::arg("spike_threshold") = 0.0)
 
         // Python special methods
         .def("__repr__", [](const Network& net) {
@@ -511,7 +515,7 @@ PYBIND11_MODULE(_core, m) {
              &RegionalNetwork::randomize_membrane_potentials,
              "Randomize membrane potentials in a population",
              py::arg("name"), py::arg("mean"), py::arg("std_dev"),
-             py::arg("seed") = 0)
+             py::arg("seed") = 0, py::arg("reset_gates") = false)
 
         // Population queries
         .def("population_names", &RegionalNetwork::population_names)

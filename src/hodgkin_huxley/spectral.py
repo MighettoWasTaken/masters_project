@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.signal.windows import dpss
+from scipy.interpolate import interp1d as _interp1d
 
 
 # =============================================================================
@@ -32,10 +33,12 @@ def mtspectrumpt(spike_times_list: list,
     """
     Multitaper spectral estimator for point-process (spike train) data.
 
-    Implements the Chronux ``mtspectrumpt`` algorithm:
-    for each taper, evaluate the taper at spike times (via interpolation),
-    compute the non-uniform DFT, average |J|^2 across tapers and trials,
-    then subtract the mean firing rate as a bias correction.
+    Implements the Chronux ``mtspectrumpt`` algorithm (Mitra & Bokil 2008),
+    matching simulate_network_model.py / MATLAB Chronux exactly:
+
+      J_k(f) = Σ_i h_k(t_i) exp(−2πif(t_i − t₀)) − H_k(f) · Msp
+
+    where H_k(f) = FFT(h_k)[f] (tapers scaled by √Fs), Msp = Nsp/N.
 
     Parameters
     ----------
@@ -58,50 +61,55 @@ def mtspectrumpt(spike_times_list: list,
         Corresponding frequencies in Hz.
     """
     NW, K = tapers
-    N = int(duration * Fs)
     dt = 1.0 / Fs
 
-    # DPSS tapers — shape (K, N)
-    H = dpss(N, NW, Kmax=K)
+    # Time grid covering the full recording duration
+    t = np.arange(0, duration, dt)
+    N = len(t)
 
-    # Continuous time axis for taper interpolation (seconds)
-    t_taper = np.arange(N) * dt
+    # Zero-pad to next power of 2 (matches benchmark pad=0)
+    nfft = int(2 ** np.ceil(np.log2(max(N, 1))))
+    nfft = max(nfft, N)
 
-    # Frequency grid matching an N-point DFT, restricted to fpass
-    f_all = np.fft.rfftfreq(N, d=dt)          # Hz
-    f_mask = (f_all >= fpass[0]) & (f_all <= fpass[1])
-    f_out = f_all[f_mask]
+    # Frequency grid: uniform from 0 to Fs, restricted to fpass
+    df = Fs / nfft
+    f_all = np.arange(0, Fs, df)[:nfft]
+    findx = np.where((f_all >= fpass[0]) & (f_all <= fpass[-1]))[0]
+    f_out = f_all[findx]
+    w = 2.0 * np.pi * f_out
 
-    S_trials = []
-    total_rate = 0.0
+    # DPSS tapers scaled by sqrt(Fs) — Chronux convention
+    tap, _ = dpss(N, NW, K, return_ratios=True)   # (K, N)
+    tap = tap * np.sqrt(Fs)
 
-    for spikes in spike_times_list:
-        spikes = np.asarray(spikes, dtype=np.float64)
-        spikes = spikes[(spikes >= 0) & (spikes < duration)]
-        total_rate += len(spikes) / duration
+    # FFT of tapers for mean-rate bias correction: shape (nfreq, K)
+    H = np.fft.fft(tap.T, nfft, axis=0)[findx, :]
 
-        if len(spikes) == 0:
-            S_trials.append(np.zeros(f_out.size))
-            continue
+    nfreq = len(f_out)
+    C = len(spike_times_list)
+    J = np.zeros((nfreq, K, C), dtype=complex)
+    Msp = np.zeros(C)
 
-        # For each taper k, compute the tapered Fourier transform at the
-        # exact spike times (non-uniform DFT):
-        #   J_k(f) = Σ_i  h_k(t_i) · exp(−2πi · f · t_i)
-        J = np.empty((K, f_out.size), dtype=complex)
-        for k in range(K):
-            h = np.interp(spikes, t_taper, H[k])       # (n_spikes,)
-            phase = -2.0 * np.pi * np.outer(spikes, f_out)   # (n_spikes, n_freq)
-            J[k] = h @ np.exp(1j * phase)               # (n_freq,)
+    for ch, spikes in enumerate(spike_times_list):
+        spikes = np.asarray(spikes, dtype=np.float64).ravel()
+        spikes = spikes[(spikes >= t[0]) & (spikes <= t[-1])]
+        Nsp = len(spikes)
+        Msp[ch] = Nsp / N   # mean spike count per time-grid point
 
-        # Trial power: mean over tapers of |J|^2
-        S_trials.append(np.mean(np.abs(J) ** 2, axis=0))
+        if Nsp > 0:
+            # Taper values at spike times (linear interpolation)
+            data_proj = _interp1d(t, tap.T, axis=0, kind='linear',
+                                  fill_value='extrapolate')(spikes)  # (Nsp, K)
+            # Phase at spike times relative to t[0]
+            exponential = np.exp(-1j * np.outer(w, spikes - t[0]))  # (nfreq, Nsp)
+            # J = tapered NUFFT − mean-rate bias (Chronux eq.)
+            J[:, :, ch] = exponential @ data_proj - H * Msp[ch]
 
-    # Average across neurons/trials
-    S = np.mean(S_trials, axis=0) if S_trials else np.zeros(f_out.size)
+    # Power: mean over tapers → (nfreq, C)
+    S = np.mean(np.real(np.conj(J) * J), axis=1)
 
-    # Point-process bias correction: subtract mean firing rate
-    mean_rate = total_rate / len(spike_times_list) if spike_times_list else 0.0
-    S = S - mean_rate
+    # Average over trials (neurons) → (nfreq,)
+    S = np.mean(S, axis=-1)
 
     return S, f_out
 

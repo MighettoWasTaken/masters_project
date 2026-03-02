@@ -1,4 +1,5 @@
 #include "hodgkin_huxley/regional_network.hpp"
+#include "hodgkin_huxley/composable_neuron.hpp"
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -368,7 +369,8 @@ void RegionalNetwork::generate_connections(
 
 void RegionalNetwork::randomize_membrane_potentials(const std::string& name,
                                                      double mean, double std_dev,
-                                                     unsigned int seed) {
+                                                     unsigned int seed,
+                                                     bool reset_gates) {
     const auto& pop = population(name);
     std::mt19937 rng;
     if (seed != 0) {
@@ -380,6 +382,11 @@ void RegionalNetwork::randomize_membrane_potentials(const std::string& name,
     std::normal_distribution<double> dist(mean, std_dev);
     for (size_t i = pop.start_idx; i < pop.end_idx(); ++i) {
         net_.neuron(i).set_membrane_potential(dist(rng));
+        if (reset_gates) {
+            if (auto* cn = dynamic_cast<ComposableNeuron*>(&net_.neuron(i))) {
+                cn->reset_gates_to_steady_state();
+            }
+        }
     }
 }
 

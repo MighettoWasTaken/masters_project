@@ -107,7 +107,8 @@ public:
     // Heterogeneous initial conditions
     void randomize_membrane_potentials(const std::string& name,
                                        double mean, double std_dev,
-                                       unsigned int seed = 0);
+                                       unsigned int seed = 0,
+                                       bool reset_gates = false);
 
     // Population queries
     const Population& population(const std::string& name) const;
