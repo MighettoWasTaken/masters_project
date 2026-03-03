@@ -183,10 +183,10 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
 
     # Randomise initial membrane potentials (matches benchmark scatter)
     # Benchmark: TH/STN/GPe/GPi/Str are randomised; CTX_e/CTX_i are NOT (all at -65).
-    net.randomize_membrane_potentials("TH",     -62.0, 5.0, seed=seed)
-    net.randomize_membrane_potentials("STN",    -62.0, 5.0, seed=seed + 1)
-    net.randomize_membrane_potentials("GPe",    -62.0, 5.0, seed=seed + 2)
-    net.randomize_membrane_potentials("GPi",    -62.0, 5.0, seed=seed + 3)
+    net.randomize_membrane_potentials("TH",     -62.0, 5.0, seed=seed, reset_gates=True)
+    net.randomize_membrane_potentials("STN",    -62.0, 5.0, seed=seed + 1, reset_gates=True)
+    net.randomize_membrane_potentials("GPe",    -62.0, 5.0, seed=seed + 2, reset_gates=True)
+    net.randomize_membrane_potentials("GPi",    -62.0, 5.0, seed=seed + 3, reset_gates=True)
     # Str: randomise V AND reset gate steady states to avoid V/gate mismatch transient.
     net.randomize_membrane_potentials("Str_D2", -63.8, 5.0, seed=seed + 4, reset_gates=True)
     net.randomize_membrane_potentials("Str_D1", -63.8, 5.0, seed=seed + 5, reset_gates=True)
@@ -280,13 +280,13 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
     # ---- Str_D2 → GPe  (inhibitory alpha, all-to-all, delay=5ms) ----------
     # Benchmark: gstrgpe=0.5, S peaks at gpeak1=0.3 → weight=0.5*gpeak1/n per connection
     net.connect("Str_D2", "GPe", "all_to_all",
-                weight=0.5 * gpeak1 / n,
+                weight=0.5 * gpeak1,
                 synapse=SynapseSpec.alpha(-85.0, tau), delay=5.0)
 
     # ---- Str_D1 → GPi  (inhibitory alpha, all-to-all, delay=4ms) ----------
     # Benchmark: gstrgpi=0.5, kernel peaks at gpeak1=0.3
     net.connect("Str_D1", "GPi", "all_to_all",
-                weight=0.5 * gpeak1 / n,
+                weight=0.5 * gpeak1,
                 synapse=SynapseSpec.alpha(-85.0, tau), delay=4.0)
 
     # ---- CTX_e → Str_D2  (excitatory alpha, one-to-one, delay=5.1ms) -----
@@ -298,6 +298,7 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
 
     # ---- CTX_e → Str_D1  (excitatory alpha, one-to-one, per-neuron weight) -
     # Benchmark: Icorstr6 = gcordrstr[k]*(V6-Esyn[1])*S6a, gcordrstr peaks at gpeak
+    
     gcordrstr = (0.07 - 0.044 * pd) + 0.001 * rng.random(n)
     for i in range(n):
         net.add_connection("CTX_e", i, "Str_D1", i,
@@ -321,26 +322,28 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
                            SynapseSpec.double_exponential(0.0, 2.0, 90.0), delay=5.9)
 
     # ---- TH → CTX_e  (one-to-one, no permutation, delay=5ms) --------------
-    # MATLAB uses standard alpha functions peaking at 1.0; gthcor=0.15 → weight=0.15.
-    # (Python benchmark normalises to gpeak=0.43, but MATLAB does not — use MATLAB convention.)
-    net.connect("TH", "CTX_e", "one_to_one", weight=0.15 *gpeak,
-                synapse=SynapseSpec.alpha(0.0, tau), delay=5.6)
+    # Benchmark: t_d_th_cor = 5 ms, gthcor=0.15, kernel peaks at gpeak=0.43.
+    # weight = gthcor * gpeak = 0.15 * 0.43
+    net.connect("TH", "CTX_e", "one_to_one", weight=0.15 * gpeak,
+                synapse=SynapseSpec.alpha(0.0, tau), delay=5.0)
 
     # ---- CTX_i → CTX_e  (4 random permutations) ---------------------------
-    # gie=0.2, 4 permutations → weight per connection = 0.2 (MATLAB convention, peak=1.0)
+    # Benchmark: gie=0.2, S1b via 2nd-order ODE (no explicit delay, starts at spike).
+    # weight = gie * gpeak = 0.2 * gpeak; delay=0.01 matches benchmark's ~0 effective delay.
     for _ in range(4):
         perm = rng.permutation(n)
         for i in range(n):
             net.add_connection("CTX_i", i, "CTX_e", int(perm[i]),
-                               0.2 * gpeak, SynapseSpec.alpha(-85.0, tau), delay=1)
+                               0.2 * gpeak, SynapseSpec.alpha(-85.0, tau), delay=0.01)
 
     # ---- CTX_e → CTX_i  (4 random permutations) ---------------------------
-    # gei=0.1, 4 permutations → weight per connection = 0.1 (MATLAB convention, peak=1.0)
+    # Benchmark: gei=0.1, S1a via 2nd-order ODE (no explicit delay, starts at spike).
+    # weight = gei * gpeak = 0.1 * gpeak; delay=0.01 matches benchmark's ~0 effective delay.
     for _ in range(4):
         perm = rng.permutation(n)
         for i in range(n):
             net.add_connection("CTX_e", i, "CTX_i", int(perm[i]),
-                               0.1 * gpeak, SynapseSpec.alpha(0.0, tau), delay=1)
+                               0.1 * gpeak, SynapseSpec.alpha(0.0, tau), delay=0.01)
 
     # ---- Intra-striatal GABA-A  (kinetic, Ggaba(V) gate) ------------------
     gaba_kin = _gaba_kinetic(tau_i=13.0, E_syn=-80.0)
@@ -478,7 +481,7 @@ if __name__ == "__main__":
     window_s = 0.25  # time window for rate-over-time reporting (seconds)
 
     print(f"Building CTX-BG-TH network (healthy, no DBS, n=10, {time}s) ...")
-    area, S, f, spikes, syn_events, t_sim = simulate_ctxbgth(n=10, pd=0, tmax=time*1000, dt=0.01, corstim=0)
+    area, S, f, spikes, syn_events, t_sim = simulate_ctxbgth(n=10, pd=0, tmax=time*1000, dt=0.01, corstim=0, seed=6536)
     print(f"  Simulation time : {t_sim:.2f} s")
     print(f"  GPi β-band power: {area:.4f}")
 
