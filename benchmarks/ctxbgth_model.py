@@ -191,6 +191,7 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
     net.randomize_membrane_potentials("Str_D2", -63.8, 5.0, seed=seed + 4, reset_gates=True)
     net.randomize_membrane_potentials("Str_D1", -63.8, 5.0, seed=seed + 5, reset_gates=True)
 
+
     # ---- Synapse parameter shorthands (from benchmark) --------------------
     tau    = 5.0    # ms — alpha-function time constant
     gpeak  = 0.43   # peak of excitatory alpha kernel (const = gpeak/(tau*exp(-1)))
@@ -300,26 +301,25 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
     # Benchmark: Icorstr6 = gcordrstr[k]*(V6-Esyn[1])*S6a, gcordrstr peaks at gpeak
     
     gcordrstr = (0.07 - 0.044 * pd) + 0.001 * rng.random(n)
+    
     for i in range(n):
         net.add_connection("CTX_e", i, "Str_D1", i,
                            float(gcordrstr[i]) * gpeak,
                            SynapseSpec.alpha(0.0, tau), delay=5.1)
+    
 
     # ---- CTX_e → STN  (receiver-indexed AMPA + NMDA, delay=5.9ms) --------
     # Benchmark: gcorsna[k]*(S6b[k]+S61b[k]) where S61b[k]=S6b[k+1]
     #   gcorsna is (n,1), all neurons nonzero (0 to 0.3)
     #   STN[k] ← CTX[k] and CTX[k+1], weight = gcorsna[k]*gpeak (receiver-indexed)
-    gcorsna = 0.3   * rng.random(n)   # per receiver STN
-    gcorsnn = 0.003 * rng.random(n)   # per receiver STN
-    for k in range(n):
-        net.add_connection("CTX_e", k,        "STN", k, float(gcorsna[k]) * gpeak,
-                           SynapseSpec.double_exponential(0.0, 0.5, 2.49), delay=5.9)
-        net.add_connection("CTX_e", (k+1)%n,  "STN", k, float(gcorsna[k]) * gpeak,
-                           SynapseSpec.double_exponential(0.0, 0.5, 2.49), delay=5.9)
-        net.add_connection("CTX_e", k,        "STN", k, float(gcorsnn[k]) * gpeak,
-                           SynapseSpec.double_exponential(0.0, 2.0, 90.0), delay=5.9)
-        net.add_connection("CTX_e", (k+1)%n,  "STN", k, float(gcorsnn[k]) * gpeak,
-                           SynapseSpec.double_exponential(0.0, 2.0, 90.0), delay=5.9)
+    net.connect("CTX_e", "STN", "all_to_all", weight=(0.0, 0.003 * gpeak),
+                synapse=SynapseSpec.double_exponential(0.0, 2.0, 90.0), delay=5.9)
+    
+    net.connect("CTX_e", "STN", "one_to_one", weight=(0.0, 0.3 * gpeak),
+                synapse=SynapseSpec.double_exponential(0.0, 0.5, 2.49), delay=5.9)
+    
+    net.connect("CTX_e", "STN", "shifted", weight=(0.0, 0.3 * gpeak),
+                synapse=SynapseSpec.double_exponential(0.0, 0.5, 2.49), delay=5.9, shift=1)
 
     # ---- TH → CTX_e  (one-to-one, no permutation, delay=5ms) --------------
     # Benchmark: t_d_th_cor = 5 ms, gthcor=0.15, kernel peaks at gpeak=0.43.
@@ -355,11 +355,13 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
             net.add_kinetic_connection("Str_D2", i, "Str_D2", int(perm[i]),
                                        ggaba / 4, gaba_kin)
     # Str_D1 → Str_D1 (3 random permutations, GABA-A)
+
     for _ in range(3):
         perm = rng.permutation(n)
         for i in range(n):
             net.add_kinetic_connection("Str_D1", i, "Str_D1", int(perm[i]),
                                        ggaba / 3, gaba_kin)
+
 
     return net
 
@@ -445,7 +447,7 @@ def simulate_ctxbgth(
     start = timer()
     result = net.simulate(tmax, dt, I_ext,
                           record=RecordingConfig(
-                              ["spikes", "spike_count", "firing_rate",
+                              ["V", "spikes", "spike_count", "firing_rate",
                                "ISI_mean", "ISI_cv", "spike_events"],
                               interval=1, spike_threshold=-10.0))
     elapsed = timer() - start
@@ -469,7 +471,7 @@ def simulate_ctxbgth(
     spike_times = {pop: result[pop]["spikes"] for pop in pops_ordered}
     spike_events = {pop: result[pop]["spike_events"] for pop in pops_ordered}
 
-    return gpi_alpha_beta_area, gpi_S, gpi_f, spike_times, spike_events, elapsed
+    return gpi_alpha_beta_area, gpi_S, gpi_f, spike_times, spike_events, elapsed, result
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +483,7 @@ if __name__ == "__main__":
     window_s = 0.25  # time window for rate-over-time reporting (seconds)
 
     print(f"Building CTX-BG-TH network (healthy, no DBS, n=10, {time}s) ...")
-    area, S, f, spikes, syn_events, t_sim = simulate_ctxbgth(n=10, pd=0, tmax=time*1000, dt=0.01, corstim=0, seed=6536)
+    area, S, f, spikes, syn_events, t_sim, sim_result = simulate_ctxbgth(n=10, pd=0, tmax=time*1000, dt=0.01, corstim=0, seed=6536)
     print(f"  Simulation time : {t_sim:.2f} s")
     print(f"  GPi β-band power: {area:.4f}")
 
@@ -518,6 +520,7 @@ if __name__ == "__main__":
     # Synapse-detected vs voltage-based spike count comparison
     # syn_events[pop] shape: (n_neurons, n_rec); each value = #steps neuron fired (synapse view)
     # spikes[pop] is list of spike-time arrays (voltage view)
+    """
     dt_ms = 0.01
     t_axis = np.arange(0, time * 1000, dt_ms * 1)  # interval=1, so n_rec = n_steps
 
@@ -550,3 +553,31 @@ if __name__ == "__main__":
             delta = syn_row[w] - v_row[w]
             print(f"      {lbl:{label_w}s}  syn={syn_row[w]:6.1f}  V={v_row[w]:6.1f}  Δ={delta:+.1f}")
     print()
+    """
+
+    # ---- Voltage diagnostic: Str_D1 from 0–2 ms at 0.25 ms resolution ------
+    print("\n--- Str_D1 voltage diagnostic (0–2 ms, every 0.25 ms) ---")
+    _V_all = sim_result["Str_D1"]["V"]   # (n, n_steps) at interval=1, dt=0.01ms
+    _t_all = sim_result["Str_D1"].time   # ms
+    _sp    = sim_result["Str_D1"]["spikes"]
+
+    # 0.25 ms resolution = every 25 steps at dt=0.01ms; window 0–2 ms
+    _step = 25
+    _idx = np.arange(0, _V_all.shape[1], _step)
+    _mask = _t_all[_idx] <= 2.0
+    _idx = _idx[_mask]
+    _V = _V_all[:, _idx]
+    _t = _t_all[_idx]
+    _sp_100 = [sp[sp <= 2.0] for sp in _sp]
+
+    n_d1 = _V.shape[0]
+    _hdr = f"{'t(ms)':>7s} | " + " | ".join(f"  N{i:02d} " for i in range(n_d1))
+    print(_hdr)
+    print("-" * len(_hdr))
+    for _ti in range(len(_t)):
+        _row = " | ".join(f"{_V[i, _ti]:+6.2f}" for i in range(n_d1))
+        print(f"{_t[_ti]:7.1f} | {_row}")
+    print("-" * len(_hdr))
+    print("Spikes in first 100 ms:")
+    for i, sp in enumerate(_sp_100):
+        print(f"  N{i:02d}: {np.round(sp, 2).tolist()}")

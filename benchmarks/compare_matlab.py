@@ -93,7 +93,7 @@ def run_library(tmax, n, pd, seed):
     from ctxbgth_model import simulate_ctxbgth
 
     t0 = timer()
-    beta_power, gpi_S, gpi_f, spike_times, _, _ = simulate_ctxbgth(
+    beta_power, gpi_S, gpi_f, spike_times, _, _, _ = simulate_ctxbgth(
         n=n, pd=pd, tmax=tmax, dt=0.01, seed=seed
     )
     elapsed = timer() - t0
