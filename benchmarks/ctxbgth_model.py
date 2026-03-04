@@ -7,9 +7,9 @@ presets, composable model builder, and C++-accelerated simulation.
 
 Network populations:
   TH       — Thalamus            (custom spec matching benchmark K-channel mechanism)
-  STN      — Subthalamic Nucleus (NeuronModelSpec.stn preset)
-  GPe      — Globus Pallidus ext (NeuronModelSpec.gpe preset)
-  GPi      — Globus Pallidus int (NeuronModelSpec.gpi preset)
+  STN      — Subthalamic Nucleus (custom NeuronModel builder)
+  GPe      — Globus Pallidus ext (custom NeuronModel builder)
+  GPi      — Globus Pallidus int (custom NeuronModel builder, same params as GPe)
   Str_D2   — Striatum indirect   (HH-style composable, D2 receptors)
   Str_D1   — Striatum direct     (HH-style composable, D1 receptors)
   CTX_e    — Cortex excitatory   (Izhikevich Regular Spiking)
@@ -26,8 +26,9 @@ from hodgkin_huxley import (
     KineticSynapseSpec, KineticUpdateForm, KineticCurrentForm,
     IzhikevichParameters, IzhikevichType,
     DBSStimulator, DBSParameters,
+    PulseStimulator,
     RecordingConfig,
-    mtspectrumpt,
+    analyze_beta_power,
 )
 
 
@@ -135,6 +136,108 @@ def _make_striatum_spec(pd: int = 0, V_init: float = -63.8) -> NeuronModelSpec:
 
 
 # ---------------------------------------------------------------------------
+# STN composable model (Rubin & Terman 2004 / Hahn et al. 2019)
+# Channels: Na(m³h), K-DR(n⁴), A(a²b), CaL(c²d1d2), T(p²q), AHP-K(r²), Leak
+# Ca dynamics: dCa/dt = epsilon*(-I_CaL - I_T - K_Ca*Ca)
+# ---------------------------------------------------------------------------
+
+def _make_stn_spec() -> NeuronModelSpec:
+    model = NeuronModel("STN", C_m=1.0, V_init=-62.0)
+
+    m  = model.add_gate("m_Na",   update_form="inf_tau", initial_value=0.060,
+                         inf=Boltzmann(-40.0,  8.0),
+                         tau=Tau.boltzmann(0.2, 3.0, -53.0, -0.7))
+    h  = model.add_gate("h_Na",   update_form="inf_tau", initial_value=0.929,
+                         inf=Boltzmann(-45.5, -6.4),
+                         tau=Tau.double_exp_sum(0.0, 24.5, 50.0, 15.0, 50.0, 16.0))
+    n  = model.add_gate("n_K",    update_form="inf_tau", initial_value=0.182,
+                         inf=Boltzmann(-41.0, 14.0),
+                         tau=Tau.double_exp_sum(0.0, 11.0, 40.0, 40.0, 40.0, 50.0))
+    a  = model.add_gate("a_A",    update_form="inf_tau", initial_value=0.239,
+                         inf=Boltzmann(-45.0, 14.7),
+                         tau=Tau.boltzmann(1.0, 1.0, -40.0, -0.5))
+    b  = model.add_gate("b_A",    update_form="inf_tau", initial_value=0.023,
+                         inf=Boltzmann(-90.0, -7.5),
+                         tau=Tau.double_exp_sum(0.0, 200.0, 60.0, 30.0, 40.0, 10.0))
+    c  = model.add_gate("c_CaL",  update_form="inf_tau", initial_value=0.002,
+                         inf=Boltzmann(-30.6,  5.0),
+                         tau=Tau.double_exp_sum(45.0, 10.0, 27.0, 20.0, 50.0, 15.0))
+    d1 = model.add_gate("d1_CaL", update_form="inf_tau", initial_value=0.566,
+                         inf=Boltzmann(-60.0, -7.5),
+                         tau=Tau.double_exp_sum(400.0, 500.0, 40.0, 15.0, 20.0, 20.0))
+    d2 = model.add_gate("d2_CaL", update_form="inf_tau", initial_value=1.0,
+                         inf=Boltzmann(0.1, -0.02),
+                         tau=Tau.constant(130.0))
+    p  = model.add_gate("p_T",    update_form="inf_tau", initial_value=0.290,
+                         inf=Boltzmann(-56.0,  6.7),
+                         tau=Tau.double_exp_sum(5.0, 0.33, 27.0, 10.0, 102.0, 15.0))
+    q  = model.add_gate("q_T",    update_form="inf_tau", initial_value=0.019,
+                         inf=Boltzmann(-85.0, -5.8),
+                         tau=Tau.double_exp_sum(0.0, 400.0, 50.0, 15.0, 50.0, 16.0))
+    r  = model.add_gate("r_AHP",  update_form="inf_tau", initial_value=0.0,
+                         inf=Boltzmann(0.17, 0.08),
+                         tau=Tau.constant(2.0))
+
+    model.add_channel("Na",    g=49.0,  E_rev= 60.0, gates=[(m, 3), (h, 1)])
+    model.add_channel("K",     g=57.0,  E_rev=-90.0, gates=[(n, 4)])
+    model.add_channel("A",     g= 5.0,  E_rev=-90.0, gates=[(a, 2), (b, 1)])
+    cal = model.add_channel("CaL",   g= 0.5,  E_rev=0.0,
+                             use_calcium_nernst=True, gates=[(c, 2), (d1, 1), (d2, 1)])
+    t   = model.add_channel("T",     g= 5.0,  E_rev=0.0,
+                             use_calcium_nernst=True, gates=[(p, 2), (q, 1)])
+    model.add_channel("AHP_K", g= 1.0,  E_rev=-90.0, gates=[(r, 2)])
+    model.add_channel("Leak",  g=0.35,  E_rev=-60.0)
+
+    model.set_calcium(epsilon=5.182e-6, K_Ca=386.0, Ca_init=0.005,
+                      use_nernst=True, Ca_o=2000.0, source_channels=[cal, t])
+    return model.to_spec()
+
+
+# ---------------------------------------------------------------------------
+# GPe/GPi composable model (Rubin & Terman 2004)
+# Channels: Na(m³h), K(n⁴), T(a³r), CaL(s²), AHP(Ca-dep K), Leak
+# Ca dynamics: dCa/dt = 1e-4*(-I_T - I_CaL - 15*Ca)
+# ---------------------------------------------------------------------------
+
+def _make_gpe_spec() -> NeuronModelSpec:
+    model = NeuronModel("GPe", C_m=1.0, V_init=-62.0)
+
+    m = model.add_gate("m_Na",  update_form="instant", initial_value=0.076,
+                        inf=Boltzmann(-37.0, 10.0))
+    h = model.add_gate("h_Na",  update_form="inf_tau", scale=0.05, initial_value=0.583,
+                        inf=Boltzmann(-58.0, -12.0),
+                        tau=Tau.boltzmann(0.05, 0.27, -40.0, -12.0))
+    n = model.add_gate("n_K",   update_form="inf_tau", scale=0.1,  initial_value=0.298,
+                        inf=Boltzmann(-50.0,  14.0),
+                        tau=Tau.boltzmann(0.05, 0.27, -40.0, -12.0))
+    a = model.add_gate("a_T",   update_form="instant", initial_value=0.0,
+                        inf=Boltzmann(-57.0,   2.0))
+    r = model.add_gate("r_T",   update_form="inf_tau", initial_value=0.018,
+                        inf=Boltzmann(-70.0,  -2.0),
+                        tau=Tau.constant(30.0))
+    s = model.add_gate("s_CaL", update_form="instant", initial_value=0.0,
+                        inf=Boltzmann(-35.0,   2.0))
+
+    model.add_channel("Na",   g=120.0, E_rev= 55.0, gates=[(m, 3), (h, 1)])
+    model.add_channel("K",    g= 30.0, E_rev=-80.0, gates=[(n, 4)])
+    t_ch = model.add_channel("T",   g=  0.5, E_rev=120.0, gates=[(a, 3), (r, 1)])
+    cal  = model.add_channel("CaL", g= 0.15, E_rev=120.0, gates=[(s, 2)])
+    model.add_channel("AHP",  g= 10.0, E_rev=-80.0, is_ahp=True, ahp_k1=10.0)
+    model.add_channel("Leak", g=  0.1, E_rev=-65.0)
+
+    model.set_calcium(epsilon=1e-4, K_Ca=15.0, Ca_init=0.1,
+                      source_channels=[t_ch, cal])
+    return model.to_spec()
+
+
+def _make_gpi_spec() -> NeuronModelSpec:
+    """GPi: identical neuron parameters to GPe."""
+    spec = _make_gpe_spec()
+    spec.name = "GPi"
+    return spec
+
+
+# ---------------------------------------------------------------------------
 # Kinetic GABA-A synapse (Ggaba(V) = 2*(1+tanh(V/4)))
 # Used for intra-striatal inhibition (Str→Str)
 # dS/dt = Ggaba(V)*(1-S) - S/tau_i  (exact-exponential integration in C++)
@@ -170,9 +273,9 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
 
     # ---- Populations -------------------------------------------------------
     net.add_population("TH",     n, model=_make_th_spec())
-    net.add_population("STN",    n, model=NeuronModelSpec.stn())
-    net.add_population("GPe",    n, model=NeuronModelSpec.gpe())
-    net.add_population("GPi",    n, model=NeuronModelSpec.gpi())
+    net.add_population("STN",    n, model=_make_stn_spec())
+    net.add_population("GPe",    n, model=_make_gpe_spec())
+    net.add_population("GPi",    n, model=_make_gpi_spec())
     net.add_population("Str_D2", n, model=_make_striatum_spec(pd=pd, V_init=-63.8))
     net.add_population("Str_D1", n, model=_make_striatum_spec(pd=pd, V_init=-63.8))
 
@@ -225,6 +328,9 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
     # Benchmark: gsngea[k]*(S2a[k]+S21a[k]) where S21a[k]=S2a[k-1]
     #   gsngea = zeros(n), 2 GPe RECEIVERS nonzero (0 to 0.3 each)
     #   GPe[k] ← STN[k] and STN[k-1] with weight gsngea[k]*gpeak
+    # NOTE: connect() cannot express this pattern — each active receiver gets two
+    # inputs (STN[k] and STN[k-1]) sharing the same per-receiver random weight.
+    # Needs a receiver-indexed weight array or a built-in "shifted_pair" pattern.
     gsngea = np.zeros(n)
     gsngea[rng.permutation(n)[:2]] = 0.3 * rng.random(2)
     gsngen = np.zeros(n)
@@ -245,6 +351,9 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
     # Benchmark: gsngi[k]*(S2b[k]+S21b[k]) where S21b[k]=S2b[k-1]
     #   gsngi = zeros(n), 5 GPi RECEIVERS = 0.15 each
     #   GPi[k] ← STN[k] and STN[k-1] with weight gsngi[k]*gpeak = 0.15*0.43 = 0.0645
+    # NOTE: connect() cannot express this pattern — a random subset of receivers is
+    # active (not a simple sparse probability), and each active receiver gets two
+    # inputs sharing a fixed weight. Needs receiver-mask or "shifted_pair" support.
     gsngi = np.zeros(n)
     gsngi[rng.permutation(n)[:5]] = 0.15
     for k in range(n):
@@ -268,6 +377,11 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
     # Benchmark: Igege = ggege_scale * ggege[k] * (S31c[k]+S32c[k])
     #   S31c[k]=S3c[k+1] → GPe[k]←GPe[k+1]; S32c[k]=S3c[k-2] → GPe[k]←GPe[k-2]
     #   Weight is per RECEIVER: ggege_scale * ggege[k] * gpeak1
+    # NOTE: connect() cannot express this pattern — the same per-receiver random weight
+    # applies to both incoming shifted connections (shift=+1 and shift=-2). Using
+    # WeightDistribution.uniform would draw independent weights per connection.
+    # Needs a per-neuron weight array argument (e.g. connect_from_matrix, or a
+    # weight_fn callback) to share one weight across multiple source→receiver pairs.
     ggege_scale   = 0.25 * (pd * 3 + 1)
     ggege_weights = rng.random(n)   # ggege[k] per receiver
     for k in range(n):
@@ -297,15 +411,14 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
                 weight=0.07 * gpeak,
                 synapse=SynapseSpec.alpha(0.0, tau), delay=5.1)
 
-    # ---- CTX_e → Str_D1  (excitatory alpha, one-to-one, per-neuron weight) -
-    # Benchmark: Icorstr6 = gcordrstr[k]*(V6-Esyn[1])*S6a, gcordrstr peaks at gpeak
-    
-    gcordrstr = (0.07 - 0.044 * pd) + 0.001 * rng.random(n)
-    
-    for i in range(n):
-        net.add_connection("CTX_e", i, "Str_D1", i,
-                           float(gcordrstr[i]) * gpeak,
-                           SynapseSpec.alpha(0.0, tau), delay=5.1)
+    # ---- CTX_e → Str_D1  (excitatory alpha, one-to-one, uniform weight) ----
+    # Benchmark: Icorstr6 = gcordrstr[k]*(V6-Esyn[1])*S6a
+    #   gcordrstr[k] = (0.07 - 0.044*pd) + 0.001*rand() → uniform per neuron
+    w_d1_base = (0.07 - 0.044 * pd) * gpeak
+    net.connect("CTX_e", "Str_D1", "one_to_one",
+                weight=(w_d1_base, w_d1_base + 0.001 * gpeak),
+                synapse=SynapseSpec.alpha(0.0, tau), delay=5.1,
+                seed=int(rng.integers(1, 2**31)))
     
 
     # ---- CTX_e → STN  (receiver-indexed AMPA + NMDA, delay=5.9ms) --------
@@ -331,36 +444,31 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
     # Benchmark: gie=0.2, S1b via 2nd-order ODE (no explicit delay, starts at spike).
     # weight = gie * gpeak = 0.2 * gpeak; delay=0.01 matches benchmark's ~0 effective delay.
     for _ in range(4):
-        perm = rng.permutation(n)
-        for i in range(n):
-            net.add_connection("CTX_i", i, "CTX_e", int(perm[i]),
-                               0.2 * gpeak, SynapseSpec.alpha(-85.0, tau), delay=0.01)
+        net.connect("CTX_i", "CTX_e", "random_permutation",
+                    weight=0.2 * gpeak, synapse=SynapseSpec.alpha(-85.0, tau),
+                    delay=0.01, seed=int(rng.integers(1, 2**31)))
 
     # ---- CTX_e → CTX_i  (4 random permutations) ---------------------------
     # Benchmark: gei=0.1, S1a via 2nd-order ODE (no explicit delay, starts at spike).
     # weight = gei * gpeak = 0.1 * gpeak; delay=0.01 matches benchmark's ~0 effective delay.
     for _ in range(4):
-        perm = rng.permutation(n)
-        for i in range(n):
-            net.add_connection("CTX_e", i, "CTX_i", int(perm[i]),
-                               0.1 * gpeak, SynapseSpec.alpha(0.0, tau), delay=0.01)
+        net.connect("CTX_e", "CTX_i", "random_permutation",
+                    weight=0.1 * gpeak, synapse=SynapseSpec.alpha(0.0, tau),
+                    delay=0.01, seed=int(rng.integers(1, 2**31)))
 
     # ---- Intra-striatal GABA-A  (kinetic, Ggaba(V) gate) ------------------
     gaba_kin = _gaba_kinetic(tau_i=13.0, E_syn=-80.0)
     ggaba = 0.1
     # Str_D2 → Str_D2 (4 random permutations, GABA-A)
     for _ in range(4):
-        perm = rng.permutation(n)
-        for i in range(n):
-            net.add_kinetic_connection("Str_D2", i, "Str_D2", int(perm[i]),
-                                       ggaba / 4, gaba_kin)
+        net.connect("Str_D2", "Str_D2", "random_permutation",
+                    weight=ggaba / 4, kinetic_spec=gaba_kin,
+                    allow_self=True, seed=int(rng.integers(1, 2**31)))
     # Str_D1 → Str_D1 (3 random permutations, GABA-A)
-
     for _ in range(3):
-        perm = rng.permutation(n)
-        for i in range(n):
-            net.add_kinetic_connection("Str_D1", i, "Str_D1", int(perm[i]),
-                                       ggaba / 3, gaba_kin)
+        net.connect("Str_D1", "Str_D1", "random_permutation",
+                    weight=ggaba / 3, kinetic_spec=gaba_kin,
+                    allow_self=True, seed=int(rng.integers(1, 2**31)))
 
 
     return net
@@ -426,14 +534,9 @@ def simulate_ctxbgth(
     # Cortical stimulus pulse at t=1000ms (if corstim=1)
     # Benchmark: CTX has zero constant Iapp; corstim adds a 350 µA/cm² pulse
     if corstim:
-        I_cortex_e = np.zeros(n_steps)
-        I_cortex_i = np.zeros(n_steps)
-        s0 = int(1000.0 / dt)
-        s1 = int((1000.0 + 0.3) / dt)
-        I_cortex_e[s0:s1] = 350.0
-        I_cortex_i[s0:s1] = 350.0
-        I_ext["CTX_e"] = I_cortex_e
-        I_ext["CTX_i"] = I_cortex_i
+        ctx_pulse = PulseStimulator.single(onset=1000.0, duration=0.3, amplitude=350.0)
+        I_ext["CTX_e"] = ctx_pulse.generate(tmax, dt)
+        I_ext["CTX_i"] = ctx_pulse.generate(tmax, dt)
 
     # DBS on STN via built-in stimulator
     if dbs_freq > 0:
@@ -453,19 +556,10 @@ def simulate_ctxbgth(
     elapsed = timer() - start
 
     # ---- Spectral analysis of GPi (multitaper, matches benchmark) ----------
-    dt_s      = dt * 1e-3          # ms → s
-    duration_s = tmax * 1e-3       # ms → s
-    GPi_spike_times = [sp / 1000.0 for sp in result["GPi"]["spikes"]]  # ms → s
-    gpi_S, gpi_f = mtspectrumpt(
-        GPi_spike_times,
-        duration=duration_s,
-        Fs=1.0 / dt_s,
-        fpass=(1, 100),
-        tapers=(3, 5),
-    )
-    
-    beta_mask = (gpi_f > 7) & (gpi_f < 35)
-    gpi_alpha_beta_area = float(np.trapezoid(gpi_S[beta_mask], gpi_f[beta_mask]))
+    gpi_beta = analyze_beta_power(result["GPi"], duration_ms=tmax)
+    gpi_alpha_beta_area = gpi_beta["power"]
+    gpi_S               = gpi_beta["spectrum"]
+    gpi_f               = gpi_beta["frequencies"]
 
     pops_ordered = ("TH", "STN", "GPe", "GPi", "Str_D2", "Str_D1", "CTX_e", "CTX_i")
     spike_times = {pop: result[pop]["spikes"] for pop in pops_ordered}
@@ -483,7 +577,7 @@ if __name__ == "__main__":
     window_s = 0.25  # time window for rate-over-time reporting (seconds)
 
     print(f"Building CTX-BG-TH network (healthy, no DBS, n=10, {time}s) ...")
-    area, S, f, spikes, syn_events, t_sim, sim_result = simulate_ctxbgth(n=10, pd=0, tmax=time*1000, dt=0.01, corstim=0, seed=6536)
+    area, S, f, spikes, syn_events, t_sim, sim_result = simulate_ctxbgth(n=10, pd=0, tmax=time*1000, dt=0.01, corstim=0, seed=6536, amplitude=1.0)
     print(f"  Simulation time : {t_sim:.2f} s")
     print(f"  GPi β-band power: {area:.4f}")
 

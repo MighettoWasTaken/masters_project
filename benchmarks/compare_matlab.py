@@ -16,7 +16,6 @@ import sys
 import os
 import argparse
 import numpy as np
-from timeit import default_timer as timer
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -92,11 +91,9 @@ def load_mat(path):
 def run_library(tmax, n, pd, seed):
     from ctxbgth_model import simulate_ctxbgth
 
-    t0 = timer()
-    beta_power, gpi_S, gpi_f, spike_times, _, _, _ = simulate_ctxbgth(
+    beta_power, gpi_S, gpi_f, spike_times, _, elapsed, _ = simulate_ctxbgth(
         n=n, pd=pd, tmax=tmax, dt=0.01, seed=seed
     )
-    elapsed = timer() - t0
 
     duration_s = tmax / 1000.0
     rates = {

@@ -283,7 +283,7 @@ private:
     // Use fast polynomial exp approximation (~8 digits) vs Eigen's built-in
     bool fast_math_ = true;
 
-    // Spike threshold used by update_synapses* for pre-synaptic spike detection.
+    // Spike threshold for pre-synaptic spike detection.
     // Set by simulate_into_buffers() before the hot loop; default 0.0 (classic HH peak).
     double spike_threshold_ = 0.0;
 
@@ -291,10 +291,11 @@ private:
     mutable bool soa_dirty_ = false;
     bool soa_sorted_ = false;
 
+    bool groups_built_ = false;
+
     void cache_voltages();
     void ensure_buffers();
     void compute_synaptic_currents();
-    void update_synapses(double dt);
     void update_synapses_grouped(double dt);
     void update_decay_factors(double dt);
     void build_synapse_groups();

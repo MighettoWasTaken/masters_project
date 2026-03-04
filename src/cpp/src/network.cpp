@@ -188,6 +188,7 @@ void Network::add_synapse(size_t pre_idx, size_t post_idx, double weight,
     // Invalidate caches
     sa_.cached_dt = -1.0;
     soa_sorted_ = false;
+    groups_built_ = false;
 }
 
 void Network::add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
@@ -218,6 +219,7 @@ void Network::add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
 
     sa_.cached_dt = -1.0;
     soa_sorted_ = false;
+    groups_built_ = false;
 }
 
 void Network::add_double_exp_synapse(size_t pre_idx, size_t post_idx, double weight,
@@ -258,6 +260,7 @@ void Network::add_double_exp_synapse(size_t pre_idx, size_t post_idx, double wei
 
     sa_.cached_dt = -1.0;
     soa_sorted_ = false;
+    groups_built_ = false;
 }
 
 // =============================================================================
@@ -339,6 +342,7 @@ size_t Network::add_kinetic_synapse(size_t pre, size_t post, double weight,
 
     sa_.cached_dt = -1.0;
     soa_sorted_ = false;
+    groups_built_ = false;
 
     return sa_.size() - 1;
 }
@@ -417,19 +421,10 @@ void Network::reset() {
     }
     sa_.cached_dt = -1.0;
 
-    // Reset kinetic gating variables
+    // Reset kinetic gating variables (g already zeroed by fill above)
     for (size_t i = 0; i < S; ++i) {
         if (sa_.type[i] == SynType::SYN_KINETIC) {
             sa_.kin_S[i] = kinetic_specs_[sa_.kin_spec_idx[i]].S_init;
-            sa_.g[i] = 0.0;
-        }
-    }
-
-    // Reset API objects (skip nullptr kinetic slots)
-    for (auto& syn : synapses_) {
-        if (syn) {
-            syn->reset();
-            syn->reset_delay_buffer();
         }
     }
 
@@ -480,78 +475,6 @@ void Network::compute_synaptic_currents() {
 }
 
 // =============================================================================
-// Synapse state update (SoA — spike detection + type-specific kinetics)
-// =============================================================================
-
-void Network::update_synapses(double dt) {
-    update_decay_factors(dt);
-
-    const size_t S = sa_.size();
-    const double spike_threshold = spike_threshold_;
-    static constexpr double E_CONST = 2.718281828459045;
-
-    for (size_t i = 0; i < S; ++i) {
-        // Spike detection using cached voltages
-        double V_pre = V_cache_[sa_.pre[i]];
-        bool spiked = (V_pre > spike_threshold) && (sa_.V_pre_prev[i] <= spike_threshold);
-        sa_.V_pre_prev[i] = V_pre;
-
-        // Delay processing
-        if (sa_.delay[i] > 0.0) {
-            if (!sa_.delay_init[i]) {
-                size_t steps = static_cast<size_t>(std::round(sa_.delay[i] / dt));
-                if (steps > 0) {
-                    sa_.spike_buf[i].assign(steps, false);
-                    sa_.buf_head[i] = 0;
-                    sa_.delay_init[i] = true;
-                }
-            }
-            if (sa_.delay_init[i]) {
-                bool delayed = sa_.spike_buf[i][sa_.buf_head[i]];
-                sa_.spike_buf[i][sa_.buf_head[i]] = spiked;
-                sa_.buf_head[i] = (sa_.buf_head[i] + 1) % sa_.spike_buf[i].size();
-                spiked = delayed;
-            }
-        }
-
-        // Type-specific conductance update
-        switch (sa_.type[i]) {
-            case SynType::SYN_EXP:
-                if (spiked) sa_.g[i] += sa_.weight[i];
-                sa_.g[i] *= sa_.exp_decay[i];
-                break;
-
-            case SynType::SYN_ALPHA: {
-                if (spiked) sa_.alpha_x[i] += sa_.weight[i] * E_CONST;
-                double inv_tau = sa_.alpha_inv_tau[i];
-                double dx = -sa_.alpha_x[i] * inv_tau;
-                double dg = (sa_.alpha_x[i] - sa_.g[i]) * inv_tau;
-                sa_.alpha_x[i] += dt * dx;
-                sa_.g[i] += dt * dg;
-                if (sa_.g[i] < 0.0) sa_.g[i] = 0.0;
-                break;
-            }
-
-            case SynType::SYN_DEXP:
-                if (spiked) {
-                    sa_.dexp_g_rise[i] += 1.0;
-                    sa_.dexp_g_decay[i] += 1.0;
-                }
-                sa_.dexp_g_rise[i] *= sa_.dexp_rise_decay[i];
-                sa_.dexp_g_decay[i] *= sa_.dexp_fall_decay[i];
-                sa_.g[i] = sa_.weight[i] * sa_.dexp_norm[i]
-                         * (sa_.dexp_g_decay[i] - sa_.dexp_g_rise[i]);
-                if (sa_.g[i] < 0.0) sa_.g[i] = 0.0;
-                break;
-
-            case SynType::SYN_KINETIC:
-                // Kinetic synapses are updated in update_synapses_grouped() phase 3
-                break;
-        }
-    }
-}
-
-// =============================================================================
 // Step
 // =============================================================================
 
@@ -561,6 +484,8 @@ void Network::step(double dt, const std::vector<double>& I_ext) {
     }
 
     ensure_buffers();
+    sort_synapses_by_pre();
+    if (!groups_built_) build_synapse_groups();
 
     // Cache voltages for synaptic current computation
     cache_voltages();
@@ -573,7 +498,7 @@ void Network::step(double dt, const std::vector<double>& I_ext) {
 
     // Re-cache voltages for spike detection
     cache_voltages();
-    update_synapses(dt);
+    update_synapses_grouped(dt);
 
     soa_dirty_ = true;
 }
@@ -669,6 +594,7 @@ void Network::build_synapse_groups() {
     }
 
     spike_detected_.resize(S);
+    groups_built_ = true;
 }
 
 // =============================================================================

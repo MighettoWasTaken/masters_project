@@ -211,6 +211,9 @@ def plot_firing_rates(mat_con, lib_con, mat_pd, lib_pd, out_path: str,
         _draw_box(ax, p_mp, mp, C_MAT_PD)
         _draw_box(ax, p_lp, lp, C_LIB_PD)
 
+        all_vals = np.concatenate([mc, lc, mp, lp])
+        ymax = max(all_vals.max() * 1.12, 5.0) if len(all_vals) > 0 else 5.0
+        ax.set_ylim(bottom=0, top=ymax)
         ax.set_xlim(0.55, 3.75)
         _style_ax(ax, pop, "Firing rate (Hz)", group_centers, group_labels, sep_x)
 
