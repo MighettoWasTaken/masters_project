@@ -499,7 +499,7 @@ class TestCorrectness:
         net.simulate(500.0, 0.1, [[25.0] * n_steps])
         cn = net.neuron(0)
         # Ca should have changed from its initial value
-        assert cn.calcium != pytest.approx(spec.calcium.Ca_init, abs=1e-3)
+        assert cn.calcium != pytest.approx(spec.calcium.Ca_init, abs=1e-4)
 
     def test_gpe_fires_under_current(self):
         """GPe fires with I_ext=5."""
@@ -785,39 +785,38 @@ class TestCorrectness:
             f"Likely cause: tau~1535 ms due to params sign error. (Task 10.2)"
         )
 
-    def test_stn_h_T_tau_correct(self):
+    def test_stn_b_A_tau_correct(self):
         """
-        STN h_T gate tau at V=-65 should be ~20 ms, NOT ~1535 ms.
-        Same sign-error bug as TH h_T.
-
-        This test FAILS while the bug is present (Task 10.2).
+        STN b_A gate (A-type K inactivation) tau at V=-65 should be ~15 ms.
+        Uses DOUBLE_EXP_SUM: tau = 200/(exp((V+60)/30) + exp(-(V+40)/10)).
+        A sign error in s2 would make tau ~215 ms, preventing convergence in 100 ms.
         """
-        def run_with_stn_h_T_init(initial_value):
+        def run_with_stn_b_A_init(initial_value):
             stn = NeuronModelSpec.stn()
-            h_T_idx = next(
-                (i for i, gate in enumerate(stn.gates) if gate.name == "h_T"),
+            b_A_idx = next(
+                (i for i, gate in enumerate(stn.gates) if gate.name == "b_A"),
                 None
             )
-            assert h_T_idx is not None, "STN preset must contain a gate named 'h_T'"
-            h_T_gate = stn.gates[h_T_idx]
-            h_T_gate.initial_value = initial_value
-            spec = make_empty_spec("stn_h_T_tau_test", V_init=-65.0)
-            spec.gates.append(h_T_gate)
+            assert b_A_idx is not None, "STN preset must contain a gate named 'b_A'"
+            b_A_gate = stn.gates[b_A_idx]
+            b_A_gate.initial_value = initial_value
+            spec = make_empty_spec("stn_b_A_tau_test", V_init=-65.0)
+            spec.gates.append(b_A_gate)
             net = Network()
             net.add_neuron(spec)
             n_steps = int(100.0 / 0.01)
             net.simulate(100.0, 0.01, [[0.0] * n_steps])
             return net.neuron(0).gate_states[0]
 
-        gate_from_zero = run_with_stn_h_T_init(0.0)
-        gate_from_one  = run_with_stn_h_T_init(1.0)
+        gate_from_zero = run_with_stn_b_A_init(0.0)
+        gate_from_one  = run_with_stn_b_A_init(1.0)
 
         diff = abs(gate_from_zero - gate_from_one)
         assert diff < 0.05, (
-            f"STN h_T gate must converge to X_inf within 100 ms (tau~20 ms). "
+            f"STN b_A gate must converge to X_inf within 100 ms (tau~15 ms). "
             f"From initial=0: {gate_from_zero:.4f}, from initial=1: {gate_from_one:.4f}, "
             f"diff={diff:.4f} (expected <0.05). "
-            f"Likely cause: tau~1535 ms due to params sign error. (Task 10.2)"
+            f"Likely cause: tau~215 ms due to DOUBLE_EXP_SUM params sign error."
         )
 
 

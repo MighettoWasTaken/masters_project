@@ -10,6 +10,8 @@ from __future__ import annotations
 import numpy as np
 from typing import Any
 
+from ._core import Network as _Network
+
 
 # =============================================================================
 # RecordingConfig
@@ -26,7 +28,7 @@ class RecordingConfig:
                  metrics=("V",),
                  neurons="all",
                  interval: int = 1,
-                 spike_threshold: float = -20.0):
+                 spike_threshold: float = 0.0):
         self.metrics = list(metrics)
         self.neurons = neurons
         self.interval = interval
@@ -41,18 +43,18 @@ class RecordingConfig:
         return cls(["V"], neurons, interval)
 
     @classmethod
-    def spikes_only(cls, threshold=-20.0, neurons="all"):
+    def spikes_only(cls, threshold=0.0, neurons="all"):
         # interval=1 is critical: subsampled V can miss narrow spikes
         return cls(["spikes", "spike_count", "firing_rate"], neurons,
                    interval=1, spike_threshold=threshold)
 
     @classmethod
-    def spike_stats(cls, threshold=-20.0, neurons="all"):
+    def spike_stats(cls, threshold=0.0, neurons="all"):
         return cls(["spikes", "spike_count", "firing_rate", "ISI_mean", "ISI_cv"],
                    neurons, interval=1, spike_threshold=threshold)
 
     @classmethod
-    def summary_metrics(cls, threshold=-20.0, neurons="all"):
+    def summary_metrics(cls, threshold=0.0, neurons="all"):
         """No full traces → minimal memory."""
         return cls(["spike_count", "firing_rate", "mean_V"], neurons,
                    interval=1, spike_threshold=threshold)
@@ -69,7 +71,7 @@ class RecordingConfig:
 
     @classmethod
     def for_population(cls, pop_name, metrics=("V", "spikes"),
-                       interval=1, threshold=-20.0):
+                       interval=1, threshold=0.0):
         return cls(list(metrics), neurons={pop_name: "all"},
                    interval=interval, spike_threshold=threshold)
 
@@ -295,21 +297,34 @@ def _extract_gate_names(network_core, selected: list) -> list | None:
 # Core recording function
 # =============================================================================
 
-def _run_recording(network_core, duration: float, dt: float,
+def _run_recording(network_core: _Network, duration: float, dt: float,
                    I_ext_list: list, config: RecordingConfig,
-                   pop_info: dict | None = None) -> MetricsResult:
+                   pop_info: dict | None = None,
+                   detection_threshold: float | None = None) -> MetricsResult:
     """
     Allocate output buffers, call _simulate_into_buffers(), build MetricsResult.
 
     Parameters
     ----------
-    network_core : C++ _Network object (net._network or rnet.network())
+    network_core : _Network
+        The C++ Network object.  Always pass ``net._network`` (from Network)
+        or ``rnet.network()`` (from RegionalNetwork) — never a RegionalNetwork
+        directly.
     duration     : simulation duration in ms
     dt           : time step in ms
     I_ext_list   : list[list[float]], shape (n_neurons, n_steps)
     config       : RecordingConfig
     pop_info     : {pop_name: (start, count)} for RegionalNetwork slicing
+    detection_threshold : float, optional
+        Voltage threshold (mV) used internally by the C++ hot loop to detect
+        pre-synaptic spikes for synapse updates.  Defaults to
+        ``config.spike_threshold`` when None.  Set this independently of
+        ``config.spike_threshold`` when the simulation detection threshold
+        differs from the post-hoc reporting threshold (e.g. -10 mV detection,
+        -20 mV reporting).
     """
+    det_thresh = detection_threshold if detection_threshold is not None \
+                 else config.spike_threshold
     n_neurons  = network_core.num_neurons
     n_synapses = network_core.num_synapses
     n_steps    = int(duration / dt)
@@ -341,7 +356,7 @@ def _run_recording(network_core, duration: float, dt: float,
     network_core._simulate_into_buffers(
         duration, dt, I_ext_list,
         V_buf, gate_buf, calcium_buf, g_syn_buf, I_syn_buf, spike_event_buf,
-        interval, config.spike_threshold)
+        interval, det_thresh)
 
     # Neuron selection
     selected = _resolve_neuron_indices(config.neurons, n_neurons, pop_info)

@@ -126,11 +126,6 @@ public:
     Network& network();
     const Network& network() const;
 
-    // Simulate (flat I_ext — Python wrapper handles dict conversion)
-    std::vector<std::vector<double>> simulate(
-        double duration, double dt,
-        const std::vector<std::vector<double>>& I_ext);
-
 private:
     Network net_;
     std::vector<Population> populations_;

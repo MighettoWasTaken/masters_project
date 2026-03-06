@@ -390,15 +390,4 @@ void RegionalNetwork::randomize_membrane_potentials(const std::string& name,
     }
 }
 
-// =============================================================================
-// Simulate
-// =============================================================================
-
-std::vector<std::vector<double>> RegionalNetwork::simulate(
-    double duration, double dt,
-    const std::vector<std::vector<double>>& I_ext)
-{
-    return net_.simulate(duration, dt, I_ext);
-}
-
 } // namespace hodgkin_huxley

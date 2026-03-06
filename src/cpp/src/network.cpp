@@ -718,131 +718,29 @@ std::vector<std::vector<double>> Network::simulate(
     double dt,
     const std::vector<std::vector<double>>& I_ext
 ) {
-    size_t num_steps = static_cast<size_t>(duration / dt);
-    size_t n_neurons = neurons_.size();
+    const size_t num_steps = static_cast<size_t>(duration / dt);
+    const size_t n_neurons = neurons_.size();
 
-    // Validate input
-    if (I_ext.size() != n_neurons) {
-        throw std::invalid_argument("I_ext outer size must match number of neurons");
-    }
-    for (const auto& curr : I_ext) {
-        if (curr.size() < num_steps) {
-            throw std::invalid_argument("I_ext vectors too short for simulation duration");
-        }
-    }
+    // Flat V buffer: layout V_flat[neuron * num_steps + step]
+    std::vector<double> V_flat(n_neurons * num_steps, 0.0);
 
-    // Pre-allocate output
+    simulate_into_buffers(
+        duration, dt, I_ext,
+        V_flat.data(),  // V_buf
+        nullptr, 0,     // gate_buf, max_gates
+        nullptr,        // calcium_buf
+        nullptr,        // g_syn_buf
+        nullptr,        // I_syn_buf
+        nullptr,        // spike_event_buf
+        1,              // interval (record every step)
+        num_steps,      // n_rec
+        0.0             // spike_threshold
+    );
+
     std::vector<std::vector<double>> traces(n_neurons);
-    for (auto& trace : traces) {
-        trace.resize(num_steps);
-    }
-
-    // Sort synapses by pre-index for cache-friendly access
-    sort_synapses_by_pre();
-    build_synapse_groups();
-
-    // =========================================================================
-    // Build batched neuron pools — classify via dynamic_cast once
-    // =========================================================================
-    size_t n_hh = 0, n_iz = 0;
-    std::map<std::string, size_t> composable_counts;
-    for (size_t i = 0; i < n_neurons; ++i) {
-        if (dynamic_cast<HHNeuron*>(neurons_[i].get())) ++n_hh;
-        else if (dynamic_cast<IzhikevichNeuron*>(neurons_[i].get())) ++n_iz;
-        else if (auto* cn = dynamic_cast<ComposableNeuron*>(neurons_[i].get())) {
-            composable_counts[cn->model_spec().name]++;
-        }
-    }
-
-    HHPool hh_pool(n_hh, fast_math_);
-    IzPool iz_pool(n_iz);
-
-    // Create one ComposablePool per distinct model name
-    std::map<std::string, ComposablePool> comp_pools;
-    for (const auto& kv : composable_counts) {
-        // Find first neuron with this model to get the spec
-        for (size_t i = 0; i < n_neurons; ++i) {
-            auto* cn = dynamic_cast<ComposableNeuron*>(neurons_[i].get());
-            if (cn && cn->model_spec().name == kv.first) {
-                comp_pools.emplace(kv.first,
-                    ComposablePool(cn->model_spec(), kv.second, fast_math_));
-                break;
-            }
-        }
-    }
-
-    for (size_t i = 0; i < n_neurons; ++i) {
-        if (auto* hh = dynamic_cast<HHNeuron*>(neurons_[i].get())) {
-            hh_pool.add(i, hh->parameters(), hh->state());
-        } else if (auto* iz = dynamic_cast<IzhikevichNeuron*>(neurons_[i].get())) {
-            iz_pool.add(i, iz->parameters(), iz->state());
-        } else if (auto* cn = dynamic_cast<ComposableNeuron*>(neurons_[i].get())) {
-            auto it = comp_pools.find(cn->model_spec().name);
-            if (it != comp_pools.end()) {
-                it->second.add(i, cn->membrane_potential(),
-                               cn->gate_states(), cn->calcium());
-            }
-        }
-    }
-
-    // Pre-allocate working buffers
-    ensure_buffers();
-
-    // =========================================================================
-    // Hot loop — pools do batched SIMD math, no virtual dispatch
-    // =========================================================================
-    for (size_t t = 0; t < num_steps; ++t) {
-        // Read voltages from pools into V_cache_
-        hh_pool.scatter_voltages(V_cache_.data());
-        iz_pool.scatter_voltages(V_cache_.data());
-        for (auto& kv : comp_pools) kv.second.scatter_voltages(V_cache_.data());
-
-        // Record traces + gather external currents into I_syn_buffer_
-        // (reuse I_syn_buffer_ as combined I buffer — compute_synaptic_currents
-        //  will ADD into it after we seed it with I_ext)
-        for (size_t i = 0; i < n_neurons; ++i) {
-            traces[i][t] = V_cache_[i];
-            I_syn_buffer_[i] = I_ext[i][t];
-        }
-
-        // Compute synaptic currents — ADDS g*(E-V) into I_syn_buffer_
-        const size_t S = sa_.size();
-        const double* g = sa_.g.data();
-        const double* E_syn = sa_.E_syn.data();
-        const size_t* post = sa_.post.data();
-        const double* V = V_cache_.data();
-        double* I_buf = I_syn_buffer_.data();
-        for (size_t i = 0; i < S; ++i) {
-            I_buf[post[i]] += g[i] * (E_syn[i] - V[post[i]]);
-        }
-
-        // Feed combined currents to pools
-        hh_pool.gather_currents(I_syn_buffer_.data());
-        iz_pool.gather_currents(I_syn_buffer_.data());
-        for (auto& kv : comp_pools) kv.second.gather_currents(I_syn_buffer_.data());
-
-        // Step pools (batched SIMD — the main performance win)
-        hh_pool.step_rk4(dt);
-        iz_pool.step_euler(dt);
-        for (auto& kv : comp_pools) kv.second.step(dt);
-
-        // Re-read voltages for spike detection
-        hh_pool.scatter_voltages(V_cache_.data());
-        iz_pool.scatter_voltages(V_cache_.data());
-        for (auto& kv : comp_pools) kv.second.scatter_voltages(V_cache_.data());
-
-        // Type-separated synapse update (no switch in inner loops)
-        update_synapses_grouped(dt);
-    }
-
-    // =========================================================================
-    // Sync pool state back to API objects once at the end
-    // =========================================================================
-    hh_pool.sync_to_neurons(neurons_);
-    iz_pool.sync_to_neurons(neurons_);
-    for (const auto& kv : comp_pools) kv.second.sync_to_neurons(neurons_);
-    sync_soa_to_objects();
-
+    for (size_t i = 0; i < n_neurons; ++i)
+        traces[i].assign(V_flat.data() + i * num_steps,
+                         V_flat.data() + (i + 1) * num_steps);
     return traces;
 }
 

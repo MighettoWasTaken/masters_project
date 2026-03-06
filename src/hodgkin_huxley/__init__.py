@@ -783,6 +783,7 @@ class Network:
         dt: float,
         I_ext: ArrayLike,
         record: "RecordingConfig | None" = None,
+        detection_threshold: "float | None" = None,
     ) -> "NDArray[np.float64] | MetricsResult":
         """
         Run a network simulation.
@@ -799,6 +800,10 @@ class Network:
             Recording configuration. If None (default), returns voltage
             traces as a plain ndarray (backward compatible). If provided,
             returns a MetricsResult with the requested metrics.
+        detection_threshold : float, optional
+            Voltage threshold (mV) used by the C++ hot loop to detect
+            pre-synaptic spikes for synapse updates.  Defaults to
+            ``record.spike_threshold`` when None.
 
         Returns
         -------
@@ -808,10 +813,10 @@ class Network:
             When record is a RecordingConfig.
         """
         from .recording import _run_recording, RecordingConfig as _RC
-        I_ext_arr = np.asarray(I_ext, dtype=np.float64)
-        I_ext_list = I_ext_arr.tolist()
+        I_ext_list = np.ascontiguousarray(I_ext, dtype=np.float64)
         cfg = record if record is not None else _RC(["V"])
-        result = _run_recording(self._network, duration, dt, I_ext_list, cfg)
+        result = _run_recording(self._network, duration, dt, I_ext_list, cfg,
+                                detection_threshold=detection_threshold)
         if record is None:
             return result["V"]
         return result
@@ -1321,6 +1326,7 @@ class RegionalNetwork:
         dt: float,
         I_ext: "dict | ArrayLike" = None,
         record: "RecordingConfig | None" = None,
+        detection_threshold: "float | None" = None,
     ) -> "dict[str, NDArray[np.float64]] | PopulationMetricsResult":
         """
         Run a network simulation.
@@ -1342,6 +1348,10 @@ class RegionalNetwork:
         record : RecordingConfig, optional
             Recording configuration. If None (default), returns a dict of
             voltage traces keyed by population (backward compatible).
+        detection_threshold : float, optional
+            Voltage threshold (mV) used by the C++ hot loop to detect
+            pre-synaptic spikes for synapse updates.  Defaults to
+            ``record.spike_threshold`` when None.
 
         Returns
         -------
@@ -1386,10 +1396,9 @@ class RegionalNetwork:
                 flat[start:start + size, :] += np.array(
                     stim_trace[:num_steps], dtype=np.float64
                 )[np.newaxis, :]
-            I_ext_list = flat.tolist()
+            I_ext_list = flat
         else:
-            I_ext_arr = np.asarray(I_ext, dtype=np.float64)
-            I_ext_list = I_ext_arr.tolist()
+            I_ext_list = np.ascontiguousarray(I_ext, dtype=np.float64)
 
         pop_info = {
             name: (self._rnet.population_start(name),
@@ -1398,7 +1407,8 @@ class RegionalNetwork:
         }
         cfg = record if record is not None else _RC(["V"])
         result = _run_recording(
-            self._rnet.network(), duration, dt, I_ext_list, cfg, pop_info)
+            self._rnet.network(), duration, dt, I_ext_list, cfg, pop_info,
+            detection_threshold=detection_threshold)
 
         if record is None:
             # Backward compat: return {pop_name: ndarray}

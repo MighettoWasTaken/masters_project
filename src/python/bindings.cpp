@@ -1,3 +1,4 @@
+#include <cstring>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
@@ -347,7 +348,7 @@ PYBIND11_MODULE(_core, m) {
              "Flat postsynaptic neuron index vector")
         .def("_simulate_into_buffers",
             [](Network& net, double dur, double dt,
-               const std::vector<std::vector<double>>& I_ext,
+               py::array_t<double, py::array::c_style | py::array::forcecast> I_ext_arr,
                py::array_t<double> V_buf,
                py::array_t<double> gate_buf,
                py::array_t<double> calcium_buf,
@@ -356,6 +357,14 @@ PYBIND11_MODULE(_core, m) {
                py::array_t<double> spike_event_buf,
                size_t interval,
                double spike_threshold) {
+                // Copy numpy 2D array → vector<vector<double>> in C++ (no GIL, no Python objects)
+                auto buf = I_ext_arr.unchecked<2>();
+                size_t n_n = static_cast<size_t>(buf.shape(0));
+                size_t n_t = static_cast<size_t>(buf.shape(1));
+                std::vector<std::vector<double>> I_ext(n_n, std::vector<double>(n_t));
+                for (size_t i = 0; i < n_n; ++i)
+                    std::memcpy(I_ext[i].data(), &buf(i, 0), n_t * sizeof(double));
+
                 size_t n_rec = (static_cast<size_t>(dur / dt) + interval - 1) / interval;
                 size_t max_gates = (gate_buf.ndim() == 3)
                                    ? static_cast<size_t>(gate_buf.shape(1)) : 0;
@@ -531,10 +540,6 @@ PYBIND11_MODULE(_core, m) {
         .def("reset", &RegionalNetwork::reset)
         .def("network", py::overload_cast<>(&RegionalNetwork::network),
              py::return_value_policy::reference_internal)
-        .def("simulate", &RegionalNetwork::simulate,
-             "Run simulation (returns voltage traces as nested list)",
-             py::arg("duration"), py::arg("dt"), py::arg("I_ext"))
-
         .def("__repr__", [](const RegionalNetwork& rn) {
             return "<RegionalNetwork populations=" + std::to_string(rn.num_populations()) +
                    " neurons=" + std::to_string(rn.num_neurons()) +

@@ -120,7 +120,7 @@ def run_benchmark(n, tmax, dt, pd, seed):
 def run_library(n, tmax, dt, pd, seed):
     from ctxbgth_model import simulate_ctxbgth
 
-    beta_power, gpi_S, gpi_f, spike_times, _, elapsed, _ = simulate_ctxbgth(
+    beta_power, gpi_S, gpi_f, spike_times, elapsed = simulate_ctxbgth(
         n=n, pd=pd, tmax=tmax, dt=dt, seed=seed
     )
 

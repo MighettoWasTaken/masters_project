@@ -112,9 +112,11 @@ class TestMtspectrumpt:
 
     def test_peak_near_input_frequency(self):
         """Regular 20 Hz train → spectral peak within 5 Hz of 20 Hz."""
-        # Use 2 s for cleaner frequency resolution (df = 0.5 Hz at TEST_FS)
+        # Use 2 s for cleaner frequency resolution (df = 0.5 Hz at TEST_FS).
+        # fpass capped at 35 Hz to exclude the 40 Hz harmonic — a regular train
+        # has equal power at all harmonics so argmax in a wider band is arbitrary.
         spikes = [make_regular_train(20, 2.0)]
-        S, f = mtspectrumpt(spikes, duration=2.0, Fs=TEST_FS, fpass=(1, 100))
+        S, f = mtspectrumpt(spikes, duration=2.0, Fs=TEST_FS, fpass=(1, 35))
         peak_freq = f[np.argmax(S)]
         assert abs(peak_freq - 20.0) < 5.0, (
             f"Peak at {peak_freq:.1f} Hz; expected near 20 Hz"
