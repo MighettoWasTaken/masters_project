@@ -61,5 +61,5 @@ benchmarks/simulate_network_model_CL_fast.py
 benchmarks/simulate_network_model.py
 benchmarks/TestDataSet_64
 benchmarks/inspect_mat.py
-.claude/
+.claude
 nihms803352.pdf
