@@ -31,10 +31,14 @@ public:
     explicit DBSStimulator(const Parameters& params);
 
     /**
-     * @brief Generate full current trace for given duration and time step.
+     * @brief Generate a full dense current trace (allocates O(duration/dt) memory).
      *
      * Returns a vector of length ceil((duration + dt) / dt), matching the
      * np.arange(0, tmax+dt, dt) convention from the benchmark.
+     *
+     * Prefer current_at() for simulation use — it evaluates via modulo
+     * arithmetic with no memory allocation. Use generate() only when a
+     * pre-computed trace array is explicitly needed (e.g. for plotting).
      *
      * @param duration  Total duration in ms.
      * @param dt        Time step in ms.
@@ -43,6 +47,8 @@ public:
 
     /**
      * @brief Compute current at a specific simulation step index.
+     *
+     * Preferred over generate() for simulation use: O(1), zero allocation.
      *
      * @param step_index  Zero-based step index.
      * @param dt          Time step in ms.

@@ -383,6 +383,57 @@ PYBIND11_MODULE(_core, m) {
             py::arg("g_syn_buf"), py::arg("I_syn_buf"), py::arg("spike_event_buf"),
             py::arg("interval"), py::arg("spike_threshold") = 0.0)
 
+        // Descriptor-based simulation (avoids dense I_ext matrix)
+        // I_const:   (n_neurons,) float64 — per-neuron constant baseline
+        // pulses:    list of (neuron_start, neuron_end, onset_step, end_step, amplitude)
+        // dbs_events:list of (neuron_start, neuron_end, isi_steps, pw_steps, amplitude)
+        .def("_simulate_with_descriptors",
+            [](Network& net, double dur, double dt,
+               py::array_t<double, py::array::c_style | py::array::forcecast> I_const_arr,
+               const std::vector<std::tuple<size_t,size_t,size_t,size_t,double>>& pulses,
+               const std::vector<std::tuple<size_t,size_t,size_t,size_t,double>>& dbs_events,
+               py::array_t<double> V_buf,
+               py::array_t<double> gate_buf,
+               py::array_t<double> calcium_buf,
+               py::array_t<double> g_syn_buf,
+               py::array_t<double> I_syn_buf,
+               py::array_t<double> spike_event_buf,
+               size_t interval,
+               double spike_threshold) {
+                StimPlan stim;
+                auto ic = I_const_arr.unchecked<1>();
+                stim.I_const.assign(ic.data(0), ic.data(0) + ic.shape(0));
+                for (auto& t : pulses) {
+                    stim.pulses.push_back({
+                        std::get<0>(t), std::get<1>(t),
+                        std::get<2>(t), std::get<3>(t), std::get<4>(t)
+                    });
+                }
+                for (auto& d : dbs_events) {
+                    stim.dbs.push_back({
+                        std::get<0>(d), std::get<1>(d),
+                        std::get<2>(d), std::get<3>(d), std::get<4>(d)
+                    });
+                }
+                size_t n_rec = (static_cast<size_t>(dur / dt) + interval - 1) / interval;
+                size_t max_gates = (gate_buf.ndim() == 3)
+                                   ? static_cast<size_t>(gate_buf.shape(1)) : 0;
+                net.simulate_with_descriptors(
+                    dur, dt, stim,
+                    V_buf.size()           ? V_buf.mutable_data()           : nullptr,
+                    gate_buf.size()        ? gate_buf.mutable_data()        : nullptr, max_gates,
+                    calcium_buf.size()     ? calcium_buf.mutable_data()     : nullptr,
+                    g_syn_buf.size()       ? g_syn_buf.mutable_data()       : nullptr,
+                    I_syn_buf.size()       ? I_syn_buf.mutable_data()       : nullptr,
+                    spike_event_buf.size() ? spike_event_buf.mutable_data() : nullptr,
+                    interval, n_rec, spike_threshold);
+            },
+            py::arg("duration"), py::arg("dt"), py::arg("I_const"),
+            py::arg("pulses"), py::arg("dbs_events"),
+            py::arg("V_buf"), py::arg("gate_buf"), py::arg("calcium_buf"),
+            py::arg("g_syn_buf"), py::arg("I_syn_buf"), py::arg("spike_event_buf"),
+            py::arg("interval"), py::arg("spike_threshold") = 0.0)
+
         // Python special methods
         .def("__repr__", [](const Network& net) {
             return "<Network neurons=" + std::to_string(net.num_neurons()) +

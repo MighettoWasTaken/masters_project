@@ -223,34 +223,34 @@ def _subtitle(n_trials):
 
 
 def plot_timing_avg(results: Dict, figs_dir: Path, n_trials: int):
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(9, 7))
     axes = axes.flatten()
 
     for idx, (topo_name, data) in enumerate(results.items()):
         ax = axes[idx]
         topo_sizes = data["sizes"]
         ax.loglog(topo_sizes, data["cpp"], 'o-', color='tab:blue',
-                  linewidth=2, markersize=6, label='C++ backend')
+                  linewidth=1.5, markersize=5, label='C++ backend')
         ax.loglog(topo_sizes, data["numpy"], 's--', color='tab:red',
-                  linewidth=2, markersize=6, label='NumPy')
-        ax.set_title(topo_name, fontsize=13, fontweight='bold')
-        ax.set_xlabel('Number of neurons')
-        ax.set_ylabel('Wall time (s)')
+                  linewidth=1.5, markersize=5, label='NumPy')
+        ax.set_title(topo_name, fontsize=11)
+        ax.set_xlabel('Number of neurons', fontsize=10)
+        ax.set_ylabel('Wall time (s)', fontsize=10)
+        ax.tick_params(labelsize=9)
         ax.legend(fontsize=9)
-        ax.grid(True, which='both', alpha=0.3)
+        ax.grid(True, which='both', alpha=0.2)
 
-    fig.suptitle(f'Network Simulation: C++ vs NumPy Timing\n'
-                 f'{_subtitle(n_trials)}',
-                 fontsize=14, fontweight='bold')
+    fig.suptitle('Network Simulation: C++ Backend vs Pure NumPy',
+                 fontsize=12, fontweight='bold')
     fig.tight_layout()
-    fig.savefig(figs_dir / "benchmark_avg_time_vs_neurons.png", dpi=150,
+    fig.savefig(figs_dir / "benchmark_avg_time_vs_neurons.png", dpi=300,
                 bbox_inches='tight')
     plt.close(fig)
     print(f"\nSaved: {figs_dir / 'benchmark_avg_time_vs_neurons.png'}")
 
 
 def plot_speedup_avg(results: Dict, figs_dir: Path, n_trials: int):
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(6, 4))
     markers = ['o', 's', '^', 'D']
     colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
 
@@ -259,20 +259,21 @@ def plot_speedup_avg(results: Dict, figs_dir: Path, n_trials: int):
         speedups = [n / c if c > 0 else 0
                     for c, n in zip(data["cpp"], data["numpy"])]
         ax.plot(topo_sizes, speedups, f'{markers[idx]}-', color=colors[idx],
-                linewidth=2, markersize=7, label=topo_name)
+                linewidth=1.5, markersize=6, label=topo_name)
 
-    ax.axhline(y=1.0, color='gray', linestyle=':', alpha=0.7, label='Parity')
+    ax.axhline(y=1.0, color='gray', linestyle=':', alpha=0.7, label='Parity (1×)')
     ax.set_xscale('log')
-    ax.set_xlabel('Number of neurons', fontsize=12)
-    ax.set_ylabel('Speedup (NumPy time / C++ time)', fontsize=12)
-    ax.set_title(f'C++ Backend Speedup Over Pure NumPy\n'
-                 f'{_subtitle(n_trials)}',
-                 fontsize=14, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(True, which='both', alpha=0.3)
+    ax.set_yscale('log')
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:g}×'))
+    ax.set_xlabel('Number of neurons', fontsize=10)
+    ax.set_ylabel('Speedup (NumPy / C++)', fontsize=10)
+    ax.set_title('C++ Backend Speedup Over Pure NumPy', fontsize=11, fontweight='bold')
+    ax.tick_params(labelsize=9)
+    ax.legend(fontsize=9)
+    ax.grid(True, which='both', alpha=0.2)
 
     fig.tight_layout()
-    fig.savefig(figs_dir / "benchmark_avg_speedup.png", dpi=150,
+    fig.savefig(figs_dir / "benchmark_avg_speedup.png", dpi=300,
                 bbox_inches='tight')
     plt.close(fig)
     print(f"Saved: {figs_dir / 'benchmark_avg_speedup.png'}")
@@ -345,7 +346,7 @@ def plot_isolation_avg(syn_data: Dict, neuron_data: Dict,
 
 
 def plot_duration_avg(dur_data: Dict, figs_dir: Path, n_trials: int):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
 
     durations = dur_data["durations"]
     N = dur_data["N"]
@@ -353,32 +354,32 @@ def plot_duration_avg(dur_data: Dict, figs_dir: Path, n_trials: int):
 
     ax = axes[0]
     ax.loglog(durations, dur_data["cpp"], 'o-', color='tab:blue',
-              linewidth=2, markersize=6, label='C++')
+              linewidth=1.5, markersize=5, label='C++ backend')
     ax.loglog(durations, dur_data["numpy"], 's--', color='tab:red',
-              linewidth=2, markersize=6, label='NumPy')
-    ax.set_xlabel('Simulation duration (ms)')
-    ax.set_ylabel('Wall time (s)')
-    ax.set_title(f'Duration Scaling (N={N}, {S} synapses)',
-                 fontsize=12, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(True, which='both', alpha=0.3)
+              linewidth=1.5, markersize=5, label='NumPy')
+    ax.set_xlabel('Simulation duration (ms)', fontsize=10)
+    ax.set_ylabel('Wall time (s)', fontsize=10)
+    ax.set_title(f'Wall Time (N={N}, {S} synapses)', fontsize=11)
+    ax.tick_params(labelsize=9)
+    ax.legend(fontsize=9)
+    ax.grid(True, which='both', alpha=0.2)
 
     ax = axes[1]
     speedups = [n / c if c > 0 else 0
                 for c, n in zip(dur_data["cpp"], dur_data["numpy"])]
     ax.semilogx(durations, speedups, 'D-', color='tab:purple',
-                linewidth=2, markersize=6)
+                linewidth=1.5, markersize=5)
     ax.axhline(y=1.0, color='gray', linestyle=':', alpha=0.7)
-    ax.set_xlabel('Simulation duration (ms)')
-    ax.set_ylabel('Speedup (NumPy / C++)')
-    ax.set_title('Speedup vs Duration', fontsize=12, fontweight='bold')
-    ax.grid(True, which='both', alpha=0.3)
+    ax.set_xlabel('Simulation duration (ms)', fontsize=10)
+    ax.set_ylabel('Speedup (NumPy / C++)', fontsize=10)
+    ax.set_title('Speedup vs Duration', fontsize=11)
+    ax.tick_params(labelsize=9)
+    ax.grid(True, which='both', alpha=0.2)
 
-    fig.suptitle(f'Fixed Network, Scaling Simulation Time\n'
-                 f'{_subtitle(n_trials)}',
-                 fontsize=14, fontweight='bold')
+    fig.suptitle('Fixed Network, Scaling Simulation Time',
+                 fontsize=12, fontweight='bold')
     fig.tight_layout()
-    fig.savefig(figs_dir / "benchmark_avg_duration.png", dpi=150,
+    fig.savefig(figs_dir / "benchmark_avg_duration.png", dpi=300,
                 bbox_inches='tight')
     plt.close(fig)
     print(f"Saved: {figs_dir / 'benchmark_avg_duration.png'}")

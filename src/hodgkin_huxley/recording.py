@@ -9,8 +9,36 @@ from __future__ import annotations
 
 import numpy as np
 from typing import Any
+from dataclasses import dataclass, field
 
 from ._core import Network as _Network
+
+
+# =============================================================================
+# StimPlan — compact stimulation descriptor (no dense I_ext matrix)
+# =============================================================================
+
+@dataclass
+class _StimPlan:
+    """
+    Compact external-stimulus representation passed to _simulate_with_descriptors.
+
+    Avoids the large dense (n_neurons × n_steps) I_ext matrix for inputs that
+    can be expressed as constant baselines, rectangular pulse events, or DBS
+    trains.
+
+    Fields
+    ------
+    I_const : ndarray, shape (n_neurons,)
+        Per-neuron constant baseline current (µA/cm²).
+    pulses  : list of (neuron_start, neuron_end, onset_step, end_step, amplitude)
+        Rectangular pulse intervals.  Multiple entries allowed per population.
+    dbs     : list of (neuron_start, neuron_end, isi_steps, pw_steps, amplitude)
+        Periodic DBS pulse trains evaluated via modulo arithmetic.
+    """
+    I_const: np.ndarray                            # shape (N,), float64
+    pulses:  list = field(default_factory=list)    # list of 5-tuples
+    dbs:     list = field(default_factory=list)    # list of 5-tuples
 
 
 # =============================================================================
@@ -298,11 +326,12 @@ def _extract_gate_names(network_core, selected: list) -> list | None:
 # =============================================================================
 
 def _run_recording(network_core: _Network, duration: float, dt: float,
-                   I_ext_list: list, config: RecordingConfig,
+                   I_ext_list, config: RecordingConfig,
                    pop_info: dict | None = None,
-                   detection_threshold: float | None = None) -> MetricsResult:
+                   detection_threshold: float | None = None,
+                   stim_plan: "_StimPlan | None" = None) -> MetricsResult:
     """
-    Allocate output buffers, call _simulate_into_buffers(), build MetricsResult.
+    Allocate output buffers, run simulation, build MetricsResult.
 
     Parameters
     ----------
@@ -312,16 +341,14 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
         directly.
     duration     : simulation duration in ms
     dt           : time step in ms
-    I_ext_list   : list[list[float]], shape (n_neurons, n_steps)
+    I_ext_list   : ndarray (n_neurons, n_steps) or None when stim_plan is given
     config       : RecordingConfig
     pop_info     : {pop_name: (start, count)} for RegionalNetwork slicing
     detection_threshold : float, optional
-        Voltage threshold (mV) used internally by the C++ hot loop to detect
-        pre-synaptic spikes for synapse updates.  Defaults to
-        ``config.spike_threshold`` when None.  Set this independently of
-        ``config.spike_threshold`` when the simulation detection threshold
-        differs from the post-hoc reporting threshold (e.g. -10 mV detection,
-        -20 mV reporting).
+        Voltage threshold (mV) for C++ hot-loop spike detection.
+    stim_plan    : _StimPlan, optional
+        When provided, calls _simulate_with_descriptors() instead of
+        _simulate_into_buffers(), avoiding the dense I_ext matrix allocation.
     """
     det_thresh = detection_threshold if detection_threshold is not None \
                  else config.spike_threshold
@@ -353,10 +380,18 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
     spike_event_buf  = alloc((n_neurons, n_rec)            if need_sevents else ())
 
     # Run C++ hot loop with recording
-    network_core._simulate_into_buffers(
-        duration, dt, I_ext_list,
-        V_buf, gate_buf, calcium_buf, g_syn_buf, I_syn_buf, spike_event_buf,
-        interval, det_thresh)
+    if stim_plan is not None:
+        # Compact descriptor path — no dense I_ext matrix
+        network_core._simulate_with_descriptors(
+            duration, dt, stim_plan.I_const,
+            stim_plan.pulses, stim_plan.dbs,
+            V_buf, gate_buf, calcium_buf, g_syn_buf, I_syn_buf, spike_event_buf,
+            interval, det_thresh)
+    else:
+        network_core._simulate_into_buffers(
+            duration, dt, I_ext_list,
+            V_buf, gate_buf, calcium_buf, g_syn_buf, I_syn_buf, spike_event_buf,
+            interval, det_thresh)
 
     # Neuron selection
     selected = _resolve_neuron_indices(config.neurons, n_neurons, pop_info)

@@ -118,7 +118,6 @@ A single `Network` or `RegionalNetwork` may contain any combination of:
 - Classic Hodgkin-Huxley neurons
 - Five Izhikevich presets (Regular Spiking, Fast Spiking, Intrinsically Bursting, Chattering, Low-Threshold Spiking) plus fully custom Izhikevich parameters
 - `ComposableNeuron` neurons specified by `NeuronModelSpec`
-- Five built-in biological presets: thalamic (TC), subthalamic nucleus (STN), globus pallidus externa (GPe), globus pallidus interna (GPi), and striatum (healthy or PD dopamine-depleted)
 
 ### 2.6 Multiple Synapse Types
 

@@ -1360,7 +1360,8 @@ class RegionalNetwork:
         PopulationMetricsResult
             When record is a RecordingConfig.
         """
-        from .recording import _run_recording, RecordingConfig as _RC, PopulationMetricsResult as _PMR
+        from .recording import (_run_recording, RecordingConfig as _RC,
+                                PopulationMetricsResult as _PMR, _StimPlan)
 
         num_neurons = self._rnet.num_neurons
         num_steps = int(duration / dt)
@@ -1368,47 +1369,83 @@ class RegionalNetwork:
         if I_ext is None:
             I_ext = {}
 
-        if isinstance(I_ext, dict):
-            flat = np.zeros((num_neurons, num_steps), dtype=np.float64)
-            pop_names = self._rnet.population_names()
-            for name in pop_names:
-                if name not in I_ext:
-                    continue
-                val = I_ext[name]
-                start = self._rnet.population_start(name)
-                size = self._rnet.population_size(name)
-                val = np.asarray(val, dtype=np.float64)
-                if val.ndim == 0:
-                    flat[start:start + size, :] = val.item()
-                elif val.ndim == 1:
-                    flat[start:start + size, :] = val[np.newaxis, :num_steps]
-                elif val.ndim == 2:
-                    flat[start:start + size, :] = val[:, :num_steps]
-                else:
-                    raise ValueError(
-                        f"I_ext['{name}'] must be scalar, 1D, or 2D, "
-                        f"got {val.ndim}D"
-                    )
-            for pop_name, stim in self._stimulators.items():
-                stim_trace = stim.generate(duration, dt)
-                start = self._rnet.population_start(pop_name)
-                size  = self._rnet.population_size(pop_name)
-                flat[start:start + size, :] += np.array(
-                    stim_trace[:num_steps], dtype=np.float64
-                )[np.newaxis, :]
-            I_ext_list = flat
-        else:
-            I_ext_list = np.ascontiguousarray(I_ext, dtype=np.float64)
-
         pop_info = {
             name: (self._rnet.population_start(name),
                    self._rnet.population_size(name))
             for name in self._rnet.population_names()
         }
+
+        stim_plan = None
+        I_ext_list = None
+
+        if isinstance(I_ext, dict):
+            # Try to build a compact StimPlan (avoids 128 MB dense matrix).
+            # Falls back to dense only when a population receives a pre-computed
+            # 1D/2D numpy array that cannot be expressed as descriptors.
+            can_use_descriptors = all(
+                np.asarray(v, dtype=np.float64).ndim == 0
+                for v in I_ext.values()
+            ) and all(
+                isinstance(s, DBSStimulator)
+                for s in self._stimulators.values()
+            )
+
+            if can_use_descriptors:
+                I_const = np.zeros(num_neurons, dtype=np.float64)
+                for name, val in I_ext.items():
+                    start, size = pop_info[name]
+                    I_const[start:start + size] = float(np.asarray(val))
+
+                dbs_events = []
+                for pop_name, stim in self._stimulators.items():
+                    start, size = pop_info[pop_name]
+                    freq = stim.frequency
+                    if freq > 0:
+                        isi_ms = 1000.0 / freq
+                        isi_steps = max(1, round(isi_ms / dt))
+                        pw_steps  = max(1, round(stim.pulse_width / dt))
+                        dbs_events.append(
+                            (start, start + size, isi_steps, pw_steps,
+                             stim.amplitude)
+                        )
+
+                stim_plan = _StimPlan(
+                    I_const=I_const,
+                    pulses=[],
+                    dbs=dbs_events,
+                )
+            else:
+                # Dense fallback for populations with array-valued I_ext
+                flat = np.zeros((num_neurons, num_steps), dtype=np.float64)
+                for name, val in I_ext.items():
+                    start, size = pop_info[name]
+                    val = np.asarray(val, dtype=np.float64)
+                    if val.ndim == 0:
+                        flat[start:start + size, :] = val.item()
+                    elif val.ndim == 1:
+                        flat[start:start + size, :] = val[np.newaxis, :num_steps]
+                    elif val.ndim == 2:
+                        flat[start:start + size, :] = val[:, :num_steps]
+                    else:
+                        raise ValueError(
+                            f"I_ext['{name}'] must be scalar, 1D, or 2D, "
+                            f"got {val.ndim}D"
+                        )
+                for pop_name, stim in self._stimulators.items():
+                    stim_trace = stim.generate(duration, dt)
+                    start, size = pop_info[pop_name]
+                    flat[start:start + size, :] += np.array(
+                        stim_trace[:num_steps], dtype=np.float64
+                    )[np.newaxis, :]
+                I_ext_list = flat
+        else:
+            I_ext_list = np.ascontiguousarray(I_ext, dtype=np.float64)
+
         cfg = record if record is not None else _RC(["V"])
         result = _run_recording(
             self._rnet.network(), duration, dt, I_ext_list, cfg, pop_info,
-            detection_threshold=detection_threshold)
+            detection_threshold=detection_threshold,
+            stim_plan=stim_plan)
 
         if record is None:
             # Backward compat: return {pop_name: ndarray}

@@ -16,6 +16,35 @@
 
 namespace hodgkin_huxley {
 
+// =============================================================================
+// Compact stimulation plan — avoids dense (n_neurons × n_steps) I_ext matrix
+// =============================================================================
+
+/// A rectangular current pulse applied to a contiguous neuron range.
+struct PulseEvent {
+    size_t neuron_start;  ///< First neuron index (inclusive)
+    size_t neuron_end;    ///< Last neuron index (exclusive)
+    size_t onset_step;    ///< First time step of pulse (inclusive)
+    size_t end_step;      ///< First time step after pulse (exclusive)
+    double amplitude;     ///< Current amplitude (µA/cm²)
+};
+
+/// A periodic DBS pulse train applied to a contiguous neuron range.
+struct DBSEvent {
+    size_t neuron_start;  ///< First neuron index (inclusive)
+    size_t neuron_end;    ///< Last neuron index (exclusive)
+    size_t isi_steps;     ///< Inter-stimulus interval in time steps
+    size_t pw_steps;      ///< Pulse width in time steps
+    double amplitude;     ///< Current amplitude (µA/cm²)
+};
+
+/// Compact representation of all external stimulation for one simulation run.
+struct StimPlan {
+    std::vector<double>     I_const;   ///< Per-neuron constant baseline current
+    std::vector<PulseEvent> pulses;    ///< Sparse rectangular pulse events
+    std::vector<DBSEvent>   dbs;       ///< Periodic DBS pulse trains
+};
+
 /**
  * @brief Network of neurons with polymorphic neuron support
  *
@@ -188,6 +217,23 @@ public:
         double* g_syn_buf,
         double* I_syn_buf,
         double* spike_event_buf,  // (n_neurons, n_rec): synapse-detected spike counts per interval
+        size_t  interval,
+        size_t  n_rec,
+        double  spike_threshold = 0.0
+    );
+
+    // Like simulate_into_buffers() but reads external current from compact
+    // descriptors rather than a dense (n_neurons × n_steps) matrix.
+    // Eliminates the large I_ext allocation for scalar/pulse/DBS-only inputs.
+    void simulate_with_descriptors(
+        double duration, double dt,
+        const StimPlan& stim,
+        double* V_buf,
+        double* gate_buf,       size_t max_gates,
+        double* calcium_buf,
+        double* g_syn_buf,
+        double* I_syn_buf,
+        double* spike_event_buf,
         size_t  interval,
         size_t  n_rec,
         double  spike_threshold = 0.0
