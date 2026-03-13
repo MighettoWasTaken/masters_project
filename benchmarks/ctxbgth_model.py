@@ -573,7 +573,7 @@ def simulate_ctxbgth(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    time = 0.5 # seconds
+    time = 1 # seconds
     window_s = 0.25  # time window for rate-over-time reporting (seconds)
 
     print(f"Building CTX-BG-TH network (healthy, no DBS, n=10, {time}s) ...")
