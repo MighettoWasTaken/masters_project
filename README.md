@@ -36,7 +36,7 @@ This project provides modular, reusable components for computational neuroscienc
 uv venv && uv pip install -e ".[examples]" --python .venv/Scripts/python.exe
 ```
 
-Creates a virtual environment and installs the library in editable mode. `cmake` and `ninja` are fetched automatically as build dependencies — no separate CMake install required.
+Creates a virtual environment and installs the library in editable mode. `cmake` and `ninja` are fetched automatically as build dependencies — no separate CMake install required. 
 
 ---
 
