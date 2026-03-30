@@ -1,6 +1,6 @@
 # Hodgkin-Huxley Network Simulation Framework
 
-A fast, generalized Python framework for building complex brain network simulations, powered by a high-performance C++ backend. Developed as a masters project targeting basal ganglia–thalamo–cortical models used in Parkinson's disease research.
+A fast, generalized Python framework for building complex brain network simulations, powered by a high-performance C++ backend. Developed as a masters project.
 
 **Author:** Edward Mighetto
 **GitHub:** [MighettoWasTaken/masters_project](https://github.com/MighettoWasTaken/masters_project)
