@@ -30,29 +30,29 @@ All foundational features required to reproduce the Hahn/Kumaravelu CTX-BG-TH Pa
 
 ---
 
-### Phase 2 — API Clarity and Model Expressiveness (Current)
+### Phase 2 — API Cleanup and Unified Equation System (Current)
 
-Improve the user-facing API and extend the biological modeling capabilities. These tasks are largely independent and can proceed in parallel.
+task12 (structural cleanup) has no dependencies and should be done first to clear the surface before any new feature work. task13 (SymPy equation system) is the highest-priority feature and unblocks everything else in phases 2–4.
 
 | Task | Title | Priority | Dependencies |
 |------|-------|----------|--------------|
-| [task17](../task17.md) | API Streamlining | 2 | None |
-| [task16](../task16.md) | Better Equation Support | 2 | None |
-| [task12](../task12.md) | Generalized Intracellular Dynamics | 2 | None |
+| [task12](../task12.md) | API Structural Cleanup | 2 | None — **start here** |
+| [task13](../task13.md) | Unified Equation System (SymPy) | 2 | task12 recommended first |
+| [task14](../task14.md) | Generalized Intracellular Dynamics | 2 | task13 (ODE fields use SymPy) |
 
-**Recommended order:** task17 first (clears the API surface), task16 and task12 in parallel (both extend existing internal systems without user-facing conflicts).
+task13 also includes its own API cleanup section (13.9) which retires the legacy equation types (`BoltzmannParams`, `TauParams`, form enums) to `hodgkin_huxley.legacy` once SymPy is in place.
 
-**Key outcomes:** One canonical workflow for all simulations, named equation parameters, arbitrary intracellular substances (dopamine, cAMP, etc.).
+**Key outcomes:** One canonical network-building workflow; one equation language (SymPy) across all model definitions; legacy equation types retired; arbitrary intracellular substances (dopamine, cAMP, etc.).
 
 ---
 
 ### Phase 3 — Synaptic Plasticity (After Phase 2)
 
-Synaptic learning rules that depend on a clean API (task17) and optionally on intracellular substances (task12) for neuromodulator-gated plasticity.
+Synaptic learning rules using SymPy update-rule expressions (task13) and optionally intracellular substances (task14) for neuromodulator-gated plasticity.
 
 | Task | Title | Priority | Dependencies |
 |------|-------|----------|--------------|
-| [task13](../task13.md) | Plasticity Support (STDP, STP) | 2 | task12 (for gated plasticity) |
+| [task15](../task15.md) | Plasticity Support (STDP, STP) | 2 | task13 (SymPy update rules), task14 (for gated plasticity) |
 
 **Key outcomes:** STDP, short-term depression/facilitation, dopamine-gated STDP, weight recording.
 
@@ -60,36 +60,34 @@ Synaptic learning rules that depend on a clean API (task17) and optionally on in
 
 ### Phase 4 — Performance Scaling (Parallel with Phase 3)
 
-Infrastructure for simulating networks with >1000 neurons efficiently. These are largely independent of Phase 2/3 feature work and can be developed in parallel.
+Infrastructure for simulating networks with >1000 neurons efficiently. task16 (OpenMP) can begin as soon as the codebase is stable post-task13; task17 (CUDA) depends on both task16 (PoolBase interface) and task13 (CUDAPrinter). task19 (Multi-GPU) depends on task17's `Device` model and task16's `SpikeTransport` abstraction — target for extremely large models (N > 50,000) or full-scale cortical column simulations where single-GPU memory is a bottleneck.
 
 | Task | Title | Priority | Dependencies |
 |------|-------|----------|--------------|
-| [task15](../task15.md) | CPU Parallelism (OpenMP) | 3 | None |
-| [task14](../task14.md) | CUDA GPU Acceleration | 3 | task15 (PoolBase interface) |
+| [task16](../task16.md) | CPU Parallelism (OpenMP) | 3 | None |
+| [task17](../task17.md) | CUDA GPU Acceleration | 3 | task16 (PoolBase), task13 (CUDAPrinter) |
+| [task19](../task19.md) | Multi-GPU Parallelism | 3 | task17 (Device API), task16 (SpikeTransport) |
 
-**Recommended order:** task15 OpenMP phase first (introduces PoolBase abstraction needed by CUDA), then task14.
-
-**Key outcomes:** 2–4× speedup via OpenMP on multi-core CPU, 50–200× speedup via CUDA for N>1000.
+**Key outcomes:** 2–4× speedup via OpenMP on multi-core CPU; 50–200× speedup via CUDA for N>1000; custom SymPy equations work transparently on GPU; near-linear multi-GPU scaling for N>50,000 via CUDA P2P or NCCL.
 
 ---
 
 ### Phase 5 — Ecosystem (Parallel with Phases 3–4)
 
-Documentation and community tooling. This can proceed independently as features stabilise.
+Documentation and ML integration tooling. task18 (docs) can proceed as features stabilise post-task13. task20 (ML integration) depends on task12 for a stable public API and task13 for serialisable SymPy state, but its continuable-simulation and pickling sub-features can begin earlier in parallel with task14/15.
 
 | Task | Title | Priority | Dependencies |
 |------|-------|----------|--------------|
-| [task18](../task18.md) | Web Documentation | 3 | Stable API (task17) |
+| [task18](../task18.md) | Web Documentation | 3 | Stable API (tasks 12–13 complete) |
+| [task20](../task20.md) | ML Framework Integration | 2 | task12 (stable API), task13 (serialisable state) |
 
-**Key outcomes:** MkDocs site on GitHub Pages, full API reference, tutorial notebooks, contributor guide.
+**Key outcomes:** MkDocs site on GitHub Pages, full API reference, tutorial notebooks, contributor guide; continuable simulations with `state_dict()` / `load_state_dict()`; sparse spike tensors for SNN pipelines; PyTorch / TensorFlow / pandas export; full `pickle` / `joblib` support.
 
 ---
 
 ## Architectural Principles
 
-These principles guide all design decisions across phases:
-
-1. **Data over code**: neuron and synapse models are described by parameter structs, not class hierarchies. This enables Eigen vectorization across neuron pools and preserves composability.
+1. **Data over code**: neuron and synapse models are described by parameter structs, not class hierarchies. This enables Eigen vectorization across neuron pools and preserves composability. Equations within those structs are expressed as SymPy expressions — compiled to Eigen-compatible C++ lambdas (CPU) or `__device__` functions (CUDA) with standard forms recognized at no JIT cost.
 
 2. **One canonical workflow**: users should reach any simulation through the same sequence — define model → build network → simulate → analyze. Internal routing (descriptor path, pool dispatch, backend selection) is invisible.
 
@@ -104,6 +102,6 @@ These principles guide all design decisions across phases:
 ## Known Limitations (Deferred)
 
 - **RK45 adaptive integration**: enum exists, implementation incomplete. Fixed dt (0.01 ms) is sufficient for current use cases.
-- **Multi-GPU / distributed simulation**: out of scope for all current tasks.
+- **Multi-GPU / distributed simulation**: planned for task19 (depends on task17 Device API + task16 SpikeTransport). Not out of scope — deferred until single-GPU path is stable.
 - **Non-conductance-based neuron models** (LIF, AdEx): not planned; use Izhikevich as the lightweight alternative.
 - **Python-defined neuron subclasses** (pybind11 trampolines): possible but carries performance penalty; composable spec system is the preferred extension mechanism.

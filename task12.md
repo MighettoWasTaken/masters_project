@@ -1,198 +1,164 @@
-# Task 12: Generalized Intracellular Dynamics
+# Task 12: API Structural Cleanup
 
-## Priority: 2
+## Priority: 2 — First to implement; no dependencies
 
 ## Overview
 
-Extend the current calcium-only intracellular tracking to a general-purpose system for arbitrary intracellular substances. Calcium is the only substance currently modeled; many biologically relevant phenomena require additional intracellular dynamics — notably dopamine (modulates M-current and plasticity in striatum), cAMP (second messenger), and IP3 (triggers calcium release from internal stores). The goal is a flexible `IntracellularSpec` system that makes calcium a special case of a broader mechanism, while preserving the existing calcium presets and pool performance.
+The library has accumulated multiple overlapping entry points as features were added incrementally. This task removes all structural redundancy — network class ambiguity, duplicate neuron-add paths, exposed internal simulation methods, inconsistent I_ext interface — without touching equation-definition types (those are addressed in task13). Completing this first ensures all subsequent feature tasks build on a clean, consistent API surface.
 
 ---
 
-## 12.1 Current State
+## 12.1 Network Class Ambiguity
 
-`CalciumSpec` in `ion_channels.hpp` handles one substance with two modes:
+`Network` is the low-level class; `RegionalNetwork` wraps it with named populations. There is no documented guidance on when to use which, and `Network` is fully exposed in the public API.
 
-- **Simple decay** (GPe/GPi): `d[Ca]/dt = epsilon * (-sum(I_sources) - K_Ca * Ca)`
-- **Nernst** (STN): same ODE + dynamic `E_Ca = (RT/zF) * ln(Ca_o / Ca)`
+**Change:** `Network` becomes `_Network` (internal). `RegionalNetwork` is the sole public network class. Single-population use cases work naturally with one population.
 
-`ComposablePool` maintains one `Eigen::ArrayXd Ca_` per pool and one `Eigen::ArrayXd E_Ca_` if Nernst is enabled. Calcium-dependent gates reference `Ca_` via `GateDependency::CALCIUM`.
+Migration:
+```python
+# Old
+net = Network(10)
+net.add_synapse(0, 1, 0.5)
 
-**Limitations:**
-- Hardcoded to one substance per neuron model
-- No mechanism for one substance to modulate another's dynamics
-- No way to express volume-transmitted modulators (dopamine, serotonin)
-- `GateDependency::CALCIUM` must be generalised to reference any substance
+# New
+net = RegionalNetwork()
+net.add_population("neurons", 10, NeuronModelSpec.hh_default())
+net.add_connection("neurons", 0, "neurons", 1, 0.5, SynapseSpec.exponential(0.0, 2.0))
+```
 
 ---
 
-## 12.2 Architecture
+## 12.2 Redundant Neuron Add Methods
 
-### Core Principle
-
-Each `NeuronModelSpec` carries a list of `IntracellularSpec` objects. Each spec defines:
-1. **Dynamics**: how the substance concentration changes each step
-2. **Modulations**: what simulation parameters it adjusts (channel g, gate x_inf, gate tau)
-3. **Nernst flag**: if true, compute a reversal potential from this concentration
-
-Calcium is expressed as an `IntracellularSpec` with `use_nernst = true`. All existing presets continue to work via updated factory functions.
-
-### C++ Structs
-
-```cpp
-/// Dynamics of a single intracellular substance concentration X.
-///   dX/dt = scale * (-sum(I_source_channels) - decay_rate * X)
-struct IntracellularDynamicsSpec {
-    double scale       = 1e-4;   // epsilon: conversion factor
-    double decay_rate  = 15.0;   // K_X: first-order decay (ms^-1)
-    double initial     = 0.1;    // initial concentration
-    std::vector<int> source_channels;  // channel indices that contribute I to dX/dt
-
-    // Nernst reversal potential (for ions, e.g. Ca2+)
-    bool   use_nernst  = false;
-    double X_o         = 2000.0; // extracellular concentration (Nernst denominator)
-    double z           = 2.0;    // valence
-    double F           = 96485.0, R = 8314.0, T = 298.0;
-};
-
-/// Target types for concentration-dependent parameter modulation.
-enum class ModulationTarget {
-    CHANNEL_G_SCALE,      // g_eff = g * (1 + scale * X)
-    GATE_INF_SHIFT,       // x_inf computed at (V + scale * X) instead of V
-    GATE_TAU_SCALE,       // tau_eff = tau * (1 + scale * X)
-};
-
-/// A single modulation: substance X → parameter adjustment.
-struct IntracellularModulation {
-    int               substance_idx;  // index into NeuronModelSpec::intracellular
-    ModulationTarget  target;
-    int               target_idx;    // channel or gate index
-    double            scale;         // linear coefficient
-};
-
-/// Complete specification of one intracellular substance.
-struct IntracellularSpec {
-    std::string name;
-    IntracellularDynamicsSpec dynamics;
-    std::vector<IntracellularModulation> modulations;
-};
+All of the following add a default HH neuron — four paths for one operation:
+```python
+net.add_neuron()
+net.add_hh_neuron()
+net.add_neuron(NetworkNeuronType.HH)
+net.add_neuron(HHParameters())
 ```
 
-### NeuronModelSpec Changes
-
-Replace the single `CalciumSpec calcium` field:
-
-```cpp
-struct NeuronModelSpec {
-    std::string name;
-    double C_m = 1.0;
-    std::vector<GateSpec>         gates;
-    std::vector<ChannelSpec>      channels;
-    std::vector<IntracellularSpec> intracellular;   // replaces CalciumSpec
-
-    // Convenience: index of substance providing reversal potential to
-    // channels with use_calcium_nernst=true (-1 = none)
-    int nernst_substance_idx = -1;
-};
-```
-
-### GateDependency Extension
-
-```cpp
-enum class GateDependency {
-    VOLTAGE,
-    INTRACELLULAR   // replaces CALCIUM; gate_spec.intracellular_idx selects which substance
-};
-
-struct GateSpec {
-    // ...existing fields...
-    GateDependency dependency = GateDependency::VOLTAGE;
-    int intracellular_idx = 0;  // which IntracellularSpec (ignored if dependency=VOLTAGE)
-};
-```
-
-### ComposablePool Changes
-
-```cpp
-class ComposablePool {
-    // ...
-private:
-    // Per-substance state (one ArrayXd per IntracellularSpec in model)
-    std::vector<Eigen::ArrayXd> X_;       // concentrations
-    std::vector<Eigen::ArrayXd> E_nernst_; // Nernst reversals (if use_nernst)
-    // ...
-};
-```
-
-The `step()` function iterates over substances in model order, updating each with its dynamics ODE after channel currents are computed.
-
----
-
-## 12.3 Backwards Compatibility
-
-`CalciumSpec` is kept as a Python-level convenience builder that constructs the equivalent `IntracellularSpec`:
+**Change:** Remove from public API. Neuron type is always expressed via `NeuronModelSpec`. Add two new presets:
 
 ```python
-# Old (still works)
-spec.set_calcium(mode="nernst", Ca_init=0.005, ...)
-
-# New equivalent
-spec.add_intracellular(IntracellularSpec(
-    name="calcium",
-    dynamics=IntracellularDynamicsSpec(use_nernst=True, initial=0.005, ...),
-))
+NeuronModelSpec.hh_default()                             # replaces NetworkNeuronType.HH
+NeuronModelSpec.izhikevich(IzhikevichType.FAST_SPIKING)  # replaces IZHIKEVICH_FS etc.
 ```
 
-All five existing presets (`thalamic()`, `stn()`, `gpe()`, `gpi()`, `striatum()`) are updated to use the new system internally; their Python-facing API is unchanged.
+`NetworkNeuronType` enum is removed from the public API.
 
 ---
 
-## 12.4 New Use Case: Dopamine Modulation
+## 12.3 Scalar Neuron Classes
 
-The primary new use case is dopamine modulation of striatal M-current, replacing the PD scaling parameter with a dynamic dopamine concentration:
+`HHNeuron` and `IzhikevichNeuron` are full public API classes with their own `simulate()`, `step()`, `parameters`, and `state` properties. They predate the composable system and represent a usage pattern (one neuron at a time) that is not how the library simulates networks.
+
+**Change:** Move to `hodgkin_huxley.legacy`. Still importable with no breakage, but not in the top-level namespace. Emit `DeprecationWarning` on import from legacy.
 
 ```python
-# Dopamine: externally driven (no source channels), decays slowly
-# Modulates Str M-channel conductance
-dopamine = IntracellularSpec(
-    name="dopamine",
-    dynamics=IntracellularDynamicsSpec(
-        scale=0.0,         # no ion-current source
-        decay_rate=0.01,   # slow clearance
-        initial=1.0,       # baseline tonic level
-        source_channels=[]
-    ),
-    modulations=[
-        IntracellularModulation(
-            substance_idx=0,
-            target=ModulationTarget.CHANNEL_G_SCALE,
-            target_idx=3,    # M channel index in striatum spec
-            scale=-1.1       # g_M_eff = g_M * (1 + (-1.1) * [DA])
-        )
-    ]
+# Old (still works, raises DeprecationWarning)
+from hodgkin_huxley import HHNeuron
+
+# New location
+from hodgkin_huxley.legacy import HHNeuron
+```
+
+---
+
+## 12.4 Exposed Internal Simulation Methods
+
+`_simulate_into_buffers()` and `_simulate_with_descriptors()` are prefixed `_` but still importable via bindings and appear in examples, creating confusion about which simulation path to use.
+
+**Change:** Remove from public binding exports entirely. `RegionalNetwork.simulate()` routes to the correct internal path automatically; this is not user-visible.
+
+---
+
+## 12.5 I_ext Interface Unification
+
+`RegionalNetwork.simulate()` currently accepts I_ext as a float, 1D array, 2D array, dict, or `_StimPlan` with no clear primary form.
+
+**Change:** Per-population dict is the documented primary interface:
+
+```python
+I_ext = {"CTX": 10.0}                     # scalar constant for all neurons in pop
+I_ext = {"CTX": DBSStimulator(...)}        # on-the-fly stimulator object
+I_ext = {"CTX": np.array([10.0, 12.0])}   # per-neuron 1D array (length = pop size)
+```
+
+Dense 2D arrays (`n_neurons × n_steps`) remain accepted for backwards compatibility but are not documented as a primary interface.
+
+---
+
+## 12.6 Canonical Workflow
+
+After this task, the intended flow for all simulations:
+
+```python
+import hodgkin_huxley as hh
+
+# 1. Define models (presets or composable specs)
+ctx_model = hh.NeuronModelSpec.izhikevich(hh.IzhikevichType.REGULAR_SPIKING)
+stn_model = hh.NeuronModelSpec.stn()
+
+# 2. Build network
+net = hh.RegionalNetwork()
+net.add_population("CTX", 10, ctx_model)
+net.add_population("STN", 10, stn_model)
+net.connect("CTX", "STN",
+    pattern=hh.ConnectivityPattern.ONE_TO_ONE,
+    synapse=hh.SynapseSpec.ampa(),
+    weight=hh.WeightDistribution.constant(0.5))
+
+# 3. Simulate
+result = net.simulate(
+    duration=2000.0, dt=0.01,
+    I_ext={"CTX": 10.0, "STN": 0.0},
+    recording=hh.RecordingConfig.all_neuron_metrics()
 )
 
-str_model.add_intracellular(dopamine)
+# 4. Analyse
+print(result["CTX"].firing_rate.mean())
 ```
+
+Note: equation-definition types (`GateSpec`, `TauParams`, etc.) are not changed by this task. That is task13.
 
 ---
 
-## 12.5 Implementation Checklist
+## 12.7 Export Cleanup (Structural Only)
 
-### C++ Core
-- [ ] Define `IntracellularDynamicsSpec`, `IntracellularModulation`, `IntracellularSpec` in `ion_channels.hpp`
-- [ ] Replace `CalciumSpec calcium` in `NeuronModelSpec` with `std::vector<IntracellularSpec> intracellular`
-- [ ] Generalise `GateDependency::CALCIUM` → `GateDependency::INTRACELLULAR` + `intracellular_idx` field in `GateSpec`
-- [ ] Update `ComposablePool`: replace `Ca_` / `E_Ca_` with `std::vector<Eigen::ArrayXd>` for N substances
-- [ ] Update `ComposablePool::step()`: iterate over substances, apply modulations before channel current summation
-- [ ] Update existing presets to use `IntracellularSpec` internally
+**`hodgkin_huxley` top-level after this task:**
+`RegionalNetwork`, `NeuronModelSpec`, `SynapseSpec`, `WeightDistribution`, `ConnectivityPattern`, `GateSpec`, `ChannelSpec`, `KineticSynapseSpec`, `CalciumSpec`, `RecordingConfig`, `IzhikevichType`, `IntegrationMethod`, `DBSStimulator`, `PulseStimulator`, `NoiseInjector`, `BoltzmannParams`, `TauParams`, `TauForm`, `RateFuncParams`, `RateFuncForm`, `GateUpdateForm`, `GateDependency`, `KineticUpdateForm`, `KineticCurrentForm`, `analyze_beta_power`
 
-### Python Bindings
-- [ ] Bind `IntracellularDynamicsSpec`, `IntracellularModulation`, `IntracellularSpec`, `ModulationTarget`
-- [ ] Keep `CalciumSpec` as deprecated alias mapping to new system
-- [ ] Expose `NeuronModelSpec.add_intracellular()`
+*(Equation-definition types remain in top-level for now; moved to legacy in task13.)*
+
+**`hodgkin_huxley.legacy` after this task:**
+`HHNeuron`, `IzhikevichNeuron`, `Network`, `HHParameters`, `HHState`, `IzhikevichParameters`, `IzhikevichState`, `NetworkNeuronType`
+
+**Removed entirely:**
+`_simulate_into_buffers`, `_simulate_with_descriptors`, `add_hh_neuron()`, `add_izhikevich_neuron()`
+
+---
+
+## Implementation Checklist
+
+### Bindings / C++
+- [ ] Prefix `Network` as `_Network` in bindings (C++ class name unchanged)
+- [ ] Remove `add_hh_neuron()`, `add_izhikevich_neuron()`, `NetworkNeuronType` from public binding exports
+- [ ] Remove `_simulate_into_buffers` and `_simulate_with_descriptors` from public binding exports
+- [ ] Add `NeuronModelSpec.hh_default()` and `NeuronModelSpec.izhikevich(type)` static factory methods
+
+### Python Layer
+- [ ] Create `hodgkin_huxley/legacy.py` re-exporting `HHNeuron`, `IzhikevichNeuron`, `HHParameters`, `HHState`, `IzhikevichParameters`, `IzhikevichState`, `Network`, `NetworkNeuronType` with `DeprecationWarning`
+- [ ] Update `__init__.py` to the trimmed structural export list (keep equation types for now)
+- [ ] Unify `I_ext` dispatch in `RegionalNetwork.simulate()`: scalar / stimulator / 1D array per population dict → auto-route to descriptor or dense path
+- [ ] Remove legacy non-dict `I_ext` overloads from `RegionalNetwork.simulate()`
+
+### Downstream
+- [ ] Update all `examples/` to use `RegionalNetwork` and dict `I_ext`
+- [ ] Update `benchmarks/ctxbgth_model.py` to new structural API
 
 ### Tests
-- [ ] Verify calcium dynamics unchanged for all five existing presets
-- [ ] Test dopamine modulation: g_M_eff scales with dopamine concentration
-- [ ] Test Nernst pathway: E_nernst updates correctly for generalised substance
-- [ ] Test calcium-dependent gate still updates correctly via `intracellular_idx`
+- [ ] Test `NeuronModelSpec.hh_default()` and `NeuronModelSpec.izhikevich()` produce correct dynamics
+- [ ] Test that `from hodgkin_huxley.legacy import HHNeuron` raises `DeprecationWarning`
+- [ ] Test dict `I_ext` routing for scalar, stimulator, and 1D array forms
+- [ ] Verify all existing tests pass (or update imports to legacy path)

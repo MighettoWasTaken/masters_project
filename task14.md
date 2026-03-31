@@ -1,220 +1,182 @@
-# Task 14: CUDA GPU Acceleration
+# Task 14: Generalized Intracellular Dynamics
 
-## Priority: 3
+## Priority: 2 — Depends on task13 (ODE fields use SymPy expressions)
 
 ## Overview
 
-Add an optional CUDA backend for GPU-accelerated simulation of large networks (>1000 neurons). The CPU path (Eigen pools + SoA synapses) remains the default; CUDA activates only when explicitly requested or when the network exceeds a configurable threshold. The primary bottleneck at scale is the neuron pool `step()` function and synaptic current accumulation; these are the first targets for GPU offload.
-
-Expected speedup: 50–200× vs C++ CPU for networks >5000 neurons where memory bandwidth is not the bottleneck.
+Extend the current calcium-only intracellular tracking to a general-purpose system for arbitrary intracellular substances. Calcium is the only substance currently modeled; many biologically relevant phenomena require additional intracellular dynamics — notably dopamine (modulates M-current and plasticity in striatum), cAMP (second messenger), and IP3 (triggers calcium release from internal stores). The goal is a flexible `IntracellularSpec` system that makes calcium a special case of a broader mechanism, while preserving the existing calcium presets and pool performance.
 
 ---
 
-## 14.1 Architecture
+## 14.1 Current State
 
-### Build Configuration
+`CalciumSpec` in `ion_channels.hpp` handles one substance with two modes:
 
-CUDA support is opt-in at build time:
+- **Simple decay** (GPe/GPi): `d[Ca]/dt = epsilon * (-sum(I_sources) - K_Ca * Ca)`
+- **Nernst** (STN): same ODE + dynamic `E_Ca = (RT/zF) * ln(Ca_o / Ca)`
 
-```cmake
-option(USE_CUDA "Enable CUDA GPU backend" OFF)
-if(USE_CUDA)
-    enable_language(CUDA)
-    find_package(CUDAToolkit REQUIRED)
-    target_compile_definitions(hodgkin_huxley_core PRIVATE HH_USE_CUDA)
-endif()
-```
+`ComposablePool` maintains one `Eigen::ArrayXd Ca_` per pool and one `Eigen::ArrayXd E_Ca_` if Nernst is enabled. Calcium-dependent gates reference `Ca_` via `GateDependency::CALCIUM`.
 
-The Python package builds normally without CUDA; a separate `hodgkin_huxley_cuda` wheel can be distributed for GPU-capable environments.
+**Limitations:**
+- Hardcoded to one substance per neuron model
+- No mechanism for one substance to modulate another's dynamics
+- No way to express volume-transmitted modulators (dopamine, serotonin)
+- `GateDependency::CALCIUM` must be generalised to reference any substance
 
-### Backend Selection
+---
 
-```cpp
-enum class Backend { CPU, CUDA };
+## 14.2 Architecture
 
-// In Network:
-void set_backend(Backend b);  // explicit override
-Backend backend() const;
+### Core Principle
 
-// Auto-select threshold
-static constexpr size_t CUDA_AUTO_THRESHOLD = 1000; // neurons
-```
+Each `NeuronModelSpec` carries a list of `IntracellularSpec` objects. Each spec defines:
+1. **Dynamics**: how the substance concentration changes each step — expressed as a SymPy ODE (see task13)
+2. **Modulations**: what simulation parameters it adjusts (channel g, gate x_inf, gate tau)
+3. **Nernst expression**: optional SymPy expression computing E_rev from concentration
 
-### Pool Abstraction
+Calcium is expressed as an `IntracellularSpec` with a Nernst expression. All existing presets continue to work via updated factory functions.
 
-Introduce a `PoolBase` interface (currently implicit):
+### C++ Structs
 
 ```cpp
-class PoolBase {
-public:
-    virtual ~PoolBase() = default;
-    virtual void step(double dt,
-                      const double* I_ext,
-                      const double* I_syn,
-                      double* V_out,
-                      size_t n) = 0;
-    virtual void get_V(double* out) const = 0;
-    virtual void reset() = 0;
+/// Target types for concentration-dependent parameter modulation.
+enum class ModulationTarget {
+    CHANNEL_G_SCALE,      // g_eff = g * (1 + scale * X)
+    GATE_INF_SHIFT,       // x_inf evaluated at (V + scale * X)
+    GATE_TAU_SCALE,       // tau_eff = tau * (1 + scale * X)
+};
+
+/// A single modulation: substance X → parameter adjustment.
+struct IntracellularModulation {
+    int               substance_idx;  // index into NeuronModelSpec::intracellular
+    ModulationTarget  target;
+    int               target_idx;    // channel or gate index
+    double            scale;         // linear coefficient
+    // Note: non-linear modulations expressed via SymPy (task13) in future
+};
+
+/// Complete specification of one intracellular substance.
+/// ODE and Nernst expressions are SymPy expressions compiled via task13 codegen.
+struct IntracellularSpec {
+    std::string name;
+    double      initial;
+    // SymPy-compiled function pointers (set at first simulate() call)
+    CompiledFn  ode_fn;       // dX/dt = f(X, I_source_sum)
+    CompiledFn  nernst_fn;    // E_rev = g(X), optional
+    std::vector<int> source_channels;
+    std::vector<IntracellularModulation> modulations;
 };
 ```
 
-CPU pools (`HHPool`, `IzPool`, `ComposablePool`) implement this interface. CUDA pools (`CUDAHHPool`, `CUDAComposablePool`) provide equivalent GPU implementations.
+### NeuronModelSpec Changes
 
----
-
-## 14.2 CUDA Kernels
-
-### Neuron Pool Kernel (one thread per neuron)
-
-```cuda
-__global__ void hh_pool_step_kernel(
-    double* V, double* m, double* h, double* n,
-    const double* I_ext, const double* I_syn,
-    const HHParams params, double dt, size_t N)
-{
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    // RK4 step using registers — no shared memory needed
-    // (embarrassingly parallel; no dependencies between neurons)
-    // ...
-}
-```
-
-Grid configuration: `<<<(N + 255) / 256, 256>>>` — standard 1D grid.
-
-### Synaptic Current Accumulation
-
-The main challenge: multiple pre-synaptic neurons contribute to the same post-synaptic neuron's current. This requires parallel reduction with atomic operations.
-
-```cuda
-__global__ void isyn_accumulate_kernel(
-    const size_t* post, const double* g, const double* E_syn,
-    const double* V, double* I_syn, size_t n_synapses)
-{
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_synapses) return;
-    double contrib = g[i] * (V[post[i]] - E_syn[i]);
-    atomicAdd(&I_syn[post[i]], contrib);  // race condition: use atomicAdd
-}
-```
-
-Note: `atomicAdd` for `double` requires `sm_60` (Pascal) or newer. For older GPUs, fall back to segmented reduction.
-
-### Synapse Update Kernel
-
-Synapse conductance decay is embarrassingly parallel (no cross-neuron dependencies):
-
-```cuda
-__global__ void synapse_decay_kernel(
-    double* g, const double* decay_factors, size_t n_synapses)
-{
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_synapses) return;
-    g[i] *= decay_factors[i];  // pre-computed decay = exp(-dt/tau)
-}
-```
-
----
-
-## 14.3 Memory Management
-
-### Device Memory Layout
-
-All simulation state is transferred to device at simulation start; results transferred back at recording intervals or simulation end.
+Replace the single `CalciumSpec calcium` field:
 
 ```cpp
-class CUDASimContext {
-public:
-    CUDASimContext(size_t n_neurons, size_t n_synapses);
-    ~CUDASimContext();
+struct NeuronModelSpec {
+    std::string name;
+    double C_m = 1.0;
+    std::vector<GateSpec>          gates;
+    std::vector<ChannelSpec>       channels;
+    std::vector<IntracellularSpec> intracellular;  // replaces CalciumSpec
 
-    void upload_neuron_state(const NeuronState& state);
-    void upload_synapse_state(const SynArrays& sa);
-    void download_V(double* host_V);
-    void download_I_syn(double* host_I_syn);
+    // Index of substance providing reversal potential to Nernst channels (-1 = none)
+    int nernst_substance_idx = -1;
+};
+```
 
+### GateDependency Extension
+
+```cpp
+enum class GateDependency {
+    VOLTAGE,
+    INTRACELLULAR   // replaces CALCIUM; gate_spec.intracellular_idx selects which substance
+};
+
+struct GateSpec {
+    // ...existing fields...
+    GateDependency dependency      = GateDependency::VOLTAGE;
+    int            intracellular_idx = 0;  // which IntracellularSpec (ignored if VOLTAGE)
+};
+```
+
+With SymPy (task13), the dependency is inferred automatically from which symbols appear in the `inf` expression — if `hh.Ca` appears, it is `INTRACELLULAR` referencing the substance named "calcium".
+
+### ComposablePool Changes
+
+```cpp
+class ComposablePool {
 private:
-    double *d_V_, *d_m_, *d_h_, *d_n_;   // neuron state
-    double *d_g_;                          // synapse conductances
-    size_t *d_pre_, *d_post_;             // synapse connectivity
-    double *d_E_syn_, *d_decay_;          // synapse params
-    double *d_I_syn_;                     // accumulation buffer (zeroed each step)
-    double *d_I_ext_;                     // external current
+    // Per-substance state (one ArrayXd per IntracellularSpec in model)
+    std::vector<Eigen::ArrayXd> X_;        // concentrations
+    std::vector<Eigen::ArrayXd> E_nernst_; // Nernst reversals (if nernst_fn set)
 };
 ```
 
-### Transfer Strategy
-
-- **Upload once** at `simulate()` start
-- **Stay on device** throughout the hot loop
-- **Download** only when recording buffers require it (every `interval` steps)
-- Use `cudaMemcpyAsync` + streams for overlap with CPU post-processing of previous interval
+The `step()` function iterates over substances in model order, updating each with its compiled ODE function after channel currents are computed.
 
 ---
 
-## 14.4 Delay Buffers on GPU
+## 14.3 Backwards Compatibility
 
-Synaptic delays complicate the GPU path. Options:
-
-1. **Pre-transfer**: maintain spike history on CPU, transfer pre-synaptic spike vector to device each step (simple, low bandwidth cost for typical networks)
-2. **On-device ring buffer**: circular buffer in device memory per synapse (requires careful atomic index management)
-
-**Recommended starting point:** option 1. Transfer spike vectors CPU→GPU each step (N_neurons bytes = negligible). Implement option 2 only if profiling shows this is a bottleneck.
+`CalciumSpec` is kept as a Python-level convenience builder that constructs the equivalent `IntracellularSpec`. All five existing presets (`thalamic()`, `stn()`, `gpe()`, `gpi()`, `striatum()`) are updated internally; their Python-facing API is unchanged.
 
 ---
 
-## 14.5 Python API
-
-No user-facing API change is required for auto-selected backend:
+## 14.4 New Use Case: Dopamine Modulation
 
 ```python
-# Auto-select (GPU if N > 1000 and CUDA available)
-net = RegionalNetwork()
-net.add_population("STN", 5000, NeuronModelSpec.stn())
-# ... network builds normally ...
-result = net.simulate(2000.0, 0.01, ...)  # transparently uses GPU
+Ca, I_src = hh.Ca, hh.I_source
 
-# Explicit override
-net.set_backend("cuda")   # force GPU
-net.set_backend("cpu")    # force CPU
-print(net.backend())      # "cuda" or "cpu"
+# Calcium (standard Nernst mode)
+calcium = hh.IntracellularSpec(
+    name="calcium",
+    ode=1e-4 * (-I_src - 2e-3 * Ca),
+    source_channels=["L_Ca", "T_Ca"],
+    nernst=8314*298/(2*96485) * log(2000 / Ca),
+    initial=0.005
+)
+
+# Dopamine: externally driven, decays slowly, modulates Str M-channel
+DA = hh.symbols("DA")
+dopamine = hh.IntracellularSpec(
+    name="dopamine",
+    ode=-0.01 * DA,          # simple first-order decay; no channel source
+    source_channels=[],
+    initial=1.0,
+    modulations=[
+        hh.IntracellularModulation(
+            substance="dopamine",
+            target=hh.ModulationTarget.CHANNEL_G_SCALE,
+            channel="M",
+            scale=-1.1        # g_M_eff = g_M * (1 + (-1.1) * [DA])
+        )
+    ]
+)
+
+str_model.add_intracellular(calcium)
+str_model.add_intracellular(dopamine)
 ```
 
 ---
 
-## 14.6 Limitations and Non-Goals
+## 14.5 Implementation Checklist
 
-- CUDA support is a separate build option; the default CPU build is unaffected
-- Windows CUDA Toolkit requires MSVC + separate nvcc compiler; document setup carefully
-- Mixed-precision (float32 for pools, float64 for accumulation) is out of scope for first implementation
-- Multi-GPU is out of scope
+### C++ Core
+- [ ] Define `IntracellularModulation`, `IntracellularSpec`, `ModulationTarget` in `ion_channels.hpp`
+- [ ] Replace `CalciumSpec calcium` in `NeuronModelSpec` with `std::vector<IntracellularSpec> intracellular`
+- [ ] Update `GateDependency::CALCIUM` → `GateDependency::INTRACELLULAR` + `intracellular_idx` in `GateSpec`
+- [ ] Update `ComposablePool`: replace `Ca_` / `E_Ca_` with `std::vector<Eigen::ArrayXd>` for N substances
+- [ ] Update `ComposablePool::step()`: iterate over substances, apply modulations before channel current summation
+- [ ] Update existing presets to use `IntracellularSpec` internally
 
----
-
-## 14.7 Implementation Checklist
-
-### Build System
-- [ ] Add `USE_CUDA` CMake option with proper `enable_language(CUDA)` guard
-- [ ] Separate compilation: `.cu` files compiled with nvcc, `.cpp` files with host compiler
-- [ ] CI: add optional CUDA build job (skip on machines without GPU)
-
-### C++ Abstraction
-- [ ] Define `PoolBase` virtual interface
-- [ ] Refactor `HHPool`, `IzPool`, `ComposablePool` to implement `PoolBase`
-- [ ] Add `Backend` enum and `Network::set_backend()` / `Network::backend()`
-
-### CUDA Kernels
-- [ ] Implement `hh_pool_step_kernel` (Euler first, RK4 later)
-- [ ] Implement `isyn_accumulate_kernel` with atomicAdd
-- [ ] Implement `synapse_decay_kernel` for exponential synapses
-- [ ] Implement `CUDASimContext` with upload/download methods
-
-### Integration
-- [ ] `Network::simulate_with_descriptors()`: dispatch to CUDA path when backend=CUDA
-- [ ] Recording download: async transfer every `interval` steps
-- [ ] Delay handling: CPU-managed spike vectors uploaded each step
+### Python Bindings
+- [ ] Bind `IntracellularModulation`, `IntracellularSpec`, `ModulationTarget`
+- [ ] Keep `CalciumSpec` as deprecated alias mapping to new system
+- [ ] Expose `NeuronModelSpec.add_intracellular()`
 
 ### Tests
-- [ ] Verify CPU and CUDA produce identical voltage traces for HH neuron (small network)
-- [ ] Verify synaptic transmission accuracy (spike propagation) on GPU
-- [ ] Benchmark: measure speedup at N=100, 1000, 5000, 10000 neurons
+- [ ] Verify calcium dynamics unchanged for all five existing presets
+- [ ] Test dopamine modulation: g_M_eff scales with dopamine concentration
+- [ ] Test Nernst pathway: E_nernst updates correctly for generalised substance
+- [ ] Test calcium-dependent gate still updates correctly via `intracellular_idx`

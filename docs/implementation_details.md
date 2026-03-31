@@ -97,9 +97,9 @@ class NeuronBase {
 
 **Presets** (static factories on `NeuronModelSpec`): `thalamic()`, `stn()`, `gpe()`, `gpi()`, `striatum(pd_factor)`.
 
-**Future change (task 12):** `CalciumSpec` will be replaced by `std::vector<IntracellularSpec>` to support arbitrary intracellular substances. Calcium becomes a special case.
+**Future change (task13):** `TauParams` and `RateFuncParams` will switch from positional `params[8]` arrays to SymPy expressions. Legacy types move to `hodgkin_huxley.legacy`.
 
-**Future change (task 16):** `TauParams` and `RateFuncParams` will switch from positional `params[8]` arrays to named nested structs with `std::variant`.
+**Future change (task14):** `CalciumSpec` will be replaced by `std::vector<IntracellularSpec>` to support arbitrary intracellular substances. Calcium becomes a special case.
 
 ---
 
@@ -135,7 +135,7 @@ Eigen::ArrayXd E_Ca_;                  // if CalciumSpec::use_nernst
 4. `V += dt * (-I_total + I_ext + I_syn) / C_m`
 5. Update calcium if enabled; recompute E_Ca if Nernst
 
-**Future change (task 12):** Replace `Ca_` / `E_Ca_` with `vector<ArrayXd> X_` and `vector<ArrayXd> E_nernst_` for N substances.
+**Future change (task14):** Replace `Ca_` / `E_Ca_` with `vector<ArrayXd> X_` and `vector<ArrayXd> E_nernst_` for N substances.
 
 ---
 
@@ -225,9 +225,11 @@ syn_groups_: type-separated index lists (exp, alpha, dexp, kinetic)
 
 **Lazy sync:** `SynArrays` (SoA) is the authoritative state during simulation. `SynapseBase` objects are synced lazily on `synapse(idx)` access (`soa_dirty_` flag). Avoids copying conductance values on every step.
 
-**Future change (task 15):** `step()` pool loops will gain `#pragma omp parallel for`; I_syn accumulation will need thread-local partial sums or atomics.
+**Future change (task16):** `step()` pool loops will gain `#pragma omp parallel for`; I_syn accumulation will need thread-local partial sums or atomics.
 
-**Future change (task 14):** `set_backend(CUDA)` will route pool `step()` to CUDA kernels.
+**Future change (task17):** `to(Device)` will route pool `step()` to CUDA kernels when `device().type == CUDA`.
+
+**Future change (task20):** `simulate_with_descriptors()` will preserve pool and synapse state across calls (persistent by default). A `SimulationState` struct (`get_state()` / `set_state()` / `reset_state()`) will enable `state_dict()` / `load_state_dict()` and pickle support. Decay factors and synapse groups will be cached via `groups_dirty_` / `decay_dirty_` flags to avoid redundant rebuilds on repeated calls.
 
 ---
 
@@ -246,7 +248,9 @@ map<string, size_t> pop_index_;   // name → index in populations_
 
 **Stimulation routing (Python layer):** `RegionalNetwork.simulate()` (Python) auto-selects descriptor vs dense path based on whether all I_ext values are scalars and all stimulators are `DBSStimulator`.
 
-**Future change (task 17):** `Network` will be prefixed `_Network` and removed from public API; `RegionalNetwork` becomes the sole public network class.
+**Future change (task12):** `Network` will be prefixed `_Network` and removed from public API; `RegionalNetwork` becomes the sole public network class.
+
+**Future change (task19):** `device_map_` will track per-population device assignment; `simulate()` will dispatch to `MultiDeviceSimContext` when > 1 unique device is present.
 
 ---
 
@@ -262,7 +266,7 @@ map<string, size_t> pop_index_;   // name → index in populations_
 
 ### `src/hodgkin_huxley/__init__.py`
 
-Re-exports all public symbols from `_core` (pybind11 extension) plus Python-native utilities. `__all__` controls what appears on `from hodgkin_huxley import *`. Currently exports ~50 symbols; task 17 will trim this to the core workflow set.
+Re-exports all public symbols from `_core` (pybind11 extension) plus Python-native utilities. `__all__` controls what appears on `from hodgkin_huxley import *`. Currently exports ~50 symbols; task12 will trim this to the core workflow set.
 
 ### `recording.py`
 
@@ -328,6 +332,20 @@ This eliminates the 128 MB allocation that was the dominant memory cost for the 
 
 During simulation, SoA is the ground truth. The polymorphic synapse objects are not updated on every step. The `soa_dirty_` flag is set after simulation; accessing `network.synapse(idx)` triggers a one-time sync pass. This avoids O(n_synapses) copy overhead on every step.
 
+### 6. Device Model (task17+)
+
+Following PyTorch conventions, compute devices are represented by a `Device` struct:
+
+```cpp
+struct Device {
+    enum class Type { CPU, CUDA };
+    Type type  = Type::CPU;
+    int  index = 0;   // CUDA device index
+};
+```
+
+`Network::to(device)` moves all pool state to the target device. For multi-GPU simulation (task19), `RegionalNetwork::assign(population, device)` maps individual populations to devices; the `SpikeTransport` abstraction (task16) handles inter-device spike delivery without changing the delay-decomposition algorithm.
+
 ---
 
 ## Data Flow: Simulation
@@ -360,13 +378,17 @@ Python: net.simulate(duration, dt, I_ext, recording)
 
 | Issue | Impact | Resolution |
 |-------|--------|------------|
-| `TauParams` uses positional `double params[8]` | Poor readability | task16: named structs |
-| `CalciumSpec` supports only calcium | Cannot model dopamine, cAMP etc. | task12: generalized intracellular |
-| Multiple overlapping neuron-add APIs | Confusing entry points | task17: API streamlining |
-| Single-threaded hot loop | Limits large-N performance | task15: OpenMP |
-| No GPU support | Limits N>5000 simulations | task14: CUDA |
+| `TauParams` uses positional `double params[8]` | Poor readability | task13: SymPy equation system |
+| `CalciumSpec` supports only calcium | Cannot model dopamine, cAMP etc. | task14: generalized intracellular |
+| Multiple overlapping neuron-add APIs | Confusing entry points | task12: API streamlining |
+| Single-threaded hot loop | Limits large-N performance | task16: OpenMP |
+| No GPU support | Limits N>5000 simulations | task17: CUDA |
+| No multi-GPU support | Limits extremely large models (N>50,000) | task19: Multi-GPU (CUDA P2P / NCCL) |
 | RK45 adaptive integration incomplete | Stiff systems require tiny fixed dt | Low priority; RK4 at dt=0.01 ms is sufficient |
-| No plasticity | Weights are fixed at init | task13: STDP, STP |
+| No plasticity | Weights are fixed at init | task15: STDP, STP |
+| `simulate()` resets state each call | Cannot continue simulation across calls | task20: continuable simulations |
+| No pickle / deepcopy support | Blocks multiprocessing parameter sweeps | task20: `__getstate__` / `__setstate__` |
+| No ML tensor export | Manual conversion required for PyTorch/TF | task20: `to_torch()`, `to_tensorflow()`, sparse spike tensors |
 | No web documentation | Onboarding friction | task18: MkDocs site |
 
 ---
@@ -390,7 +412,7 @@ Python: net.simulate(duration, dt, I_ext, recording)
 5. Add to `syn_groups_` in `Network::build_synapse_groups()`
 6. Bind in `bindings.cpp` and test
 
-### Adding a New Intracellular Substance (after task 12)
+### Adding a New Intracellular Substance (after task14)
 
 1. Create an `IntracellularSpec` with the substance dynamics and modulation targets
 2. Add it to the `NeuronModelSpec` via `model.add_intracellular(spec)`
