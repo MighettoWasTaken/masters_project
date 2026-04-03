@@ -205,8 +205,8 @@ PYBIND11_MODULE(_core, m) {
         .value("GABA_A", Network::ReceptorType::GABA_A)
         .export_values();
 
-    // Network::NeuronType enum
-    py::enum_<Network::NeuronType>(m, "NetworkNeuronType")
+    // Network::NeuronType enum — internal; exposed as _NetworkNeuronType
+    py::enum_<Network::NeuronType>(m, "_NetworkNeuronType")
         .value("HH", Network::NeuronType::HH)
         .value("IZHIKEVICH_RS", Network::NeuronType::IZHIKEVICH_RS)
         .value("IZHIKEVICH_FS", Network::NeuronType::IZHIKEVICH_FS)
@@ -217,7 +217,7 @@ PYBIND11_MODULE(_core, m) {
         .value("COMPOSABLE", Network::NeuronType::COMPOSABLE)
         .export_values();
 
-    auto netCls = py::class_<Network>(m, "Network")
+    auto netCls = py::class_<Network>(m, "_Network")
         .def(py::init<>(), "Create an empty network")
         .def(py::init<size_t>(), "Create a network with n HH neurons", py::arg("num_neurons"))
         .def(py::init<size_t, Network::NeuronType>(),
@@ -244,23 +244,6 @@ PYBIND11_MODULE(_core, m) {
              py::overload_cast<const NeuronModelSpec&>(&Network::add_neuron),
              "Add a composable neuron from a model spec, returns index",
              py::arg("spec"))
-
-        // Explicit typed add methods
-        .def("add_hh_neuron",
-             py::overload_cast<>(&Network::add_hh_neuron),
-             "Add a HH neuron with default parameters")
-        .def("add_hh_neuron",
-             py::overload_cast<const HHNeuron::Parameters&>(&Network::add_hh_neuron),
-             "Add a HH neuron with custom parameters",
-             py::arg("parameters"))
-        .def("add_izhikevich_neuron",
-             py::overload_cast<IzhikevichNeuron::Type>(&Network::add_izhikevich_neuron),
-             "Add an Izhikevich neuron with preset type",
-             py::arg("type") = IzhikevichNeuron::Type::REGULAR_SPIKING)
-        .def("add_izhikevich_neuron",
-             py::overload_cast<const IzhikevichNeuron::Parameters&>(&Network::add_izhikevich_neuron),
-             "Add an Izhikevich neuron with custom parameters",
-             py::arg("parameters"))
 
         // Synapses
         .def("add_synapse", &Network::add_synapse,
@@ -352,6 +335,7 @@ PYBIND11_MODULE(_core, m) {
                py::array_t<double> V_buf,
                py::array_t<double> gate_buf,
                py::array_t<double> calcium_buf,
+               py::array_t<double> u_buf,
                py::array_t<double> g_syn_buf,
                py::array_t<double> I_syn_buf,
                py::array_t<double> spike_event_buf,
@@ -373,6 +357,7 @@ PYBIND11_MODULE(_core, m) {
                     V_buf.size()            ? V_buf.mutable_data()            : nullptr,
                     gate_buf.size()         ? gate_buf.mutable_data()         : nullptr, max_gates,
                     calcium_buf.size()      ? calcium_buf.mutable_data()      : nullptr,
+                    u_buf.size()            ? u_buf.mutable_data()            : nullptr,
                     g_syn_buf.size()        ? g_syn_buf.mutable_data()        : nullptr,
                     I_syn_buf.size()        ? I_syn_buf.mutable_data()        : nullptr,
                     spike_event_buf.size()  ? spike_event_buf.mutable_data()  : nullptr,
@@ -380,8 +365,9 @@ PYBIND11_MODULE(_core, m) {
             },
             py::arg("duration"), py::arg("dt"), py::arg("I_ext"),
             py::arg("V_buf"), py::arg("gate_buf"), py::arg("calcium_buf"),
-            py::arg("g_syn_buf"), py::arg("I_syn_buf"), py::arg("spike_event_buf"),
-            py::arg("interval"), py::arg("spike_threshold") = 0.0)
+            py::arg("u_buf"), py::arg("g_syn_buf"), py::arg("I_syn_buf"),
+            py::arg("spike_event_buf"), py::arg("interval"),
+            py::arg("spike_threshold") = 0.0)
 
         // Descriptor-based simulation (avoids dense I_ext matrix)
         // I_const:   (n_neurons,) float64 — per-neuron constant baseline
@@ -395,6 +381,7 @@ PYBIND11_MODULE(_core, m) {
                py::array_t<double> V_buf,
                py::array_t<double> gate_buf,
                py::array_t<double> calcium_buf,
+               py::array_t<double> u_buf,
                py::array_t<double> g_syn_buf,
                py::array_t<double> I_syn_buf,
                py::array_t<double> spike_event_buf,
@@ -423,6 +410,7 @@ PYBIND11_MODULE(_core, m) {
                     V_buf.size()           ? V_buf.mutable_data()           : nullptr,
                     gate_buf.size()        ? gate_buf.mutable_data()        : nullptr, max_gates,
                     calcium_buf.size()     ? calcium_buf.mutable_data()     : nullptr,
+                    u_buf.size()           ? u_buf.mutable_data()           : nullptr,
                     g_syn_buf.size()       ? g_syn_buf.mutable_data()       : nullptr,
                     I_syn_buf.size()       ? I_syn_buf.mutable_data()       : nullptr,
                     spike_event_buf.size() ? spike_event_buf.mutable_data() : nullptr,
@@ -431,8 +419,9 @@ PYBIND11_MODULE(_core, m) {
             py::arg("duration"), py::arg("dt"), py::arg("I_const"),
             py::arg("pulses"), py::arg("dbs_events"),
             py::arg("V_buf"), py::arg("gate_buf"), py::arg("calcium_buf"),
-            py::arg("g_syn_buf"), py::arg("I_syn_buf"), py::arg("spike_event_buf"),
-            py::arg("interval"), py::arg("spike_threshold") = 0.0)
+            py::arg("u_buf"), py::arg("g_syn_buf"), py::arg("I_syn_buf"),
+            py::arg("spike_event_buf"), py::arg("interval"),
+            py::arg("spike_threshold") = 0.0)
 
         // Python special methods
         .def("__repr__", [](const Network& net) {
@@ -727,11 +716,20 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("gates", &NeuronModelSpec::gates)
         .def_readwrite("channels", &NeuronModelSpec::channels)
         .def_readwrite("calcium", &NeuronModelSpec::calcium)
-        .def_static("thalamic", &NeuronModelSpec::thalamic)
-        .def_static("stn", &NeuronModelSpec::stn)
-        .def_static("gpe", &NeuronModelSpec::gpe)
-        .def_static("gpi", &NeuronModelSpec::gpi)
-        .def_static("striatum", &NeuronModelSpec::striatum, py::arg("pd") = 0.0)
+        .def_static("hh_default", &NeuronModelSpec::hh_default,
+                    "Classic Hodgkin-Huxley squid axon model (Na, K, Leak channels)")
+        .def_static("izhikevich",
+                    py::overload_cast<IzhikevichNeuron::Type>(&NeuronModelSpec::izhikevich),
+                    "Izhikevich spiking neuron with preset type",
+                    py::arg("type") = IzhikevichNeuron::Type::REGULAR_SPIKING)
+        .def_static("izhikevich",
+                    py::overload_cast<const IzhikevichNeuron::Parameters&>(&NeuronModelSpec::izhikevich),
+                    "Izhikevich spiking neuron with custom parameters",
+                    py::arg("parameters"))
+        .def_readwrite("is_izhikevich", &NeuronModelSpec::is_izhikevich,
+                       "True when this spec represents an Izhikevich neuron")
+        .def_readwrite("iz_params", &NeuronModelSpec::iz_params,
+                       "Izhikevich parameters (only valid when is_izhikevich=True)")
         .def("validate", &NeuronModelSpec::validate,
              "Validate spec — raises ValueError on structural errors")
         .def("__copy__",  [](const NeuronModelSpec& s) { return NeuronModelSpec(s); })

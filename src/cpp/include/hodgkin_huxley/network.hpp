@@ -1,14 +1,15 @@
 #pragma once
 
-#include "neuron_base.hpp"
-#include "neuron.hpp"
-#include "izhikevich.hpp"
-#include "synapse.hpp"
-#include "hh_pool.hpp"
-#include "iz_pool.hpp"
-#include "composable_neuron.hpp"
-#include "composable_pool.hpp"
-#include "ion_channels.hpp"
+#include "hodgkin_huxley/neuron_base.hpp"
+#include "hodgkin_huxley/neuron.hpp"
+#include "hodgkin_huxley/izhikevich.hpp"
+#include "hodgkin_huxley/synapse.hpp"
+#include "hodgkin_huxley/hh_pool.hpp"
+#include "hodgkin_huxley/iz_pool.hpp"
+#include "hodgkin_huxley/composable_neuron.hpp"
+#include "hodgkin_huxley/composable_pool.hpp"
+#include "hodgkin_huxley/ion_channels.hpp"
+#include "hodgkin_huxley/network/pool_manager.hpp"
 #include <vector>
 #include <memory>
 #include <string>
@@ -206,6 +207,7 @@ public:
     //   V_buf:       (n_neurons, n_rec)
     //   gate_buf:    (n_neurons, max_gates, n_rec)
     //   calcium_buf: (n_neurons, n_rec)
+    //   u_buf:       (n_neurons, n_rec) — Izhikevich recovery variable; 0 for non-Iz neurons
     //   g_syn_buf:   (n_synapses, n_rec)
     //   I_syn_buf:   (n_neurons, n_rec)
     void simulate_into_buffers(
@@ -214,6 +216,7 @@ public:
         double* V_buf,
         double* gate_buf,   size_t max_gates,
         double* calcium_buf,
+        double* u_buf,
         double* g_syn_buf,
         double* I_syn_buf,
         double* spike_event_buf,  // (n_neurons, n_rec): synapse-detected spike counts per interval
@@ -231,6 +234,7 @@ public:
         double* V_buf,
         double* gate_buf,       size_t max_gates,
         double* calcium_buf,
+        double* u_buf,
         double* g_syn_buf,
         double* I_syn_buf,
         double* spike_event_buf,
@@ -338,6 +342,11 @@ private:
     bool soa_sorted_ = false;
 
     bool groups_built_ = false;
+
+    // Batched neuron pools — owned across simulate() calls for task20 continuable sims.
+    // pools_dirty_ = true forces rebuild from API neuron state on next simulate().
+    PoolManager pool_mgr_;
+    bool pools_dirty_ = true;
 
     void cache_voltages();
     void ensure_buffers();

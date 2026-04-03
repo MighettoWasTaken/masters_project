@@ -3,7 +3,7 @@
 
 import time
 import numpy as np
-from hodgkin_huxley import Network
+from hodgkin_huxley import RegionalNetwork, SynapseSpec
 
 # Import the benchmark helpers
 import sys, os
@@ -19,18 +19,18 @@ num_steps = int(duration / dt)
 
 def bench(label, synapses, trials=3):
     actual_s = len(synapses)
-    net = Network(N)
-    for pre, post, w, e, tau in synapses:
-        net.add_synapse(pre, post, w, e, tau)
     I_ext = np.full((N, num_steps), I_val)
+    pairs = [(s[0], s[1]) for s in synapses]
+    w, e, tau = synapses[0][2], synapses[0][3], synapses[0][4]
 
     times = []
     for _ in range(trials):
-        net_t = Network(N)
-        for pre, post, w, e, tau in synapses:
-            net_t.add_synapse(pre, post, w, e, tau)
+        rn = RegionalNetwork()
+        rn.add_population("E", N)
+        rn.connect("E", "E", lambda ns, nd: pairs, weight=w,
+                   synapse=SynapseSpec.exponential(E_syn=e, tau=tau))
         start = time.perf_counter()
-        net_t.simulate(duration, dt, I_ext)
+        rn.simulate(duration, dt, {"E": I_ext})
         times.append(time.perf_counter() - start)
 
     print(f"  {label:>30s}  synapses={actual_s:>6d}  "

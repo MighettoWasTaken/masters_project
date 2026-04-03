@@ -11,7 +11,7 @@ import numpy as np
 from typing import Any
 from dataclasses import dataclass, field
 
-from ._core import Network as _Network
+from ._core import _Network as _Network
 
 
 # =============================================================================
@@ -89,7 +89,7 @@ class RecordingConfig:
 
     @classmethod
     def all_neuron_metrics(cls, interval=1, neurons="all"):
-        return cls(["V", "gates", "calcium", "spikes", "firing_rate", "mean_V",
+        return cls(["V", "gates", "calcium", "u", "spikes", "firing_rate", "mean_V",
                     "ISI_mean", "ISI_cv"], neurons, interval)
 
     @classmethod
@@ -175,7 +175,7 @@ class MetricsResult:
 class PopulationMetricsResult:
     """Dict-like by population name; each value is a MetricsResult."""
 
-    _PER_NEURON_KEYS = frozenset(["V", "gates", "calcium", "I_syn", "spikes",
+    _PER_NEURON_KEYS = frozenset(["V", "gates", "calcium", "u", "I_syn", "spikes",
                                    "spike_count", "firing_rate", "mean_V",
                                    "ISI_mean", "ISI_cv", "spike_events"])
 
@@ -362,6 +362,7 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
     need_V       = config.needs_V()
     need_gates   = "gates"        in metrics
     need_calcium = "calcium"      in metrics
+    need_u       = "u"            in metrics
     need_g_syn   = "g_syn"        in metrics
     need_I_syn   = "I_syn"        in metrics
     need_sevents = "spike_events" in metrics
@@ -375,6 +376,7 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
     V_buf            = alloc((n_neurons, n_rec)            if need_V       else ())
     gate_buf         = alloc((n_neurons, max_gates, n_rec) if need_gates   else ())
     calcium_buf      = alloc((n_neurons, n_rec)            if need_calcium else ())
+    u_buf            = alloc((n_neurons, n_rec)            if need_u       else ())
     g_syn_buf        = alloc((n_synapses, n_rec)           if need_g_syn   else ())
     I_syn_buf        = alloc((n_neurons, n_rec)            if need_I_syn   else ())
     spike_event_buf  = alloc((n_neurons, n_rec)            if need_sevents else ())
@@ -385,13 +387,13 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
         network_core._simulate_with_descriptors(
             duration, dt, stim_plan.I_const,
             stim_plan.pulses, stim_plan.dbs,
-            V_buf, gate_buf, calcium_buf, g_syn_buf, I_syn_buf, spike_event_buf,
-            interval, det_thresh)
+            V_buf, gate_buf, calcium_buf, u_buf, g_syn_buf, I_syn_buf,
+            spike_event_buf, interval, det_thresh)
     else:
         network_core._simulate_into_buffers(
             duration, dt, I_ext_list,
-            V_buf, gate_buf, calcium_buf, g_syn_buf, I_syn_buf, spike_event_buf,
-            interval, det_thresh)
+            V_buf, gate_buf, calcium_buf, u_buf, g_syn_buf, I_syn_buf,
+            spike_event_buf, interval, det_thresh)
 
     # Neuron selection
     selected = _resolve_neuron_indices(config.neurons, n_neurons, pop_info)
@@ -401,6 +403,7 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
     if "V" in metrics:        data["V"]            = V_buf[selected]
     if need_gates:            data["gates"]        = gate_buf[selected]
     if need_calcium:          data["calcium"]      = calcium_buf[selected]
+    if need_u:                data["u"]            = u_buf[selected]
     if need_g_syn:            data["g_syn"]        = g_syn_buf
     if need_I_syn:            data["I_syn"]        = I_syn_buf[selected]
     if need_sevents:          data["spike_events"] = spike_event_buf[selected]

@@ -1,14 +1,15 @@
 #pragma once
 
-#include "ion_channels.hpp"
-#include "neuron_base.hpp"
+#include "hodgkin_huxley/ion_channels.hpp"
+#include "hodgkin_huxley/neuron_base.hpp"
+#include "hodgkin_huxley/pool/pool_base.hpp"
 #include <Eigen/Core>
 #include <vector>
 #include <memory>
 
 namespace hodgkin_huxley {
 
-class ComposablePool {
+class ComposablePool : public PoolBase {
 public:
     ComposablePool() = default;
     explicit ComposablePool(const NeuronModelSpec& model, size_t capacity, bool fast_math = true);
@@ -16,23 +17,24 @@ public:
     void add(size_t network_idx, double V_init,
              const std::vector<double>& gate_inits, double Ca_init);
 
-    size_t size() const { return N_; }
+    size_t size() const override { return N_; }
     bool empty() const { return N_ == 0; }
     size_t network_idx(size_t pool_idx) const { return net_idx_[pool_idx]; }
 
-    void scatter_voltages(double* V_buf) const;
-    void gather_currents(const double* I_buf);
-    void step(double dt);
-    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const;
+    void scatter_voltages(double* V_buf) const override;
+    void gather_currents(const double* I_buf) override;
+    void step(double dt) override;
+    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const override;
 
     // Write gate_states_[g][i] into buf[net_idx_[i] * max_gates * n_rec + g * n_rec + t_rec]
     void scatter_gate_states_into(double* buf, size_t max_gates,
-                                   size_t n_rec, size_t t_rec) const;
+                                   size_t n_rec, size_t t_rec) const override;
 
     // Write Ca_[i] into buf[net_idx_[i] * n_rec + t_rec]
-    void scatter_calcium_into(double* buf, size_t n_rec, size_t t_rec) const;
+    void scatter_calcium_into(double* buf, size_t n_rec, size_t t_rec) const override;
 
-    size_t n_gates() const { return model_.gates.size(); }
+    int    n_gates() const override { return static_cast<int>(model_.gates.size()); }
+    bool   has_calcium() const override { return model_.calcium.enabled; }
 
     const NeuronModelSpec& model() const { return model_; }
 
@@ -53,14 +55,8 @@ private:
     // Pre-allocated temporaries (resized to N_)
     Eigen::ArrayXd I_total_, tmp_, tmp2_;
 
-    // Helpers (work on full ArrayXd, no head())
-    static Eigen::ArrayXd boltzmann_vec(const Eigen::ArrayXd& x, const BoltzmannParams& p);
-    static Eigen::ArrayXd compute_tau_vec(const Eigen::ArrayXd& V, const TauParams& tau,
-                                           Eigen::ArrayXd& tmp);
-    static Eigen::ArrayXd compute_rate_vec(const Eigen::ArrayXd& V, const RateFuncParams& rate,
-                                            Eigen::ArrayXd& tmp);
-
     Eigen::ArrayXd tmp_exp_r_;
+    // fast_exp wraps hodgkin_huxley::fast_exp using tmp_exp_r_ as scratch
     void fast_exp(const Eigen::ArrayXd& src, Eigen::ArrayXd& dst);
 
     // Called after last add() to trim arrays to N_

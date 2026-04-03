@@ -10,8 +10,22 @@ This document is the primary architectural reference for the project. It describ
 Masters Project/
 ├── src/
 │   ├── cpp/
-│   │   ├── include/hodgkin_huxley/   ← C++ headers (public interface)
-│   │   └── src/                      ← C++ implementation files
+│   │   ├── include/hodgkin_huxley/
+│   │   │   ├── model/               ← spec + kinetics headers (split from ion_channels.hpp)
+│   │   │   │   ├── gate_spec.hpp
+│   │   │   │   ├── channel_spec.hpp
+│   │   │   │   ├── synapse_spec.hpp
+│   │   │   │   ├── neuron_spec.hpp
+│   │   │   │   └── kinetics.hpp     ← single authoritative math (scalar + vec + fast_exp)
+│   │   │   ├── pool/
+│   │   │   │   └── pool_base.hpp    ← abstract pool interface (PoolBase)
+│   │   │   ├── network/
+│   │   │   │   └── pool_manager.hpp ← owns HHPool + IzPool + ComposablePools
+│   │   │   └── [other existing headers]
+│   │   └── src/
+│   │       ├── network/
+│   │       │   └── pool_manager.cpp
+│   │       └── [other existing .cpp files]
 │   ├── python/
 │   │   └── bindings.cpp              ← pybind11 glue layer
 │   └── hodgkin_huxley/               ← Python package
@@ -21,6 +35,7 @@ Masters Project/
 │       ├── pulse.py                  ← PulseStimulator
 │       └── noise.py                  ← NoiseInjector
 ├── tests/python/                     ← pytest test suite (15 files)
+│   └── neuron_specs.py              ← circuit-specific NeuronModelSpec builders
 ├── benchmarks/                       ← CTX-BG-TH model + comparison scripts
 ├── examples/                         ← usage examples
 ├── completed/                        ← finished task files (task1–11)
@@ -79,25 +94,46 @@ class NeuronBase {
 
 ---
 
-### `ion_channels.hpp` (Composable System Specs)
+### `ion_channels.hpp` (Umbrella re-export header)
 
-**Role:** Data structs defining parameterized gate kinetics and ion channels. These are **pure data** — no computation happens here. Computation is in the pools.
+**Role:** Thin backwards-compatible umbrella. Re-exports all types and math functions from the `model/` sub-headers so that existing `#include "ion_channels.hpp"` sites continue to compile without change.
 
-**Key types:**
+**Content:** `#include model/gate_spec.hpp`, `channel_spec.hpp`, `synapse_spec.hpp`, `neuron_spec.hpp`, `kinetics.hpp`
 
-| Type | Purpose |
-|------|---------|
-| `BoltzmannParams` | Steady-state x_inf: `1/(1+exp(-(V-v_half)/k))` |
-| `TauParams` | Time constant tau_x: 6 forms (CONSTANT, BOLTZMANN, DOUBLE_EXP_SUM, OFFSET_DOUBLE_EXP, SCALED_EXP, COMPOUND_AB) |
-| `RateFuncParams` | Alpha/beta rate functions: 4 forms (LINEAR_OVER_EXP, EXP_DECAY, LINEAR_OVER_EXPM1, SIGMOID) |
-| `GateSpec` | One gating variable: update form (INF_TAU / ALPHA_BETA / INSTANT / DERIVED), dependency (VOLTAGE / CALCIUM), kinetic params |
-| `ChannelSpec` | One ion channel: maximal conductance, reversal potential, gate power list, AHP flag |
-| `CalciumSpec` | Calcium dynamics: simple decay or Nernst mode, source channel list |
-| `NeuronModelSpec` | Complete model: C_m, list of GateSpecs, list of ChannelSpecs, CalciumSpec |
+---
 
-**Presets** (static factories on `NeuronModelSpec`): `thalamic()`, `stn()`, `gpe()`, `gpi()`, `striatum(pd_factor)`.
+### `model/gate_spec.hpp` · `model/channel_spec.hpp` · `model/synapse_spec.hpp` · `model/neuron_spec.hpp`
 
-**Future change (task13):** `TauParams` and `RateFuncParams` will switch from positional `params[8]` arrays to SymPy expressions. Legacy types move to `hodgkin_huxley.legacy`.
+**Role:** Pure data structs — no computation. Split out of the former monolithic `ion_channels.hpp`.
+
+| Header | Types |
+|--------|-------|
+| `gate_spec.hpp` | `BoltzmannParams`, `TauParams` (6 forms), `RateFuncParams` (4 forms), `GateSpec`, `CalciumSpec` |
+| `channel_spec.hpp` | `ChannelSpec` |
+| `synapse_spec.hpp` | `KineticSynapseSpec` + presets (`gaba_kinetic`, `nmda_kinetic`, `gaba_b`) |
+| `neuron_spec.hpp` | `NeuronModelSpec` + static presets (`hh_default`, `izhikevich`) |
+
+**Presets** on `NeuronModelSpec`: `hh_default()`, `izhikevich(Type)`, `izhikevich(Parameters)`. Circuit-specific presets (thalamic, STN, GPe, GPi, striatum) live in `tests/python/neuron_specs.py` and `benchmarks/ctxbgth_model.py`.
+
+---
+
+### `model/kinetics.hpp`
+
+**Role:** Single authoritative implementation of all kinetic math. Eliminates the former 4-site duplication (scalar in ComposableNeuron, vectorized in ComposablePool, free functions in ion_channels.hpp, inline in network.cpp synapse update).
+
+**Functions:**
+
+| Function | Form |
+|----------|------|
+| `boltzmann_scalar(x, BoltzmannParams)` | scalar sigmoid |
+| `compute_tau_scalar(V, TauParams)` | scalar, 6 forms |
+| `compute_rate_scalar(V, RateFuncParams)` | scalar, 4 forms |
+| `fast_exp(src, dst, tmp_r)` | range-reduction + degree-7 Taylor + 5 squarings; `src==dst` safe |
+| `boltzmann_vec(x, BoltzmannParams)` | vectorized (Eigen::ArrayXd) |
+| `compute_tau_vec(V, TauParams, tmp)` | vectorized, 6 forms |
+| `compute_rate_vec(V, RateFuncParams, tmp)` | vectorized, 4 forms |
+
+**Insertion point (task13):** Swap this header with a generated `kinetics_sympy.hpp` that overloads the same function names using SymPy-codegen'd expressions.
 
 **Future change (task14):** `CalciumSpec` will be replaced by `std::vector<IntracellularSpec>` to support arbitrary intracellular substances. Calcium becomes a special case.
 
@@ -116,7 +152,7 @@ class NeuronBase {
 
 ### `composable_pool.hpp` / `composable_pool.cpp`
 
-**Role:** Vectorized (Eigen) batch step for a population of neurons sharing the same `NeuronModelSpec`.
+**Role:** Vectorized (Eigen) batch step for a population of neurons sharing the same `NeuronModelSpec`. Derives from `PoolBase`.
 
 **State layout (SoA):**
 ```
@@ -126,14 +162,16 @@ Eigen::ArrayXd Ca_;                    // if CalciumSpec::enabled
 Eigen::ArrayXd E_Ca_;                  // if CalciumSpec::use_nernst
 ```
 
-**Pre-allocated working buffers:** `I_total_`, `inf_cache_`, `tau_cache_` — no heap allocation in hot loop.
+**Pre-allocated working buffers:** `I_total_`, `tmp_`, `tmp2_`, `tmp_exp_r_` — no heap allocation in hot loop.
 
 **step() algorithm:**
-1. For each gate: evaluate `x_inf(V)` and `tau_x(V)` via vectorized Eigen expressions
+1. For each gate: evaluate `x_inf(V)` and `tau_x(V)` via `boltzmann_vec` / `compute_tau_vec` / `compute_rate_vec` (from `model/kinetics.hpp`)
 2. Update gate states (INF_TAU / ALPHA_BETA / INSTANT / DERIVED)
 3. For each channel: compute `g * gate_product * (V - E_rev)`, accumulate I_total
-4. `V += dt * (-I_total + I_ext + I_syn) / C_m`
+4. `V += dt * (-I_total + I_ext) / C_m`
 5. Update calcium if enabled; recompute E_Ca if Nernst
+
+**Math:** Calls `hodgkin_huxley::fast_exp(src, dst, tmp_exp_r_)` (free function from `kinetics.hpp`) via thin `fast_exp()` member wrapper.
 
 **Future change (task14):** Replace `Ca_` / `E_Ca_` with `vector<ArrayXd> X_` and `vector<ArrayXd> E_nernst_` for N substances.
 
@@ -141,13 +179,13 @@ Eigen::ArrayXd E_Ca_;                  // if CalciumSpec::use_nernst
 
 ### `hh_pool.hpp` / `hh_pool.cpp`
 
-**Role:** Eigen-vectorized batch step for pure HH populations (fixed 4-state model).
+**Role:** Eigen-vectorized batch step for pure HH populations (fixed 4-state model). Derives from `PoolBase`.
 
 **State:** `V_, m_, h_, n_` (Eigen::ArrayXd)
 
-**Performance:** Pre-allocated k-vectors for RK4 stages; polynomial fast-exp (7th-degree Taylor + range reduction, ~8 digits precision, ~2× faster than std::exp). The `fast_math_` flag in `Network` controls this.
+**Performance:** Pre-allocated k-vectors for RK4 stages; polynomial fast-exp (7th-degree Taylor + range reduction, ~8 digits precision, ~2× faster than std::exp) via `fast_exp()` member wrapper → `hodgkin_huxley::fast_exp()` free function in `model/kinetics.hpp`. The `fast_math_` flag in `Network` controls this.
 
-**Contiguity optimization:** `step_rk4()` checks if state arrays are contiguous in memory before using vectorized path; falls back to scalar for non-contiguous layouts (rare in practice).
+**PoolBase interface:** `step(dt)` delegates to `step_rk4(dt)`.
 
 ---
 
@@ -157,12 +195,50 @@ Eigen::ArrayXd E_Ca_;                  // if CalciumSpec::use_nernst
 
 **State:** `v_, u_` (Eigen::ArrayXd). Spike reset vectorized using Eigen masked operations.
 
+**PoolBase interface:** `step(dt)` delegates to `step_euler(dt)`.
+
 **Critical gotcha (documented in MEMORY.md):** The spike reset `v_ = (v_ >= 30).select(c, v_)` must materialize the boolean mask with `.eval()` before modifying `v_`, otherwise the lazy expression reads the modified values:
 ```cpp
 auto fired = (v_ >= 30.0).eval();  // materialize first
 v_ = fired.select(params_.c, v_);
 u_ = fired.select(u_ + params_.d, u_);
 ```
+
+---
+
+### `pool/pool_base.hpp`
+
+**Role:** Abstract interface shared by `HHPool`, `IzPool`, and `ComposablePool`.
+
+**Key virtual methods:**
+```cpp
+void scatter_voltages(double* V_buf) const   // pool state → global V cache
+void gather_currents(const double* I_buf)    // global I buffer → pool I_ext
+void step(double dt)                          // HH→step_rk4, Iz→step_euler, Composable→step
+void sync_to_neurons(vector<unique_ptr<NeuronBase>>&)  // pool → API objects
+// Recording (default no-ops):
+void scatter_gate_states_into(...)
+void scatter_calcium_into(...)
+void scatter_recoveries(...)
+```
+
+**Insertion point (task16):** Add `virtual void step_parallel(double dt)` and override in each pool with `#pragma omp parallel for` loops.
+
+**Insertion point (task17):** Add CUDA pool subclasses (`CudaComposablePool`) — override `step(dt)` with CUDA kernel launch.
+
+---
+
+### `network/pool_manager.hpp` / `src/network/pool_manager.cpp`
+
+**Role:** Owns `HHPool`, `IzPool`, and one `ComposablePool` per model spec name. Provides a uniform hot-loop interface and manages pool lifetime across `simulate()` calls.
+
+**Key method — `build_from_neurons(neurons, fast_math)`:**
+- Dynamic-casts to classify neurons by type
+- Constructs/resets pools sized to capacity
+- Populates from API neuron state (`parameters()`, `state()`, `gate_states()`, `calcium()`)
+- Called at most once between `reset()` / `add_neuron()` calls — `pools_dirty_` flag gates it
+
+**Hot-loop delegates:** `scatter_all_voltages`, `gather_all_currents`, `step_all`, `sync_all_to_neurons`, `scatter_gates`, `scatter_calcium`, `scatter_recoveries`
 
 ---
 
@@ -215,21 +291,29 @@ syn_groups_: type-separated index lists (exp, alpha, dexp, kinetic)
 - `simulate_with_descriptors()`: compact StimPlan path (preferred for scalar/pulse/DBS)
 - `step()`: single time step (used by `RegionalNetwork.simulate()` for Python-managed loops)
 
+**Pool management (`PoolManager pool_mgr_`):**
+Pools are held as a `Network` member and reused across `simulate()` calls. A `pools_dirty_` flag controls rebuild:
+- `pools_dirty_ = true` after `add_neuron()`, `reset()`, or at construction
+- At start of `simulate_into_buffers` / `simulate_with_descriptors`: if dirty, call `pool_mgr_.build_from_neurons(neurons_, fast_math_)`; clear flag
+- Consecutive `simulate()` calls with no intervening `reset()` continue from pool state at end of prior run (task20 continuable simulation insertion point)
+
 **Hot-loop internal sequence per time step:**
-1. `cache_voltages()` — copy V to `V_cache_`
-2. `compute_synaptic_currents()` — accumulate I_syn from SoA g values
-3. Pool `step()` — update each neuron pool (HH, Iz, Composable) with I_ext + I_syn
-4. `update_synapses_grouped()` — update g for each synapse type (branch-free, type-grouped)
-5. Spike detection via V_cache_ vs current V
-6. Record to buffers if this step falls on a recording interval
+1. `pool_mgr_.scatter_all_voltages(V_cache_)` — pool state → V_cache_
+2. Recording block (if `t % interval == 0`): V, gates, calcium, u, g_syn via `pool_mgr_.*`
+3. Seed `I_syn_buffer_` from I_ext (dense or descriptor)
+4. Accumulate synaptic currents: `I_buf[post[i]] += g[i] * (E_syn[i] - V[post[i]])`
+5. `pool_mgr_.gather_all_currents(I_syn_buffer_)` → pools
+6. `pool_mgr_.step_all(dt)` — HH: RK4, Iz: Euler, Composable: Euler
+7. `pool_mgr_.scatter_all_voltages(V_cache_)` — re-scatter for spike detection
+8. `update_synapses_grouped(dt)` — spike detection + type-separated kinetics
 
-**Lazy sync:** `SynArrays` (SoA) is the authoritative state during simulation. `SynapseBase` objects are synced lazily on `synapse(idx)` access (`soa_dirty_` flag). Avoids copying conductance values on every step.
+**Lazy sync:** `SynArrays` (SoA) is the authoritative state during simulation. `SynapseBase` objects are synced lazily on `synapse(idx)` access (`soa_dirty_` flag).
 
-**Future change (task16):** `step()` pool loops will gain `#pragma omp parallel for`; I_syn accumulation will need thread-local partial sums or atomics.
+**Insertion point (task16):** `pool_mgr_.step_all(dt)` — replace with parallel version adding `#pragma omp parallel for` inside each pool's step.
 
-**Future change (task17):** `to(Device)` will route pool `step()` to CUDA kernels when `device().type == CUDA`.
+**Insertion point (task17):** Swap `HHPool` / `ComposablePool` for CUDA variants in `PoolManager::build_from_neurons()` when a CUDA device is selected.
 
-**Future change (task20):** `simulate_with_descriptors()` will preserve pool and synapse state across calls (persistent by default). A `SimulationState` struct (`get_state()` / `set_state()` / `reset_state()`) will enable `state_dict()` / `load_state_dict()` and pickle support. Decay factors and synapse groups will be cached via `groups_dirty_` / `decay_dirty_` flags to avoid redundant rebuilds on repeated calls.
+**Insertion point (task20):** `pools_dirty_` + `PoolManager` persistence already enables continuable simulation. Add `get_state()` / `set_state()` wrappers over `pool_mgr_` + `sa_` for full pickle support.
 
 ---
 

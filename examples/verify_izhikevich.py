@@ -10,17 +10,14 @@ Generates multiple figures to verify:
 5. V-u phase plane
 6. Current clamp series
 7. Parameter sensitivity
+8. HH vs Izhikevich comparison
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from hodgkin_huxley import (
-    IzhikevichNeuron,
-    IzhikevichType,
-    IzhikevichParameters,
-)
+from hodgkin_huxley import IzhikevichType, RegionalNetwork, NeuronModelSpec, RecordingConfig
 
 
 def setup_output_dir():
@@ -37,6 +34,13 @@ def count_spikes(trace, threshold=0.0):
     return np.sum(crossings == 1)
 
 
+def _simulate_iz(neuron_type, duration, dt, I_ext):
+    """Helper: simulate one Izhikevich neuron, return 1D voltage trace."""
+    rn = RegionalNetwork()
+    rn.add_population("E", 1, model=NeuronModelSpec.izhikevich(neuron_type))
+    return rn.simulate(duration, dt, {"E": float(I_ext)})["E"][0]
+
+
 def plot_membrane_potential(figs_dir):
     """Plot membrane potential with constant current injection."""
     print("Generating Izhikevich membrane potential plot...")
@@ -45,9 +49,8 @@ def plot_membrane_potential(figs_dir):
     dt = 0.1
     I_ext = 10.0
 
-    neuron = IzhikevichNeuron(IzhikevichType.REGULAR_SPIKING)
-    trace = neuron.simulate(duration=duration, dt=dt, I_ext=I_ext)
-    time = np.arange(0, duration, dt)
+    trace = _simulate_iz(IzhikevichType.REGULAR_SPIKING, duration, dt, I_ext)
+    time = np.arange(len(trace)) * dt
 
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.plot(time, trace, 'b-', linewidth=0.8)
@@ -64,7 +67,7 @@ def plot_membrane_potential(figs_dir):
     plt.close(fig)
 
     print(f"  Spikes detected: {count_spikes(trace, threshold=0)}")
-    print(f"  Voltage range: [{min(trace):.1f}, {max(trace):.1f}] mV")
+    print(f"  Voltage range: [{trace.min():.1f}, {trace.max():.1f}] mV")
 
 
 def plot_all_preset_types(figs_dir):
@@ -86,9 +89,8 @@ def plot_all_preset_types(figs_dir):
     fig, axes = plt.subplots(len(preset_types), 1, figsize=(14, 12), sharex=True)
 
     for ax, (neuron_type, name) in zip(axes, preset_types):
-        neuron = IzhikevichNeuron(neuron_type)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        trace = _simulate_iz(neuron_type, duration, dt, I_ext)
+        time = np.arange(len(trace)) * dt
 
         ax.plot(time, trace, 'b-', linewidth=0.6)
         ax.set_ylabel('V (mV)')
@@ -116,12 +118,9 @@ def plot_fs_vs_rs(figs_dir):
     dt = 0.1
     I_ext = 15.0
 
-    rs = IzhikevichNeuron(IzhikevichType.REGULAR_SPIKING)
-    fs = IzhikevichNeuron(IzhikevichType.FAST_SPIKING)
-
-    trace_rs = rs.simulate(duration, dt, I_ext)
-    trace_fs = fs.simulate(duration, dt, I_ext)
-    time = np.arange(0, duration, dt)
+    trace_rs = _simulate_iz(IzhikevichType.REGULAR_SPIKING, duration, dt, I_ext)
+    trace_fs = _simulate_iz(IzhikevichType.FAST_SPIKING, duration, dt, I_ext)
+    time = np.arange(len(trace_rs)) * dt
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
 
@@ -167,11 +166,11 @@ def plot_fi_curve(figs_dir):
     for neuron_type, label, color in neuron_types:
         firing_rates = []
         for I_ext in currents:
-            neuron = IzhikevichNeuron(neuron_type)
-            trace = neuron.simulate(duration, dt, I_ext)
-            spikes = count_spikes(trace, threshold=0)
-            rate = spikes / (duration / 1000)  # Hz
-            firing_rates.append(rate)
+            rn = RegionalNetwork()
+            rn.add_population("E", 1, model=NeuronModelSpec.izhikevich(neuron_type))
+            result = rn.simulate(duration, dt, {"E": float(I_ext)},
+                                 record=RecordingConfig(["firing_rate"]))
+            firing_rates.append(float(result["E"]["firing_rate"][0]))
 
         ax.plot(currents, firing_rates, f'{color}o-', label=label, linewidth=1.5, markersize=4)
 
@@ -195,20 +194,14 @@ def plot_phase_plane(figs_dir):
     dt = 0.1
     I_ext = 10.0
 
-    neuron = IzhikevichNeuron(IzhikevichType.REGULAR_SPIKING)
-    V_trace = []
-    u_trace = []
-
-    num_steps = int(duration / dt)
-    for _ in range(num_steps):
-        state = neuron.state
-        V_trace.append(state.v)
-        u_trace.append(state.u)
-        neuron.step(dt, I_ext)
+    rn = RegionalNetwork()
+    rn.add_population("E", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
+    result = rn.simulate(duration, dt, {"E": I_ext}, record=RecordingConfig(["V", "u"]))
+    V_trace = result["E"]["V"][0]
+    u_trace = result["E"]["u"][0]
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Color by time
     points = np.array([V_trace, u_trace]).T.reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
 
@@ -219,8 +212,8 @@ def plot_phase_plane(figs_dir):
     lc.set_linewidth(1)
     line = ax.add_collection(lc)
 
-    ax.set_xlim(min(V_trace) - 5, max(V_trace) + 5)
-    ax.set_ylim(min(u_trace) - 2, max(u_trace) + 2)
+    ax.set_xlim(V_trace.min() - 5, V_trace.max() + 5)
+    ax.set_ylim(u_trace.min() - 2, u_trace.max() + 2)
     ax.set_xlabel('Membrane Potential v (mV)')
     ax.set_ylabel('Recovery Variable u')
     ax.set_title('Phase Plane (v vs u) - Regular Spiking')
@@ -246,9 +239,8 @@ def plot_current_clamp_series(figs_dir):
     fig, axes = plt.subplots(len(currents), 1, figsize=(12, 10), sharex=True)
 
     for ax, I_ext in zip(axes, currents):
-        neuron = IzhikevichNeuron(IzhikevichType.REGULAR_SPIKING)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        trace = _simulate_iz(IzhikevichType.REGULAR_SPIKING, duration, dt, I_ext)
+        time = np.arange(len(trace)) * dt
 
         ax.plot(time, trace, 'b-', linewidth=0.8)
         ax.set_ylabel('V (mV)')
@@ -277,11 +269,12 @@ def plot_parameter_sensitivity(figs_dir):
     # Vary parameter a (time scale of recovery)
     ax = axes[0, 0]
     for a in [0.01, 0.02, 0.05, 0.1, 0.2]:
-        params = IzhikevichParameters()
-        params.a = a
-        neuron = IzhikevichNeuron(parameters=params)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        spec = NeuronModelSpec.izhikevich()
+        spec.iz_params.a = a
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        trace = rn.simulate(duration, dt, {"E": I_ext})["E"][0]
+        time = np.arange(len(trace)) * dt
         ax.plot(time, trace, label=f'a={a}', linewidth=0.8)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('V (mV)')
@@ -292,11 +285,12 @@ def plot_parameter_sensitivity(figs_dir):
     # Vary parameter b (sensitivity of u to v)
     ax = axes[0, 1]
     for b in [0.1, 0.2, 0.25, 0.3]:
-        params = IzhikevichParameters()
-        params.b = b
-        neuron = IzhikevichNeuron(parameters=params)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        spec = NeuronModelSpec.izhikevich()
+        spec.iz_params.b = b
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        trace = rn.simulate(duration, dt, {"E": I_ext})["E"][0]
+        time = np.arange(len(trace)) * dt
         ax.plot(time, trace, label=f'b={b}', linewidth=0.8)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('V (mV)')
@@ -307,11 +301,12 @@ def plot_parameter_sensitivity(figs_dir):
     # Vary parameter c (after-spike reset of v)
     ax = axes[1, 0]
     for c in [-70, -65, -60, -55, -50]:
-        params = IzhikevichParameters()
-        params.c = c
-        neuron = IzhikevichNeuron(parameters=params)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        spec = NeuronModelSpec.izhikevich()
+        spec.iz_params.c = c
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        trace = rn.simulate(duration, dt, {"E": I_ext})["E"][0]
+        time = np.arange(len(trace)) * dt
         ax.plot(time, trace, label=f'c={c}', linewidth=0.8)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('V (mV)')
@@ -322,11 +317,12 @@ def plot_parameter_sensitivity(figs_dir):
     # Vary parameter d (after-spike reset of u)
     ax = axes[1, 1]
     for d in [2, 4, 6, 8, 10]:
-        params = IzhikevichParameters()
-        params.d = d
-        neuron = IzhikevichNeuron(parameters=params)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        spec = NeuronModelSpec.izhikevich()
+        spec.iz_params.d = d
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        trace = rn.simulate(duration, dt, {"E": I_ext})["E"][0]
+        time = np.arange(len(trace)) * dt
         ax.plot(time, trace, label=f'd={d}', linewidth=0.8)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('V (mV)')
@@ -334,7 +330,7 @@ def plot_parameter_sensitivity(figs_dir):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    fig.suptitle('Izhikevich Parameter Sensitivity Analysis', fontsize=12, y=1.02)
+    fig.suptitle('Izhikevich Parameter Sensitivity Analysis', fontsize=12)
     fig.tight_layout()
     fig.savefig(figs_dir / "iz_07_parameter_sensitivity.png", dpi=150)
     plt.close(fig)
@@ -344,20 +340,20 @@ def plot_neuron_comparison(figs_dir):
     """Compare HH and Izhikevich neuron responses."""
     print("Generating HH vs Izhikevich comparison...")
 
-    from hodgkin_huxley import HHNeuron
-
     duration = 100.0
     I_ext = 10.0
 
     # HH neuron (smaller dt for accuracy)
-    hh = HHNeuron()
-    trace_hh = hh.simulate(duration, dt=0.01, I_ext=I_ext)
-    time_hh = np.arange(0, duration, 0.01)
+    rn_hh = RegionalNetwork()
+    rn_hh.add_population("E", 1, model=NeuronModelSpec.hh_default())
+    trace_hh = rn_hh.simulate(duration, 0.01, {"E": I_ext})["E"][0]
+    time_hh = np.arange(len(trace_hh)) * 0.01
 
     # Izhikevich neuron
-    iz = IzhikevichNeuron(IzhikevichType.REGULAR_SPIKING)
-    trace_iz = iz.simulate(duration, dt=0.1, I_ext=I_ext)
-    time_iz = np.arange(0, duration, 0.1)
+    rn_iz = RegionalNetwork()
+    rn_iz.add_population("E", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
+    trace_iz = rn_iz.simulate(duration, 0.1, {"E": I_ext})["E"][0]
+    time_iz = np.arange(len(trace_iz)) * 0.1
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
 

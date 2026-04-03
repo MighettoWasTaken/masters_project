@@ -15,10 +15,10 @@ from hodgkin_huxley import (
     mtspectrumpt,
     analyze_beta_power,
     RecordingConfig,
-    Network,
     RegionalNetwork,
     NeuronModelSpec,
 )
+from neuron_specs import make_gpi
 
 # Use a reduced sampling rate for test speed (matches dt=0.1 ms).
 # The algorithm is Fs-invariant; beta band (7–35 Hz) is well within Nyquist.
@@ -156,58 +156,58 @@ class TestMtspectrumpt:
 
 class TestAnalyzeBetaPower:
 
+    def _make_hh_rn(self):
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=NeuronModelSpec.hh_default())
+        return rn
+
     def test_raises_without_spikes_key(self):
         """ValueError if result doesn't contain 'spikes'."""
-        net = Network()
-        net.add_hh_neuron()
+        rn = self._make_hh_rn()
         cfg = RecordingConfig(["V"])
-        result = net.simulate(100.0, TEST_DT, [[5.0] * 1000], record=cfg)
+        result = rn.simulate(100.0, TEST_DT, {"E": 5.0}, record=cfg)
         with pytest.raises(ValueError, match="spikes"):
-            analyze_beta_power(result, duration_ms=100.0, Fs=TEST_FS)
+            analyze_beta_power(result["E"], duration_ms=100.0, Fs=TEST_FS)
 
     def test_return_keys(self):
         """Output dict must contain exactly 'power', 'spectrum', 'frequencies'."""
-        net = Network()
-        net.add_hh_neuron()
+        rn = self._make_hh_rn()
         cfg = RecordingConfig(["spikes"])
-        result = net.simulate(500.0, TEST_DT, [[10.0] * 5000], record=cfg)
-        out = analyze_beta_power(result, duration_ms=500.0, Fs=TEST_FS)
+        result = rn.simulate(500.0, TEST_DT, {"E": 10.0}, record=cfg)
+        out = analyze_beta_power(result["E"], duration_ms=500.0, Fs=TEST_FS)
         assert set(out.keys()) == {"power", "spectrum", "frequencies"}
 
     def test_finite_output_hh_neuron(self):
         """HH neuron under current: all outputs finite."""
-        net = Network()
-        net.add_hh_neuron()
+        rn = self._make_hh_rn()
         cfg = RecordingConfig(["spikes"])
-        result = net.simulate(1000.0, TEST_DT, [[10.0] * 10000], record=cfg)
-        out = analyze_beta_power(result, duration_ms=1000.0, Fs=TEST_FS)
+        result = rn.simulate(1000.0, TEST_DT, {"E": 10.0}, record=cfg)
+        out = analyze_beta_power(result["E"], duration_ms=1000.0, Fs=TEST_FS)
         assert np.isfinite(out["power"])
         assert np.all(np.isfinite(out["spectrum"]))
         assert np.all(np.isfinite(out["frequencies"]))
 
     def test_frequencies_within_fpass(self):
         """Returned frequencies lie within the default fpass=[1, 100] Hz."""
-        net = Network()
-        net.add_hh_neuron()
+        rn = self._make_hh_rn()
         cfg = RecordingConfig(["spikes"])
-        result = net.simulate(500.0, TEST_DT, [[10.0] * 5000], record=cfg)
-        out = analyze_beta_power(result, duration_ms=500.0, Fs=TEST_FS)
+        result = rn.simulate(500.0, TEST_DT, {"E": 10.0}, record=cfg)
+        out = analyze_beta_power(result["E"], duration_ms=500.0, Fs=TEST_FS)
         assert out["frequencies"].min() >= 1.0
         assert out["frequencies"].max() <= 100.0
 
     def test_spectrum_and_frequencies_same_shape(self):
         """'spectrum' and 'frequencies' arrays must have the same length."""
-        net = Network()
-        net.add_hh_neuron()
+        rn = self._make_hh_rn()
         cfg = RecordingConfig(["spikes"])
-        result = net.simulate(500.0, TEST_DT, [[10.0] * 5000], record=cfg)
-        out = analyze_beta_power(result, duration_ms=500.0, Fs=TEST_FS)
+        result = rn.simulate(500.0, TEST_DT, {"E": 10.0}, record=cfg)
+        out = analyze_beta_power(result["E"], duration_ms=500.0, Fs=TEST_FS)
         assert out["spectrum"].shape == out["frequencies"].shape
 
     def test_regional_network_gpi_pipeline(self):
         """Full pipeline on a RegionalNetwork GPi population."""
         rn = RegionalNetwork()
-        rn.add_population("GPi", 5, model=NeuronModelSpec.gpi())
+        rn.add_population("GPi", 5, model=make_gpi())
         cfg = RecordingConfig(["spikes"])
         result = rn.simulate(1000.0, TEST_DT, {"GPi": 5.0}, record=cfg)
         gpi = result["GPi"]
@@ -217,20 +217,18 @@ class TestAnalyzeBetaPower:
 
     def test_no_spike_population_finite(self):
         """Population that produces no spikes must not crash or return NaN."""
-        net = Network()
-        net.add_hh_neuron()
+        rn = self._make_hh_rn()
         cfg = RecordingConfig(["spikes"])
         # Zero current → no spikes
-        result = net.simulate(500.0, TEST_DT, [[0.0] * 5000], record=cfg)
-        out = analyze_beta_power(result, duration_ms=500.0, Fs=TEST_FS)
+        result = rn.simulate(500.0, TEST_DT, {"E": 0.0}, record=cfg)
+        out = analyze_beta_power(result["E"], duration_ms=500.0, Fs=TEST_FS)
         assert np.isfinite(out["power"])
         assert np.all(np.isfinite(out["spectrum"]))
 
     def test_power_scalar(self):
         """'power' must be a plain Python float (or 0-d array castable to float)."""
-        net = Network()
-        net.add_hh_neuron()
+        rn = self._make_hh_rn()
         cfg = RecordingConfig(["spikes"])
-        result = net.simulate(500.0, TEST_DT, [[10.0] * 5000], record=cfg)
-        out = analyze_beta_power(result, duration_ms=500.0, Fs=TEST_FS)
+        result = rn.simulate(500.0, TEST_DT, {"E": 10.0}, record=cfg)
+        out = analyze_beta_power(result["E"], duration_ms=500.0, Fs=TEST_FS)
         assert float(out["power"]) == out["power"]

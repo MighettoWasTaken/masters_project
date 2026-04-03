@@ -43,6 +43,11 @@ void IzPool::scatter_voltages(double* V_buf) const {
     }
 }
 
+void IzPool::scatter_recoveries(double* u_buf, size_t n_rec, size_t tr) const {
+    for (size_t i = 0; i < N_; ++i)
+        u_buf[net_idx_[i] * n_rec + tr] = u_(i);
+}
+
 void IzPool::gather_currents(const double* I_buf) {
     if (contiguous_ && N_ > 0) {
         std::memcpy(I_ext_.data(), I_buf + net_idx_[0], N_ * sizeof(double));

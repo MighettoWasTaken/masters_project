@@ -1,8 +1,7 @@
 #include "hodgkin_huxley/composable_pool.hpp"
 #include "hodgkin_huxley/composable_neuron.hpp"
+#include "hodgkin_huxley/model/kinetics.hpp"
 #include <cstring>
-#include <cmath>
-#include <algorithm>
 
 namespace hodgkin_huxley {
 
@@ -78,113 +77,9 @@ void ComposablePool::gather_currents(const double* I_buf) {
     }
 }
 
-// Fast exp: range reduction by 32 + degree-7 Taylor + 5 squarings
+// Delegate to shared implementations in model/kinetics.hpp
 void ComposablePool::fast_exp(const Eigen::ArrayXd& src, Eigen::ArrayXd& dst) {
-    tmp_exp_r_ = src * (1.0 / 32.0);
-
-    dst = tmp_exp_r_ * (1.0 / 5040.0) + (1.0 / 720.0);
-    dst = dst * tmp_exp_r_ + (1.0 / 120.0);
-    dst = dst * tmp_exp_r_ + (1.0 / 24.0);
-    dst = dst * tmp_exp_r_ + (1.0 / 6.0);
-    dst = dst * tmp_exp_r_ + 0.5;
-    dst = dst * tmp_exp_r_ + 1.0;
-    dst = dst * tmp_exp_r_ + 1.0;
-
-    dst *= dst; dst *= dst; dst *= dst; dst *= dst; dst *= dst;
-}
-
-// Vectorized Boltzmann: 1 / (1 + exp(-(x - v_half) / k))
-Eigen::ArrayXd ComposablePool::boltzmann_vec(const Eigen::ArrayXd& x, const BoltzmannParams& p) {
-    Eigen::ArrayXd arg = -(x - p.v_half) / p.k;
-    arg = arg.max(-500.0).min(500.0);
-    return 1.0 / (1.0 + arg.exp());
-}
-
-Eigen::ArrayXd ComposablePool::compute_tau_vec(const Eigen::ArrayXd& V,
-                                                 const TauParams& tau,
-                                                 Eigen::ArrayXd& tmp) {
-    const Eigen::Index N = V.size();
-    switch (tau.form) {
-        case TauParams::Form::CONSTANT:
-            return Eigen::ArrayXd::Constant(N, tau.params[0]);
-
-        case TauParams::Form::BOLTZMANN: {
-            double base = tau.params[0], amp = tau.params[1];
-            double vh = tau.params[2], k = tau.params[3];
-            tmp = (-(V - vh) / k).max(-500.0).min(500.0);
-            return base + amp / (1.0 + tmp.exp());
-        }
-
-        case TauParams::Form::DOUBLE_EXP_SUM: {
-            double base = tau.params[0], amp = tau.params[1];
-            double v1 = tau.params[2], s1 = tau.params[3];
-            double v2 = tau.params[5], s2 = tau.params[6];
-            Eigen::ArrayXd e1 = ((V + v1) / s1).exp();
-            Eigen::ArrayXd e2 = (-(V + v2) / s2).exp();
-            return base + amp / (e1 + e2).max(1e-10);
-        }
-
-        case TauParams::Form::OFFSET_DOUBLE_EXP: {
-            double base = tau.params[0], a1 = tau.params[1];
-            double v1 = tau.params[2], s1 = tau.params[3];
-            double a2 = tau.params[4], v2 = tau.params[5], s2 = tau.params[6];
-            tmp = (V + v1) / s1;
-            Eigen::ArrayXd t1 = a1 * (-tmp * tmp).exp();
-            tmp = (V + v2) / s2;
-            return base + t1 + a2 * (-tmp * tmp).exp();
-        }
-
-        case TauParams::Form::SCALED_EXP: {
-            double scale = tau.params[0], vh = tau.params[1], k = tau.params[2];
-            tmp = ((V - vh) / (2.0 * k)).max(-500.0).min(500.0);
-            return scale / tmp.cosh().max(1e-10);
-        }
-
-        case TauParams::Form::COMPOUND_AB: {
-            double aA = tau.params[0], aB = tau.params[1], aC = tau.params[2];
-            double bA = tau.params[3], bB = tau.params[4], bC = tau.params[5];
-            Eigen::ArrayXd alpha = aA * ((V + aB) / aC).exp();
-            Eigen::ArrayXd beta = bA * ((V + bB) / bC).exp();
-            return 1.0 / (alpha + beta).max(1e-10);
-        }
-    }
-    return Eigen::ArrayXd::Constant(N, 1.0);
-}
-
-Eigen::ArrayXd ComposablePool::compute_rate_vec(const Eigen::ArrayXd& V,
-                                                  const RateFuncParams& rate,
-                                                  Eigen::ArrayXd& tmp) {
-    const Eigen::Index N = V.size();
-    switch (rate.form) {
-        case RateFuncParams::Form::LINEAR_OVER_EXP: {
-            Eigen::ArrayXd x = V + rate.B;
-            Eigen::ArrayXd xc = x / rate.C;
-            Eigen::ArrayXd e = xc.exp();
-            Eigen::ArrayXd result = rate.A * x / (e - 1.0);
-            return (xc.abs() < 1e-6).select(
-                Eigen::ArrayXd::Constant(N, rate.A * rate.C), result);
-        }
-
-        case RateFuncParams::Form::EXP_DECAY: {
-            tmp = ((V + rate.B) / rate.C).max(-500.0).min(500.0);
-            return rate.A * tmp.exp();
-        }
-
-        case RateFuncParams::Form::LINEAR_OVER_EXPM1: {
-            Eigen::ArrayXd x = V + rate.B;
-            Eigen::ArrayXd xc = x / rate.C;
-            Eigen::ArrayXd e = (-xc).exp();
-            Eigen::ArrayXd result = rate.A * x / (1.0 - e);
-            return (xc.abs() < 1e-6).select(
-                Eigen::ArrayXd::Constant(N, rate.A * rate.C), result);
-        }
-
-        case RateFuncParams::Form::SIGMOID: {
-            tmp = ((V + rate.B) / rate.C).max(-500.0).min(500.0);
-            return rate.A / (1.0 + tmp.exp());
-        }
-    }
-    return Eigen::ArrayXd::Zero(N);
+    hodgkin_huxley::fast_exp(src, dst, tmp_exp_r_);
 }
 
 void ComposablePool::step(double dt) {
@@ -206,16 +101,16 @@ void ComposablePool::step(double dt) {
                 // Materialize dependency to avoid ternary type mismatch
                 Eigen::ArrayXd dep = (gs.dependency == GateSpec::Dependency::CALCIUM)
                     ? Eigen::ArrayXd(Ca_) : Eigen::ArrayXd(V_);
-                Eigen::ArrayXd x_inf = boltzmann_vec(dep, gs.inf);
-                Eigen::ArrayXd tau_x = compute_tau_vec(V_, gs.tau, tmp_);
+                Eigen::ArrayXd x_inf = hodgkin_huxley::boltzmann_vec(dep, gs.inf);
+                Eigen::ArrayXd tau_x = hodgkin_huxley::compute_tau_vec(V_, gs.tau, tmp_);
                 tau_x = tau_x.max(1e-10);
                 X = x_inf + (X - x_inf) * (-dt * gs.scale / tau_x).exp();
                 break;
             }
 
             case GateSpec::UpdateForm::ALPHA_BETA: {
-                Eigen::ArrayXd alpha = compute_rate_vec(V_, gs.alpha, tmp_);
-                Eigen::ArrayXd beta  = compute_rate_vec(V_, gs.beta,  tmp2_);
+                Eigen::ArrayXd alpha = hodgkin_huxley::compute_rate_vec(V_, gs.alpha, tmp_);
+                Eigen::ArrayXd beta  = hodgkin_huxley::compute_rate_vec(V_, gs.beta,  tmp2_);
                 Eigen::ArrayXd rate  = (alpha + beta).max(1e-10);
                 Eigen::ArrayXd x_inf = alpha / rate;
                 X = x_inf + (X - x_inf) * (-dt * rate).exp();
@@ -225,7 +120,7 @@ void ComposablePool::step(double dt) {
             case GateSpec::UpdateForm::INSTANT: {
                 Eigen::ArrayXd dep = (gs.dependency == GateSpec::Dependency::CALCIUM)
                     ? Eigen::ArrayXd(Ca_) : Eigen::ArrayXd(V_);
-                X = boltzmann_vec(dep, gs.inf);
+                X = hodgkin_huxley::boltzmann_vec(dep, gs.inf);
                 break;
             }
 

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "neuron.hpp"
+#include "hodgkin_huxley/neuron.hpp"
+#include "hodgkin_huxley/pool/pool_base.hpp"
 #include <Eigen/Core>
 #include <vector>
 #include <memory>
@@ -16,7 +17,7 @@ namespace hodgkin_huxley {
  *
  * Used internally by Network::simulate() for the hot loop.
  */
-class HHPool {
+class HHPool : public PoolBase {
 public:
     HHPool() = default;
     explicit HHPool(size_t capacity, bool fast_math = true);
@@ -24,14 +25,16 @@ public:
     void add(size_t network_idx, const HHNeuron::Parameters& params,
              const HHNeuron::State& state);
 
-    size_t size() const { return N_; }
+    size_t size() const override { return N_; }
     bool empty() const { return N_ == 0; }
     size_t network_idx(size_t pool_idx) const { return net_idx_[pool_idx]; }
 
-    void scatter_voltages(double* V_buf) const;
-    void gather_currents(const double* I_buf);
+    void scatter_voltages(double* V_buf) const override;
+    void gather_currents(const double* I_buf) override;
+    // PoolBase::step() delegates to step_rk4()
+    void step(double dt) override { step_rk4(dt); }
     void step_rk4(double dt);
-    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const;
+    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const override;
 
 private:
     size_t N_ = 0;
@@ -74,8 +77,7 @@ private:
     // True when pool indices are [start, start+1, ..., start+N-1]
     bool contiguous_ = false;
 
-    // Fast exp approximation: ~8 significant digits, no 2^k bit tricks.
-    // Uses range reduction (divide by 32) + degree-7 Taylor + 5 squarings.
+    // fast_exp wraps hodgkin_huxley::fast_exp using tmp_exp_r_ as scratch.
     // Entirely Eigen-vectorized. Safe to call with src == dst.
     void fast_exp(const Eigen::ArrayXd& src, Eigen::ArrayXd& dst);
 

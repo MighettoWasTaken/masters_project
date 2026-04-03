@@ -1,4 +1,5 @@
 #include "hodgkin_huxley/hh_pool.hpp"
+#include "hodgkin_huxley/model/kinetics.hpp"
 #include <cstring>
 
 namespace hodgkin_huxley {
@@ -83,35 +84,9 @@ void HHPool::gather_currents(const double* I_buf) {
     }
 }
 
-// =============================================================================
-// Fast exp: range reduction by 32 + degree-7 Taylor + 5 squarings
-//
-// exp(x) = exp(x/32)^32.  Taylor degree-7 on [-0.31, 0.09] gives ~8
-// significant digits after 5 squarings.  Entirely Eigen-vectorized —
-// every line is a SIMD fma or multiply over the full array.
-// Safe to call with src == dst (input consumed in first line).
-// =============================================================================
-
+// Delegate to the shared free function in model/kinetics.hpp
 void HHPool::fast_exp(const Eigen::ArrayXd& src, Eigen::ArrayXd& dst) {
-    // Range reduction: exp(x) = exp(x/32)^32
-    tmp_exp_r_ = src * (1.0 / 32.0);
-
-    // Degree-7 Taylor polynomial in Horner form:
-    // exp(r) ≈ 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120 + r⁶/720 + r⁷/5040
-    dst = tmp_exp_r_ * (1.0 / 5040.0) + (1.0 / 720.0);
-    dst = dst * tmp_exp_r_ + (1.0 / 120.0);
-    dst = dst * tmp_exp_r_ + (1.0 / 24.0);
-    dst = dst * tmp_exp_r_ + (1.0 / 6.0);
-    dst = dst * tmp_exp_r_ + 0.5;
-    dst = dst * tmp_exp_r_ + 1.0;
-    dst = dst * tmp_exp_r_ + 1.0;
-
-    // 5 squarings: exp(x/32)^32 = exp(x)
-    dst *= dst;
-    dst *= dst;
-    dst *= dst;
-    dst *= dst;
-    dst *= dst;
+    hodgkin_huxley::fast_exp(src, dst, tmp_exp_r_);
 }
 
 // =============================================================================

@@ -7,92 +7,109 @@ Supports Hodgkin-Huxley, Izhikevich, and extensible to other models.
 
 from __future__ import annotations
 
-import numpy as np
-from numpy.typing import ArrayLike, NDArray
 from typing import Union
 
-from .recording import RecordingConfig, MetricsResult, PopulationMetricsResult
-from .spectral import mtspectrumpt, beta_band_power, analyze_beta_power
-from .pulse import PulseStimulator
-from .noise import NoiseInjector
+import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
 from ._core import (
-    # Base class
-    NeuronBase as _NeuronBase,
-    # HH neuron
-    HHNeuron as _HHNeuron,
-    HHParameters,
-    HHState,
-    # Izhikevich neuron
-    IzhikevichNeuron as _IzhikevichNeuron,
-    IzhikevichParameters,
-    IzhikevichState,
-    IzhikevichType,
-    # Synapse classes
-    SynapseBase,
-    ExponentialSynapse,
-    AlphaSynapse,
-    DoubleExponentialSynapse,
-    # Network
-    Network as _Network,
-    NetworkNeuronType,
-    ReceptorType,
-    # Regional network
-    RegionalNetwork as _RegionalNetwork,
-    ConnectivityPattern,
-    SynapseSpec,
-    SynapseSpecType,
-    WeightDistribution,
-    WeightDistType,
-    # Enums
-    IntegrationMethod,
+    AlphaSynapse as _AlphaSynapse,
+)
+from ._core import (
     # Composable neuron types
     BoltzmannParams,
-    TauParams,
-    TauForm,
-    RateFuncParams,
-    RateFuncForm,
+    CalciumSpec,
+    ChannelSpec,
+    ConnectivityPattern,
+    DBSParameters,
+    GateDependency,
     GateSpec,
     GateUpdateForm,
-    GateDependency,
-    ChannelSpec,
-    CalciumSpec,
-    NeuronModelSpec,
-    ComposableNeuron as _ComposableNeuron,
+    # Enums
+    IntegrationMethod,
+    IzhikevichType,
+    KineticCurrentForm,
     # Kinetic synapse
     KineticSynapseSpec,
     KineticUpdateForm,
-    KineticCurrentForm,
-    # DBS stimulator
-    DBSStimulator as _DBSStimulator,
-    DBSParameters,
-    # Version
-    __version__,
+    NeuronModelSpec,
     # Backwards compatibility
     Parameters,
+    RateFuncForm,
+    RateFuncParams,
+    ReceptorType,
     State,
+    SynapseSpec,
+    SynapseSpecType,
+    TauForm,
+    TauParams,
+    WeightDistribution,
+    WeightDistType,
+    # Version
+    __version__,
 )
+from ._core import (
+    ComposableNeuron as _ComposableNeuron,
+)
+from ._core import (
+    # DBS stimulator
+    DBSStimulator as _DBSStimulator,
+)
+from ._core import (
+    DoubleExponentialSynapse as _DoubleExponentialSynapse,
+)
+from ._core import (
+    ExponentialSynapse as _ExponentialSynapse,
+)
+from ._core import (
+    # HH neuron (private — deprecated in public API)
+    HHNeuron as _HHNeuron,
+)
+from ._core import (
+    HHParameters as _HHParameters,
+)
+from ._core import (
+    HHState as _HHState,
+)
+from ._core import (
+    # Izhikevich neuron (private — deprecated in public API)
+    IzhikevichNeuron as _IzhikevichNeuron,
+)
+from ._core import (
+    IzhikevichParameters as _IzhikevichParameters,
+)
+from ._core import (
+    IzhikevichState as _IzhikevichState,
+)
+from ._core import (
+    # Base class
+    NeuronBase as _NeuronBase,
+)
+from ._core import (
+    # Regional network
+    RegionalNetwork as _RegionalNetwork,
+)
+from ._core import (
+    # Synapse classes (private — deprecated in public API)
+    SynapseBase as _SynapseBase,
+)
+from ._core import (
+    # Network (internal — renamed in bindings)
+    _Network as _Network,
+)
+from ._core import (
+    _NetworkNeuronType as _NetworkNeuronType,
+)
+from .noise import NoiseInjector
+from .pulse import PulseStimulator
+from .recording import MetricsResult, PopulationMetricsResult, RecordingConfig
+from .spectral import analyze_beta_power, beta_band_power, mtspectrumpt
 
 __all__ = [
-    # Neuron classes
-    "HHNeuron",
-    "IzhikevichNeuron",
-    # Parameter/State classes
-    "HHParameters",
-    "HHState",
-    "IzhikevichParameters",
-    "IzhikevichState",
+    # Neuron type enum (stays public)
     "IzhikevichType",
-    # Synapse classes
-    "SynapseBase",
-    "ExponentialSynapse",
-    "AlphaSynapse",
-    "DoubleExponentialSynapse",
-    # Network
-    "Network",
-    "NetworkNeuronType",
     "ReceptorType",
-    # Regional network
+    # Regional network (primary public API)
     "RegionalNetwork",
     "ConnectivityPattern",
     "SynapseSpec",
@@ -144,32 +161,45 @@ __all__ = [
     "State",
 ]
 
+# ---------------------------------------------------------------------------
+# Deprecated names — accessed via __getattr__ to emit DeprecationWarning
+# ---------------------------------------------------------------------------
+_DEPRECATED_NAMES = {
+    "Network",
+    "NetworkNeuronType",
+    "HHNeuron",
+    "IzhikevichNeuron",
+    "HHParameters",
+    "HHState",
+    "IzhikevichParameters",
+    "IzhikevichState",
+    "SynapseBase",
+    "ExponentialSynapse",
+    "AlphaSynapse",
+    "DoubleExponentialSynapse",
+}
 
-class HHNeuron:
+
+def __getattr__(name: str) -> object:
+    if name in _DEPRECATED_NAMES:
+        from hodgkin_huxley import legacy as _legacy
+
+        return getattr(_legacy, name)  # legacy.__getattr__ emits DeprecationWarning
+    raise AttributeError(f"module 'hodgkin_huxley' has no attribute {name!r}")
+
+
+class _HHNeuronWrapper:
     """
-    Hodgkin-Huxley neuron model.
+    Hodgkin-Huxley neuron model (deprecated wrapper).
 
-    Implements the classic Hodgkin-Huxley model with Na+, K+, and leak channels.
-
-    Parameters
-    ----------
-    parameters : HHParameters, optional
-        Custom parameters for the neuron. If not provided, uses default
-        squid giant axon parameters.
-    method : IntegrationMethod, optional
-        Integration method (EULER, RK4, RK45_ADAPTIVE). Default is RK4.
-
-    Examples
-    --------
-    >>> neuron = HHNeuron()
-    >>> trace = neuron.simulate(duration=100, dt=0.01, I_ext=10)
-    >>> print(f"Max voltage: {max(trace):.1f} mV")
+    .. deprecated::
+        Use :class:`NeuronModelSpec.hh_default()` with :class:`RegionalNetwork` instead.
     """
 
     def __init__(
         self,
-        parameters: HHParameters | None = None,
-        method: IntegrationMethod | None = None,
+        parameters: "_HHParameters | None" = None,
+        method: "IntegrationMethod | None" = None,
     ):
         if parameters is not None and method is not None:
             self._neuron = _HHNeuron(parameters, method)
@@ -190,12 +220,12 @@ class HHNeuron:
         self._neuron.V = value
 
     @property
-    def state(self) -> HHState:
+    def state(self) -> "_HHState":
         """Current state of the neuron (V, m, h, n)."""
         return self._neuron.state
 
     @property
-    def parameters(self) -> HHParameters:
+    def parameters(self) -> "_HHParameters":
         """Neuron parameters."""
         return self._neuron.parameters
 
@@ -261,34 +291,18 @@ class HHNeuron:
         return f"<HHNeuron V={self.V:.2f} mV>"
 
 
-class IzhikevichNeuron:
+class _IzhikevichNeuronWrapper:
     """
-    Izhikevich neuron model.
+    Izhikevich neuron model (deprecated wrapper).
 
-    A computationally efficient model that can reproduce many biologically
-    realistic spiking patterns with only 2 state variables.
-
-    Parameters
-    ----------
-    neuron_type : IzhikevichType, optional
-        Preset neuron type (REGULAR_SPIKING, FAST_SPIKING, etc.).
-    parameters : IzhikevichParameters, optional
-        Custom parameters. Overrides neuron_type if both provided.
-
-    Examples
-    --------
-    >>> # Regular spiking cortical neuron
-    >>> neuron = IzhikevichNeuron(IzhikevichType.REGULAR_SPIKING)
-    >>> trace = neuron.simulate(duration=100, dt=0.1, I_ext=10)
-
-    >>> # Fast spiking interneuron
-    >>> neuron = IzhikevichNeuron(IzhikevichType.FAST_SPIKING)
+    .. deprecated::
+        Use :class:`NeuronModelSpec.izhikevich()` with :class:`RegionalNetwork` instead.
     """
 
     def __init__(
         self,
-        neuron_type: IzhikevichType | None = None,
-        parameters: IzhikevichParameters | None = None,
+        neuron_type: "IzhikevichType | None" = None,
+        parameters: "_IzhikevichParameters | None" = None,
     ):
         if parameters is not None:
             self._neuron = _IzhikevichNeuron(parameters)
@@ -312,12 +326,12 @@ class IzhikevichNeuron:
         return self._neuron.u
 
     @property
-    def state(self) -> IzhikevichState:
+    def state(self) -> "_IzhikevichState":
         """Current state of the neuron (v, u)."""
         return self._neuron.state
 
     @property
-    def parameters(self) -> IzhikevichParameters:
+    def parameters(self) -> "_IzhikevichParameters":
         """Neuron parameters (a, b, c, d)."""
         return self._neuron.parameters
 
@@ -375,7 +389,7 @@ class IzhikevichNeuron:
         return np.array(trace, dtype=np.float64)
 
     @staticmethod
-    def get_preset(neuron_type: IzhikevichType) -> IzhikevichParameters:
+    def get_preset(neuron_type: "IzhikevichType") -> "_IzhikevichParameters":
         """Get parameters for a preset neuron type."""
         return _IzhikevichNeuron.get_preset(neuron_type)
 
@@ -383,37 +397,27 @@ class IzhikevichNeuron:
         return f"<IzhikevichNeuron v={self.V:.2f} mV>"
 
 
-class Network:
+class _NetworkWrapper:
     """
     Network of interconnected neurons.
 
     Supports mixed networks with HH and Izhikevich neurons.
 
+    .. deprecated::
+        Use :class:`RegionalNetwork` instead.
+
     Parameters
     ----------
     num_neurons : int, optional
         Number of HH neurons to create. Default is 0.
-    neuron_type : NetworkNeuronType, optional
+    neuron_type : _NetworkNeuronType, optional
         Type of neurons to create when using num_neurons.
-
-    Examples
-    --------
-    >>> # Create HH network
-    >>> net = Network(2)
-    >>> net.add_synapse(0, 1, weight=0.5)
-    >>> traces = net.simulate(duration=100, dt=0.01, I_ext=[[10]*10000, [0]*10000])
-
-    >>> # Create mixed network
-    >>> net = Network()
-    >>> net.add_hh_neuron()
-    >>> net.add_izhikevich_neuron(IzhikevichType.FAST_SPIKING)
-    >>> net.add_synapse(0, 1, weight=1.0)
     """
 
     def __init__(
         self,
         num_neurons: int = 0,
-        neuron_type: NetworkNeuronType | None = None,
+        neuron_type=None,
     ):
         if neuron_type is not None:
             self._network = _Network(num_neurons, neuron_type)
@@ -423,7 +427,7 @@ class Network:
     def add_neuron(
         self,
         parameters: "Union[HHParameters, IzhikevichParameters, NeuronModelSpec, None]" = None,
-        neuron_type: NetworkNeuronType | None = None,
+        neuron_type=None,
         model: "NeuronModelSpec | NeuronModel | None" = None,
     ) -> int:
         """
@@ -433,7 +437,7 @@ class Network:
         ----------
         parameters : HHParameters, IzhikevichParameters, or NeuronModelSpec, optional
             Custom parameters for the neuron.
-        neuron_type : NetworkNeuronType, optional
+        neuron_type : _NetworkNeuronType, optional
             Type of neuron to add.
         model : NeuronModelSpec or NeuronModel, optional
             Composable neuron model specification.
@@ -467,8 +471,8 @@ class Network:
             Index of the added neuron.
         """
         if parameters is not None:
-            return self._network.add_hh_neuron(parameters)
-        return self._network.add_hh_neuron()
+            return self._network.add_neuron(parameters)
+        return self._network.add_neuron()
 
     def add_izhikevich_neuron(
         self,
@@ -491,8 +495,10 @@ class Network:
             Index of the added neuron.
         """
         if parameters is not None:
-            return self._network.add_izhikevich_neuron(parameters)
-        return self._network.add_izhikevich_neuron(neuron_type)
+            return self._network.add_neuron(parameters)
+        # IzhikevichType is not a Network::NeuronType — convert via get_preset
+        params = _IzhikevichNeuron.get_preset(neuron_type)
+        return self._network.add_neuron(params)
 
     def add_synapse(
         self,
@@ -591,7 +597,8 @@ class Network:
             Axonal conduction delay in ms. Default is 0.
         """
         self._network.add_double_exp_synapse(
-            pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay, delay)
+            pre_idx, post_idx, weight, E_syn, tau_rise, tau_decay, delay
+        )
 
     def add_ampa_synapse(
         self,
@@ -812,11 +819,19 @@ class Network:
         MetricsResult
             When record is a RecordingConfig.
         """
-        from .recording import _run_recording, RecordingConfig as _RC
+        from .recording import RecordingConfig as _RC
+        from .recording import _run_recording
+
         I_ext_list = np.ascontiguousarray(I_ext, dtype=np.float64)
         cfg = record if record is not None else _RC(["V"])
-        result = _run_recording(self._network, duration, dt, I_ext_list, cfg,
-                                detection_threshold=detection_threshold)
+        result = _run_recording(
+            self._network,
+            duration,
+            dt,
+            I_ext_list,
+            cfg,
+            detection_threshold=detection_threshold,
+        )
         if record is None:
             return result["V"]
         return result
@@ -830,13 +845,13 @@ class Network:
 
 # String-to-enum mapping for neuron types
 _NEURON_TYPE_MAP = {
-    "HH": NetworkNeuronType.HH,
-    "IZHIKEVICH_RS": NetworkNeuronType.IZHIKEVICH_RS,
-    "IZHIKEVICH_FS": NetworkNeuronType.IZHIKEVICH_FS,
-    "IZHIKEVICH_IB": NetworkNeuronType.IZHIKEVICH_IB,
-    "IZHIKEVICH_CH": NetworkNeuronType.IZHIKEVICH_CH,
-    "IZHIKEVICH_LTS": NetworkNeuronType.IZHIKEVICH_LTS,
-    "IZHIKEVICH_CUSTOM": NetworkNeuronType.IZHIKEVICH_CUSTOM,
+    "HH": _NetworkNeuronType.HH,
+    "IZHIKEVICH_RS": _NetworkNeuronType.IZHIKEVICH_RS,
+    "IZHIKEVICH_FS": _NetworkNeuronType.IZHIKEVICH_FS,
+    "IZHIKEVICH_IB": _NetworkNeuronType.IZHIKEVICH_IB,
+    "IZHIKEVICH_CH": _NetworkNeuronType.IZHIKEVICH_CH,
+    "IZHIKEVICH_LTS": _NetworkNeuronType.IZHIKEVICH_LTS,
+    "IZHIKEVICH_CUSTOM": _NetworkNeuronType.IZHIKEVICH_CUSTOM,
 }
 
 # String-to-enum mapping for connectivity patterns
@@ -863,8 +878,9 @@ def _resolve_weight(weight) -> WeightDistribution:
     )
 
 
-def _generate_pairs(pattern, src_size, dst_size, shift, probability, allow_self, rng,
-                    same_pop=False):
+def _generate_pairs(
+    pattern, src_size, dst_size, shift, probability, allow_self, rng, same_pop=False
+):
     """Generate (i, j) pairs for a preset connectivity pattern."""
     pairs = []
     if pattern == ConnectivityPattern.ALL_TO_ALL:
@@ -901,6 +917,7 @@ def _generate_pairs(pattern, src_size, dst_size, shift, probability, allow_self,
 # Heterogeneity helpers (used by RegionalNetwork.add_population)
 # ---------------------------------------------------------------------------
 
+
 def _het_sample(dist: str, p1: float, p2: float, rng) -> float:
     """Sample a multiplicative scale factor from the given distribution."""
     if dist == "normal":
@@ -917,7 +934,8 @@ def _het_sample(dist: str, p1: float, p2: float, rng) -> float:
 def _het_get(spec, path: str):
     """Read a field from a NeuronModelSpec via a dotted path."""
     import re
-    m = re.match(r'^(channels|gates)\[(\d+)\]\.(\w+)$', path)
+
+    m = re.match(r"^(channels|gates)\[(\d+)\]\.(\w+)$", path)
     if m:
         col, idx, attr = m.group(1), int(m.group(2)), m.group(3)
         return getattr(getattr(spec, col)[idx], attr)
@@ -932,12 +950,13 @@ def _het_get(spec, path: str):
 def _het_set(spec, path: str, value: float) -> None:
     """Write a field on a NeuronModelSpec via a dotted path."""
     import re
-    m = re.match(r'^(channels|gates)\[(\d+)\]\.(\w+)$', path)
+
+    m = re.match(r"^(channels|gates)\[(\d+)\]\.(\w+)$", path)
     if m:
         col, idx, attr = m.group(1), int(m.group(2)), m.group(3)
-        items = getattr(spec, col)   # get as Python list
+        items = getattr(spec, col)  # get as Python list
         setattr(items[idx], attr, value)
-        setattr(spec, col, items)    # write back (safe for copy or reference semantics)
+        setattr(spec, col, items)  # write back (safe for copy or reference semantics)
         return
     if hasattr(spec, path):
         setattr(spec, path, value)
@@ -948,19 +967,22 @@ def _het_set(spec, path: str, value: float) -> None:
     )
 
 
-def _build_heterogeneous_specs(base_spec, count: int, heterogeneity: dict, seed) -> list:
+def _build_heterogeneous_specs(
+    base_spec, count: int, heterogeneity: dict, seed
+) -> list:
     """
     Return a list of *count* NeuronModelSpec copies, each with independent
     parameter samples drawn from *heterogeneity*.
     """
     import copy
+
     rng = np.random.default_rng(seed)
     specs = []
     for _ in range(count):
-        s = copy.copy(base_spec)   # C++ copy constructor via __copy__
+        s = copy.copy(base_spec)  # C++ copy constructor via __copy__
         for path, (dist, p1, p2) in heterogeneity.items():
             base_val = _het_get(s, path)
-            scale    = _het_sample(dist, p1, p2, rng)
+            scale = _het_sample(dist, p1, p2, rng)
             _het_set(s, path, base_val * scale)
         specs.append(s)
     return specs
@@ -991,7 +1013,7 @@ class RegionalNetwork:
         self,
         name: str,
         count: int,
-        neuron_type: "str | NetworkNeuronType | None" = None,
+        neuron_type: "str | None" = None,
         parameters: "HHParameters | IzhikevichParameters | None" = None,
         model: "NeuronModelSpec | NeuronModel | None" = None,
         heterogeneity: "dict | None" = None,
@@ -1006,7 +1028,7 @@ class RegionalNetwork:
             Unique name for the population.
         count : int
             Number of neurons.
-        neuron_type : str or NetworkNeuronType, optional
+        neuron_type : str, optional
             Neuron type preset ('HH', 'IZHIKEVICH_RS', etc.).
         parameters : HHParameters or IzhikevichParameters, optional
             Custom neuron parameters (overrides neuron_type).
@@ -1043,7 +1065,7 @@ class RegionalNetwork:
             self._rnet.add_population(name, count, neuron_type)
         else:
             # Default to HH
-            self._rnet.add_population(name, count, NetworkNeuronType.HH)
+            self._rnet.add_population(name, count, _NetworkNeuronType.HH)
 
     def connect(
         self,
@@ -1094,27 +1116,42 @@ class RegionalNetwork:
             rng = np.random.default_rng(seed if seed != 0 else None)
             src_size = self._rnet.population_size(src)
             dst_size = self._rnet.population_size(dst)
-            same_pop = (src == dst)
+            same_pop = src == dst
             if callable(pattern):
                 pairs = pattern(src_size, dst_size)
             elif isinstance(pattern, str):
                 pattern = _PATTERN_MAP[pattern.upper()]
-                pairs = _generate_pairs(pattern, src_size, dst_size,
-                                        shift, probability, allow_self, rng,
-                                        same_pop=same_pop)
+                pairs = _generate_pairs(
+                    pattern,
+                    src_size,
+                    dst_size,
+                    shift,
+                    probability,
+                    allow_self,
+                    rng,
+                    same_pop=same_pop,
+                )
             else:
-                pairs = _generate_pairs(pattern, src_size, dst_size,
-                                        shift, probability, allow_self, rng,
-                                        same_pop=same_pop)
-            for (i, j) in pairs:
+                pairs = _generate_pairs(
+                    pattern,
+                    src_size,
+                    dst_size,
+                    shift,
+                    probability,
+                    allow_self,
+                    rng,
+                    same_pop=same_pop,
+                )
+            for i, j in pairs:
                 if wdist.type == WeightDistType.CONSTANT:
                     w = wdist.param1
                 elif wdist.type == WeightDistType.UNIFORM:
                     w = rng.uniform(wdist.param1, wdist.param2)
                 else:
                     w = rng.normal(wdist.param1, wdist.param2)
-                self._rnet.add_kinetic_connection(src, int(i), dst, int(j),
-                                                  float(w), kinetic_spec, delay)
+                self._rnet.add_kinetic_connection(
+                    src, int(i), dst, int(j), float(w), kinetic_spec, delay
+                )
             return
 
         synapse = synapse or SynapseSpec.ampa()
@@ -1125,21 +1162,32 @@ class RegionalNetwork:
             dst_size = self._rnet.population_size(dst)
             pairs = pattern(src_size, dst_size)
             rng = np.random.default_rng(seed if seed != 0 else None)
-            for (i, j) in pairs:
+            for i, j in pairs:
                 if wdist.type == WeightDistType.CONSTANT:
                     w = wdist.param1
                 elif wdist.type == WeightDistType.UNIFORM:
                     w = rng.uniform(wdist.param1, wdist.param2)
                 else:  # NORMAL
                     w = rng.normal(wdist.param1, wdist.param2)
-                self._rnet.add_connection(src, int(i), dst, int(j),
-                                          float(w), synapse, delay)
+                self._rnet.add_connection(
+                    src, int(i), dst, int(j), float(w), synapse, delay
+                )
         else:
             # Preset pattern: delegate to C++
             if isinstance(pattern, str):
                 pattern = _PATTERN_MAP[pattern.upper()]
-            self._rnet.connect(src, dst, pattern, synapse, wdist, delay,
-                               shift, probability, allow_self, seed)
+            self._rnet.connect(
+                src,
+                dst,
+                pattern,
+                synapse,
+                wdist,
+                delay,
+                shift,
+                probability,
+                allow_self,
+                seed,
+            )
 
     def add_connection(
         self,
@@ -1153,8 +1201,9 @@ class RegionalNetwork:
     ) -> None:
         """Add a single synapse between two populations using local indices."""
         synapse = synapse or SynapseSpec.ampa()
-        self._rnet.add_connection(src, src_local, dst, dst_local, weight,
-                                  synapse, delay)
+        self._rnet.add_connection(
+            src, src_local, dst, dst_local, weight, synapse, delay
+        )
 
     def add_kinetic_connection(
         self,
@@ -1212,6 +1261,7 @@ class RegionalNetwork:
         # the library stays usable without it as a hard dep at import time.
         try:
             import numpy as np
+
             if isinstance(matrix, np.ndarray):
                 if matrix.ndim != 2:
                     raise ValueError(
@@ -1227,7 +1277,9 @@ class RegionalNetwork:
                 nz_i, nz_j = matrix.nonzero()
                 for i, j in zip(nz_i, nz_j):
                     w = float(matrix[i, j]) * weight_scale
-                    self._rnet.add_connection(src, int(i), dst, int(j), w, synapse, delay)
+                    self._rnet.add_connection(
+                        src, int(i), dst, int(j), w, synapse, delay
+                    )
                 return
         except ImportError:
             pass
@@ -1245,11 +1297,17 @@ class RegionalNetwork:
                 )
             for j, w in enumerate(row):
                 if w:
-                    self._rnet.add_connection(src, i, dst, j, float(w) * weight_scale, synapse, delay)
+                    self._rnet.add_connection(
+                        src, i, dst, j, float(w) * weight_scale, synapse, delay
+                    )
 
     def randomize_membrane_potentials(
-        self, name: str, V_mean: float, V_std: float, seed: int = 0,
-        reset_gates: bool = False
+        self,
+        name: str,
+        V_mean: float,
+        V_std: float,
+        seed: int = 0,
+        reset_gates: bool = False,
     ) -> None:
         """Randomize membrane potentials for a population."""
         self._rnet.randomize_membrane_potentials(name, V_mean, V_std, seed, reset_gates)
@@ -1360,8 +1418,9 @@ class RegionalNetwork:
         PopulationMetricsResult
             When record is a RecordingConfig.
         """
-        from .recording import (_run_recording, RecordingConfig as _RC,
-                                PopulationMetricsResult as _PMR, _StimPlan)
+        from .recording import PopulationMetricsResult as _PMR
+        from .recording import RecordingConfig as _RC
+        from .recording import _run_recording, _StimPlan
 
         num_neurons = self._rnet.num_neurons
         num_steps = int(duration / dt)
@@ -1370,8 +1429,7 @@ class RegionalNetwork:
             I_ext = {}
 
         pop_info = {
-            name: (self._rnet.population_start(name),
-                   self._rnet.population_size(name))
+            name: (self._rnet.population_start(name), self._rnet.population_size(name))
             for name in self._rnet.population_names()
         }
 
@@ -1383,18 +1441,14 @@ class RegionalNetwork:
             # Falls back to dense only when a population receives a pre-computed
             # 1D/2D numpy array that cannot be expressed as descriptors.
             can_use_descriptors = all(
-                np.asarray(v, dtype=np.float64).ndim == 0
-                for v in I_ext.values()
-            ) and all(
-                isinstance(s, DBSStimulator)
-                for s in self._stimulators.values()
-            )
+                np.asarray(v, dtype=np.float64).ndim == 0 for v in I_ext.values()
+            ) and all(isinstance(s, DBSStimulator) for s in self._stimulators.values())
 
             if can_use_descriptors:
                 I_const = np.zeros(num_neurons, dtype=np.float64)
                 for name, val in I_ext.items():
                     start, size = pop_info[name]
-                    I_const[start:start + size] = float(np.asarray(val))
+                    I_const[start : start + size] = float(np.asarray(val))
 
                 dbs_events = []
                 for pop_name, stim in self._stimulators.items():
@@ -1403,10 +1457,9 @@ class RegionalNetwork:
                     if freq > 0:
                         isi_ms = 1000.0 / freq
                         isi_steps = max(1, round(isi_ms / dt))
-                        pw_steps  = max(1, round(stim.pulse_width / dt))
+                        pw_steps = max(1, round(stim.pulse_width / dt))
                         dbs_events.append(
-                            (start, start + size, isi_steps, pw_steps,
-                             stim.amplitude)
+                            (start, start + size, isi_steps, pw_steps, stim.amplitude)
                         )
 
                 stim_plan = _StimPlan(
@@ -1421,11 +1474,11 @@ class RegionalNetwork:
                     start, size = pop_info[name]
                     val = np.asarray(val, dtype=np.float64)
                     if val.ndim == 0:
-                        flat[start:start + size, :] = val.item()
+                        flat[start : start + size, :] = val.item()
                     elif val.ndim == 1:
-                        flat[start:start + size, :] = val[np.newaxis, :num_steps]
+                        flat[start : start + size, :] = val[np.newaxis, :num_steps]
                     elif val.ndim == 2:
-                        flat[start:start + size, :] = val[:, :num_steps]
+                        flat[start : start + size, :] = val[:, :num_steps]
                     else:
                         raise ValueError(
                             f"I_ext['{name}'] must be scalar, 1D, or 2D, "
@@ -1434,7 +1487,7 @@ class RegionalNetwork:
                 for pop_name, stim in self._stimulators.items():
                     stim_trace = stim.generate(duration, dt)
                     start, size = pop_info[pop_name]
-                    flat[start:start + size, :] += np.array(
+                    flat[start : start + size, :] += np.array(
                         stim_trace[:num_steps], dtype=np.float64
                     )[np.newaxis, :]
                 I_ext_list = flat
@@ -1443,15 +1496,23 @@ class RegionalNetwork:
 
         cfg = record if record is not None else _RC(["V"])
         result = _run_recording(
-            self._rnet.network(), duration, dt, I_ext_list, cfg, pop_info,
+            self._rnet.network(),
+            duration,
+            dt,
+            I_ext_list,
+            cfg,
+            pop_info,
             detection_threshold=detection_threshold,
-            stim_plan=stim_plan)
+            stim_plan=stim_plan,
+        )
 
         if record is None:
             # Backward compat: return {pop_name: ndarray}
             V = result["V"]  # shape (n_neurons, n_steps) since neurons="all"
-            return {name: V[start:start + size, :]
-                    for name, (start, size) in pop_info.items()}
+            return {
+                name: V[start : start + size, :]
+                for name, (start, size) in pop_info.items()
+            }
 
         return _PMR(result, pop_info, record)
 
@@ -1469,8 +1530,10 @@ class RegionalNetwork:
 # Python helper classes for composable neuron model building
 # =============================================================================
 
+
 class Boltzmann:
     """Helper to create BoltzmannParams."""
+
     def __init__(self, v_half: float, k: float):
         self.v_half = v_half
         self.k = k
@@ -1607,8 +1670,11 @@ class NeuronModel:
             "instant": GateUpdateForm.INSTANT,
             "derived": GateUpdateForm.DERIVED,
         }[update_form.lower()]
-        g.dependency = (GateDependency.CALCIUM if dependency.lower() == "calcium"
-                        else GateDependency.VOLTAGE)
+        g.dependency = (
+            GateDependency.CALCIUM
+            if dependency.lower() == "calcium"
+            else GateDependency.VOLTAGE
+        )
         g.scale = scale
         g.initial_value = initial_value
         if inf is not None:
@@ -1674,36 +1740,6 @@ class NeuronModel:
     def to_spec(self) -> NeuronModelSpec:
         """Build and return the NeuronModelSpec."""
         return self._spec
-
-    @staticmethod
-    def thalamic() -> "NeuronModel":
-        m = NeuronModel.__new__(NeuronModel)
-        m._spec = NeuronModelSpec.thalamic()
-        return m
-
-    @staticmethod
-    def stn() -> "NeuronModel":
-        m = NeuronModel.__new__(NeuronModel)
-        m._spec = NeuronModelSpec.stn()
-        return m
-
-    @staticmethod
-    def gpe() -> "NeuronModel":
-        m = NeuronModel.__new__(NeuronModel)
-        m._spec = NeuronModelSpec.gpe()
-        return m
-
-    @staticmethod
-    def gpi() -> "NeuronModel":
-        m = NeuronModel.__new__(NeuronModel)
-        m._spec = NeuronModelSpec.gpi()
-        return m
-
-    @staticmethod
-    def striatum(pd: float = 0.0) -> "NeuronModel":
-        m = NeuronModel.__new__(NeuronModel)
-        m._spec = NeuronModelSpec.striatum(pd)
-        return m
 
     def __repr__(self) -> str:
         return (
@@ -1810,6 +1846,7 @@ class KineticSynapseModel:
 # DBSStimulator — Deep Brain Stimulation pulse-train generator
 # =============================================================================
 
+
 class DBSStimulator:
     """
     Deep Brain Stimulation current generator.
@@ -1851,8 +1888,8 @@ class DBSStimulator:
         pulse_width: float = 0.06,
     ):
         p = DBSParameters()
-        p.frequency   = frequency
-        p.amplitude   = amplitude
+        p.frequency = frequency
+        p.amplitude = amplitude
         p.pulse_width = pulse_width
         self._dbs = _DBSStimulator(p)
 
@@ -1918,8 +1955,8 @@ class DBSStimulator:
         current value.
         """
         p = DBSParameters()
-        p.frequency   = frequency   if frequency   is not None else self.frequency
-        p.amplitude   = amplitude   if amplitude   is not None else self.amplitude
+        p.frequency = frequency if frequency is not None else self.frequency
+        p.amplitude = amplitude if amplitude is not None else self.amplitude
         p.pulse_width = pulse_width if pulse_width is not None else self.pulse_width
         self._dbs.set_parameters(p)
 

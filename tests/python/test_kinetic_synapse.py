@@ -27,7 +27,6 @@ import numpy as np
 
 import hodgkin_huxley as hh
 from hodgkin_huxley import (
-    Network,
     RegionalNetwork,
     KineticSynapseSpec,
     KineticUpdateForm,
@@ -35,6 +34,7 @@ from hodgkin_huxley import (
     KineticSynapseModel,
     NeuronModelSpec,
     SynapseSpec,
+    RecordingConfig,
     WeightDistribution,
     ConnectivityPattern,
     TauParams,
@@ -42,32 +42,33 @@ from hodgkin_huxley import (
     BoltzmannParams,
     RateFuncParams,
     RateFuncForm,
-    NetworkNeuronType,
     IzhikevichType,
-    IzhikevichParameters,
 )
+from neuron_specs import make_thalamic, make_stn, make_gpe, make_gpi, make_striatum
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+
+# ── constants ─────────────────────────────────────────────────────────────────
 
 DT   = 0.025   # ms — typical simulation step
 LONG = 2000.0  # ms — enough for S to converge for most specs
 
 
-def _run(net: Network, duration: float = LONG, dt: float = DT,
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _fresh_rn_with_spec(spec: KineticSynapseSpec, weight: float = 1.0):
+    """Return (rn, kin_syn_idx=0) — 2-neuron HH network with one kinetic synapse."""
+    rn = RegionalNetwork()
+    rn.add_population("pre",  1, model=NeuronModelSpec.hh_default())
+    rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
+    rn.add_kinetic_connection("pre", 0, "post", 0, weight=weight, spec=spec)
+    return rn, 0   # kinetic synapse index 0
+
+
+def _run(rn: RegionalNetwork, duration: float = LONG, dt: float = DT,
          I_pre: float = 0.0, I_post: float = 0.0) -> np.ndarray:
-    """Simulate a 2-neuron network and return traces (2, steps)."""
-    n_steps = int(duration / dt)
-    I_ext = [[I_pre] * n_steps, [I_post] * n_steps]
-    return np.array(net.simulate(duration, dt, I_ext))
-
-
-def _fresh_net_with_spec(spec: KineticSynapseSpec, weight: float = 1.0):
-    """Return (net, pre_idx, post_idx, syn_idx)."""
-    net = Network()
-    pre  = net.add_neuron()
-    post = net.add_neuron()
-    syn  = net.add_kinetic_synapse(pre, post, weight, spec)
-    return net, pre, post, syn
+    """Simulate and return stacked (2, n_steps) voltage traces."""
+    result = rn.simulate(duration, dt, {"pre": I_pre, "post": I_post})
+    return np.vstack([result["pre"], result["post"]])
 
 
 def _count_spikes(trace: np.ndarray, threshold: float = 0.0) -> int:
@@ -83,6 +84,16 @@ def _count_spikes(trace: np.ndarray, threshold: float = 0.0) -> int:
 
 def _all_finite(arr: np.ndarray) -> bool:
     return bool(np.all(np.isfinite(arr)))
+
+
+def _get_S(rn: RegionalNetwork, syn: int) -> float:
+    """Get kinetic gating variable S from the underlying network."""
+    return rn._rnet.network().get_kin_S(syn)
+
+
+def _get_g(rn: RegionalNetwork, syn: int) -> float:
+    """Get effective kinetic conductance g from the underlying network."""
+    return rn._rnet.network().get_kin_g(syn)
 
 
 # ── standard specs (reused across tests) ─────────────────────────────────────
@@ -108,11 +119,7 @@ def _alpha_beta_spec(name="ab_spec") -> KineticSynapseSpec:
 
 
 def _boltzmann_linear_spec(name="btz_lin") -> KineticSynapseSpec:
-    return KineticSynapseSpec.nmda_kinetic().__class__._copy_with_name(
-        KineticSynapseSpec.nmda_kinetic(), name
-    ) if hasattr(KineticSynapseSpec.nmda_kinetic().__class__, '_copy_with_name') else (
-        _boltzmann_spec_manual(name, current_form=KineticCurrentForm.LINEAR)
-    )
+    return _boltzmann_spec_manual(name, current_form=KineticCurrentForm.LINEAR)
 
 
 def _boltzmann_spec_manual(name="btz", current_form=KineticCurrentForm.LINEAR,
@@ -129,6 +136,25 @@ def _boltzmann_spec_manual(name="btz", current_form=KineticCurrentForm.LINEAR,
     s.power = 1
     s.mg_conc = 1.0; s.mg_scale = 0.062; s.mg_denom = 3.57
     return s
+
+
+# ── neuron model factories (replace NetworkNeuronType) ────────────────────────
+
+def _hh_model():    return NeuronModelSpec.hh_default()
+def _iz_rs_model(): return NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING)
+def _iz_fs_model(): return NeuronModelSpec.izhikevich(IzhikevichType.FAST_SPIKING)
+def _iz_ib_model(): return NeuronModelSpec.izhikevich(IzhikevichType.INTRINSICALLY_BURSTING)
+def _iz_ch_model(): return NeuronModelSpec.izhikevich(IzhikevichType.CHATTERING)
+def _iz_lts_model(): return NeuronModelSpec.izhikevich(IzhikevichType.LOW_THRESHOLD_SPIKING)
+
+# ComposableNeuron model specs
+_COMPOSABLE_MODELS = {
+    "thalamic": make_thalamic,
+    "stn":      make_stn,
+    "gpe":      make_gpe,
+    "gpi":      make_gpi,
+    "striatum": make_striatum,
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -175,46 +201,43 @@ def test_gaba_b_preset_fields():
 
 @pytest.mark.parametrize("S_init", [0.0, 0.25, 0.5, 0.75, 1.0])
 def test_s_init_respected(S_init):
-    """get_kin_S() immediately after add returns S_init."""
+    """S immediately after construction equals S_init."""
     spec = KineticSynapseSpec.gaba_kinetic()
     spec.S_init = S_init
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    assert math.isclose(net.get_kin_S(syn), S_init, rel_tol=1e-12)
+    rn, syn = _fresh_rn_with_spec(spec)
+    assert math.isclose(_get_S(rn, syn), S_init, rel_tol=1e-12)
 
 
 @pytest.mark.parametrize("S_init", [0.0, 0.5, 1.0])
 def test_reset_restores_s_init(S_init):
-    """After simulate() + reset(), get_kin_S() == S_init."""
+    """After simulate() + reset(), S == S_init."""
     spec = KineticSynapseSpec.gaba_kinetic()
     spec.S_init = S_init
-    net, _, _, syn = _fresh_net_with_spec(spec)
+    rn, syn = _fresh_rn_with_spec(spec)
 
-    # Drive the pre so S changes
-    _run(net, duration=500.0, I_pre=10.0)
-    S_after_sim = net.get_kin_S(syn)
-
-    net.reset()
-    assert math.isclose(net.get_kin_S(syn), S_init, abs_tol=1e-12), \
-        f"After reset S={net.get_kin_S(syn)}, expected S_init={S_init}"
+    _run(rn, 500.0, I_pre=10.0)
+    rn.reset()
+    assert math.isclose(_get_S(rn, syn), S_init, abs_tol=1e-12), \
+        f"After reset S={_get_S(rn, syn)}, expected S_init={S_init}"
 
 
 def test_reset_g_is_zero():
     """After reset, g should be 0.0 for a synapse that was active."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    _run(net, duration=200.0, I_pre=15.0)
-    net.reset()
-    assert math.isclose(net.get_kin_g(syn), 0.0, abs_tol=1e-12)
+    rn, syn = _fresh_rn_with_spec(spec)
+    _run(rn, 200.0, I_pre=15.0)
+    rn.reset()
+    assert math.isclose(_get_g(rn, syn), 0.0, abs_tol=1e-12)
 
 
 def test_two_sims_after_reset_identical():
     """Simulate → reset → simulate again produces identical traces."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, _ = _fresh_net_with_spec(spec)
+    rn, _ = _fresh_rn_with_spec(spec)
 
-    t1 = _run(net, duration=200.0, I_pre=8.0, I_post=5.0)
-    net.reset()
-    t2 = _run(net, duration=200.0, I_pre=8.0, I_post=5.0)
+    t1 = _run(rn, 200.0, I_pre=8.0, I_post=5.0)
+    rn.reset()
+    t2 = _run(rn, 200.0, I_pre=8.0, I_post=5.0)
     np.testing.assert_array_almost_equal(t1, t2, decimal=10)
 
 
@@ -225,19 +248,18 @@ def test_two_sims_after_reset_identical():
 def test_tanh_gate_s_near_zero_at_rest():
     """With silent HH pre (I_ext=0, V≈-65), GABA kinetic S → ≈ 0."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    _run(net, duration=LONG, I_pre=0.0, I_post=0.0)
-    S = net.get_kin_S(syn)
-    # At V=-65: rate_open = 2*(1+tanh(-65/4)) ≈ 0
+    rn, syn = _fresh_rn_with_spec(spec)
+    _run(rn, LONG, I_pre=0.0, I_post=0.0)
+    S = _get_S(rn, syn)
     assert S < 0.02, f"S at rest should be near 0, got {S:.4f}"
 
 
 def test_tanh_gate_s_positive_with_active_pre():
     """With spiking HH pre, GABA kinetic S rises above zero."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    _run(net, duration=500.0, I_pre=12.0, I_post=0.0)
-    S = net.get_kin_S(syn)
+    rn, syn = _fresh_rn_with_spec(spec)
+    _run(rn, 500.0, I_pre=12.0, I_post=0.0)
+    S = _get_S(rn, syn)
     assert S > 0.05, f"S with active pre should be > 0, got {S:.4f}"
 
 
@@ -246,13 +268,13 @@ def test_tanh_gate_s_higher_with_stronger_drive():
     spec_a = KineticSynapseSpec.gaba_kinetic(); spec_a.name = "a"
     spec_b = KineticSynapseSpec.gaba_kinetic(); spec_b.name = "b"
 
-    net_weak, _, _, syn_w = _fresh_net_with_spec(spec_a)
-    _run(net_weak, duration=500.0, I_pre=5.0)
-    S_weak = net_weak.get_kin_S(syn_w)
+    rn_weak, syn_w = _fresh_rn_with_spec(spec_a)
+    _run(rn_weak, 500.0, I_pre=5.0)
+    S_weak = _get_S(rn_weak, syn_w)
 
-    net_strong, _, _, syn_s = _fresh_net_with_spec(spec_b)
-    _run(net_strong, duration=500.0, I_pre=15.0)
-    S_strong = net_strong.get_kin_S(syn_s)
+    rn_strong, syn_s = _fresh_rn_with_spec(spec_b)
+    _run(rn_strong, 500.0, I_pre=15.0)
+    S_strong = _get_S(rn_strong, syn_s)
 
     assert S_strong >= S_weak, \
         f"Stronger drive should yield >= S: {S_strong:.4f} vs {S_weak:.4f}"
@@ -270,9 +292,9 @@ def test_tanh_gate_analytical_steady_state():
     rate_total = rate_open + 1.0 / spec.tau_decay
     S_inf = rate_open / rate_total
 
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    _run(net, duration=LONG, I_pre=0.0)
-    S_sim = net.get_kin_S(syn)
+    rn, syn = _fresh_rn_with_spec(spec)
+    _run(rn, LONG, I_pre=0.0)
+    S_sim = _get_S(rn, syn)
     assert abs(S_sim - S_inf) < 0.01, \
         f"S_sim={S_sim:.5f} S_inf={S_inf:.5f}"
 
@@ -281,15 +303,13 @@ def test_alpha_beta_analytical_steady_state():
     """ALPHA_BETA: at rest (V≈-65) S → α/(α+β) analytically."""
     spec = _alpha_beta_spec()
     # α ≈ 0.5, β ≈ 0.1 (via EXP_DECAY with very large C → f(V)≈A)
-    V_pre = -65.0
-    # compute rate at V=-65: A*exp((V+B)/C) with C=1e9 → ≈ A*1.0 = A
     alpha_val = spec.alpha.A
     beta_val  = spec.beta.A
     S_inf = alpha_val / (alpha_val + beta_val)
 
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    _run(net, duration=LONG, I_pre=0.0)
-    S_sim = net.get_kin_S(syn)
+    rn, syn = _fresh_rn_with_spec(spec)
+    _run(rn, LONG, I_pre=0.0)
+    S_sim = _get_S(rn, syn)
     assert abs(S_sim - S_inf) < 0.01, \
         f"S_sim={S_sim:.5f} S_inf={S_inf:.5f}"
 
@@ -300,9 +320,9 @@ def test_boltzmann_gate_analytical_steady_state():
     V_pre = -65.0
     S_inf = 1.0 / (1.0 + math.exp(-(V_pre - spec.s_inf.v_half) / spec.s_inf.k))
 
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    _run(net, duration=LONG, I_pre=0.0)
-    S_sim = net.get_kin_S(syn)
+    rn, syn = _fresh_rn_with_spec(spec)
+    _run(rn, LONG, I_pre=0.0)
+    S_sim = _get_S(rn, syn)
     assert abs(S_sim - S_inf) < 0.01, \
         f"S_sim={S_sim:.5f} S_inf={S_inf:.5f}"
 
@@ -322,19 +342,16 @@ def test_boltzmann_gate_analytical_steady_state():
 def test_s_bounded(spec_factory, I_pre):
     """S must remain in [0, 1] throughout simulation."""
     spec = spec_factory()
-    net, _, _, syn = _fresh_net_with_spec(spec)
+    rn, syn = _fresh_rn_with_spec(spec)
 
     dt = DT
-    duration = 500.0
-    n_steps = int(duration / dt)
-    I_ext = [[I_pre] * n_steps, [0.0] * n_steps]
+    n_steps_check = 2000
 
-    # Use step() to check S after every step
-    net._network.reset()
+    rn.reset()
     S_vals = []
-    for _ in range(min(n_steps, 2000)):   # check first 2000 steps
-        net._network.step(dt, [I_pre, 0.0])
-        S_vals.append(net.get_kin_S(syn))
+    for _ in range(n_steps_check):
+        rn._rnet.network().step(dt, [I_pre, 0.0])
+        S_vals.append(_get_S(rn, syn))
 
     assert all(0.0 - 1e-10 <= s <= 1.0 + 1e-10 for s in S_vals), \
         f"S out of [0,1]: min={min(S_vals):.4f} max={max(S_vals):.4f}"
@@ -346,7 +363,6 @@ def test_s_bounded(spec_factory, I_pre):
 
 def test_mg_block_reduces_conductance_at_hyperpolarised():
     """At V_post=-70, MG_BLOCK g_eff < LINEAR g_eff (same S)."""
-    # Use NMDA preset (MG) vs manual boltzmann-linear with same kinetics
     spec_mg  = KineticSynapseSpec.nmda_kinetic()
     spec_lin = _boltzmann_spec_manual("nmda_lin", current_form=KineticCurrentForm.LINEAR,
                                       tau_val=80.0)
@@ -355,37 +371,29 @@ def test_mg_block_reduces_conductance_at_hyperpolarised():
     spec_lin.g = spec_mg.g
     spec_lin.E_syn = spec_mg.E_syn
 
-    net_mg, _, post_mg, syn_mg   = _fresh_net_with_spec(spec_mg,  weight=1.0)
-    net_lin, _, post_lin, syn_lin = _fresh_net_with_spec(spec_lin, weight=1.0)
+    rn_mg,  syn_mg  = _fresh_rn_with_spec(spec_mg,  weight=1.0)
+    rn_lin, syn_lin = _fresh_rn_with_spec(spec_lin, weight=1.0)
 
-    # Drive both to the same S level: large I_pre for both
-    for net_ in (net_mg, net_lin):
-        n = int(500 / DT)
-        net_._network.simulate(500.0, DT, [[15.0] * n, [0.0] * n])
+    for rn_ in (rn_mg, rn_lin):
+        rn_.simulate(500.0, DT, {"pre": 15.0, "post": 0.0})
 
-    # At this point, S should be similar for both (same kinetics)
-    S_mg  = net_mg.get_kin_S(syn_mg)
-    S_lin = net_lin.get_kin_S(syn_lin)
+    S_mg  = _get_S(rn_mg,  syn_mg)
+    S_lin = _get_S(rn_lin, syn_lin)
+    g_mg  = _get_g(rn_mg,  syn_mg)
+    g_lin = _get_g(rn_lin, syn_lin)
 
-    g_mg  = net_mg.get_kin_g(syn_mg)
-    g_lin = net_lin.get_kin_g(syn_lin)
-
-    # MG block denominator at V=-65: 1 + 1.0*exp(-0.062*(-65))/3.57
-    # ≈ 1 + exp(4.03)/3.57 ≈ 1 + 16.4 ≈ 17.4  → strong block at hyperpolarised V
+    # MG block denominator at V=-65: ≈ 17 → strong block at hyperpolarised V
     assert g_mg < g_lin or math.isclose(g_mg, g_lin, rel_tol=0.5), \
         f"MG g={g_mg:.6f} should be < LINEAR g={g_lin:.6f} (V_post hyperpolarised)"
 
 
 def test_mg_block_weaker_at_depolarised():
     """MG block is less severe at positive V_post (partial relief)."""
-    # Verify that the MG block factor decreases at higher V
-    # MG = 1 + mg_conc * exp(-mg_scale * V) / mg_denom
     spec = KineticSynapseSpec.nmda_kinetic()
     V_hyperpol = -70.0
     V_depol    = +40.0
     mg_hyp = 1.0 + spec.mg_conc * math.exp(-spec.mg_scale * V_hyperpol) / spec.mg_denom
     mg_dep = 1.0 + spec.mg_conc * math.exp(-spec.mg_scale * V_depol)    / spec.mg_denom
-    # At depolarised V, mg_factor should be smaller → less block
     assert mg_dep < mg_hyp, \
         f"MG factor at +40={mg_dep:.3f} should be < at -70={mg_hyp:.3f}"
 
@@ -399,21 +407,17 @@ def test_power2_smaller_conductance_than_power1():
     spec1 = KineticSynapseSpec.gaba_kinetic(); spec1.name = "p1"; spec1.power = 1
     spec2 = KineticSynapseSpec.gaba_kinetic(); spec2.name = "p2"; spec2.power = 2
 
-    n_steps = int(200.0 / DT)
-    I_ext_arr = [[10.0] * n_steps, [0.0] * n_steps]
+    rn1, syn1 = _fresh_rn_with_spec(spec1)
+    rn1.simulate(200.0, DT, {"pre": 10.0, "post": 0.0})
 
-    net1, _, _, syn1 = _fresh_net_with_spec(spec1)
-    net1._network.simulate(200.0, DT, I_ext_arr)
+    rn2, syn2 = _fresh_rn_with_spec(spec2)
+    rn2.simulate(200.0, DT, {"pre": 10.0, "post": 0.0})
 
-    net2, _, _, syn2 = _fresh_net_with_spec(spec2)
-    net2._network.simulate(200.0, DT, I_ext_arr)
+    S1 = _get_S(rn1, syn1)
+    S2 = _get_S(rn2, syn2)
+    g1 = _get_g(rn1, syn1)
+    g2 = _get_g(rn2, syn2)
 
-    S1 = net1.get_kin_S(syn1)
-    S2 = net2.get_kin_S(syn2)
-    g1 = net1.get_kin_g(syn1)
-    g2 = net2.get_kin_g(syn2)
-
-    # If S < 1, g2 = g*S^2 < g*S = g1
     if S1 < 0.999:
         assert g2 <= g1 + 1e-9, \
             f"power=2 g={g2:.6f} should be ≤ power=1 g={g1:.6f} (S={S1:.3f})"
@@ -422,10 +426,10 @@ def test_power2_smaller_conductance_than_power1():
 def test_power4_gaba_b_runs_cleanly():
     """GABA_B has power=4; verify it runs without crash and S is bounded."""
     spec = KineticSynapseSpec.gaba_b()
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    traces = _run(net, duration=500.0, I_pre=10.0)
+    rn, syn = _fresh_rn_with_spec(spec)
+    traces = _run(rn, 500.0, I_pre=10.0)
     assert _all_finite(traces)
-    S = net.get_kin_S(syn)
+    S = _get_S(rn, syn)
     assert 0.0 <= S <= 1.0
 
 
@@ -435,19 +439,16 @@ def test_power4_gaba_b_runs_cleanly():
 
 def test_weight_zero_no_effect():
     """weight=0 → same V_post as isolated neuron."""
-    spec = KineticSynapseSpec.gaba_kinetic()
-
     # Baseline: isolated post with I_post=5
-    net_base = Network()
-    net_base.add_neuron()
-    n = int(200.0 / DT)
-    t_base = np.array(net_base.simulate(200.0, DT, [[5.0] * n]))
+    rn_base = RegionalNetwork()
+    rn_base.add_population("E", 1, model=NeuronModelSpec.hh_default())
+    t_base = rn_base.simulate(200.0, DT, {"E": 5.0})["E"][0]
 
     # With weight=0 kinetic synapse from spiking pre
-    net, pre, post, syn = _fresh_net_with_spec(spec, weight=0.0)
-    traces = _run(net, duration=200.0, I_pre=15.0, I_post=5.0)
-    # Post should behave like isolated neuron (same I_post, no synaptic effect)
-    np.testing.assert_array_almost_equal(traces[1], t_base[0], decimal=6,
+    spec = KineticSynapseSpec.gaba_kinetic()
+    rn, _ = _fresh_rn_with_spec(spec, weight=0.0)
+    traces = _run(rn, 200.0, I_pre=15.0, I_post=5.0)
+    np.testing.assert_array_almost_equal(traces[1], t_base, decimal=6,
         err_msg="weight=0 kinetic syn should have zero effect on post")
 
 
@@ -456,23 +457,18 @@ def test_double_weight_doubles_g():
     spec1 = KineticSynapseSpec.gaba_kinetic(); spec1.name = "w1"
     spec2 = KineticSynapseSpec.gaba_kinetic(); spec2.name = "w2"
 
-    n_steps = int(300.0 / DT)
-    I_ext = [[10.0] * n_steps, [0.0] * n_steps]
+    rn1, syn1 = _fresh_rn_with_spec(spec1, weight=1.0)
+    rn1.simulate(300.0, DT, {"pre": 10.0, "post": 0.0})
 
-    net1, _, _, syn1 = _fresh_net_with_spec(spec1, weight=1.0)
-    net1._network.simulate(300.0, DT, I_ext)
+    rn2, syn2 = _fresh_rn_with_spec(spec2, weight=2.0)
+    rn2.simulate(300.0, DT, {"pre": 10.0, "post": 0.0})
 
-    net2, _, _, syn2 = _fresh_net_with_spec(spec2, weight=2.0)
-    net2._network.simulate(300.0, DT, I_ext)
-
-    S1 = net1.get_kin_S(syn1)
-    S2 = net2.get_kin_S(syn2)
-    # Same spec → same S (S is independent of weight)
+    S1 = _get_S(rn1, syn1)
+    S2 = _get_S(rn2, syn2)
     assert abs(S1 - S2) < 0.001, f"S should be same: {S1:.4f} vs {S2:.4f}"
 
-    g1 = net1.get_kin_g(syn1)
-    g2 = net2.get_kin_g(syn2)
-    # g = spec.g * weight * S^power
+    g1 = _get_g(rn1, syn1)
+    g2 = _get_g(rn2, syn2)
     assert math.isclose(g2, 2.0 * g1, rel_tol=1e-6), \
         f"g2={g2:.6f} should be 2×g1={g1:.6f}"
 
@@ -480,16 +476,16 @@ def test_double_weight_doubles_g():
 def test_large_weight_no_crash():
     """weight=1000 should not crash or produce NaN."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, _ = _fresh_net_with_spec(spec, weight=1000.0)
-    traces = _run(net, duration=200.0, I_pre=10.0)
+    rn, _ = _fresh_rn_with_spec(spec, weight=1000.0)
+    traces = _run(rn, 200.0, I_pre=10.0)
     assert _all_finite(traces)
 
 
 def test_negative_weight_no_crash():
     """Negative weight (sign reversal) should run without crash."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, _ = _fresh_net_with_spec(spec, weight=-1.0)
-    traces = _run(net, duration=200.0, I_pre=10.0)
+    rn, _ = _fresh_rn_with_spec(spec, weight=-1.0)
+    traces = _run(rn, 200.0, I_pre=10.0)
     assert _all_finite(traces)
 
 
@@ -497,90 +493,57 @@ def test_negative_weight_no_crash():
 # 8. ALL NEURON-TYPE COMBINATIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
-_HH_TYPE     = NetworkNeuronType.HH
-_IZ_RS_TYPE  = NetworkNeuronType.IZHIKEVICH_RS
-_IZ_FS_TYPE  = NetworkNeuronType.IZHIKEVICH_FS
-_IZ_IB_TYPE  = NetworkNeuronType.IZHIKEVICH_IB
-_IZ_CH_TYPE  = NetworkNeuronType.IZHIKEVICH_CH
-_IZ_LTS_TYPE = NetworkNeuronType.IZHIKEVICH_LTS
-
-# ComposableNeuron model specs
-_COMPOSABLE_MODELS = {
-    "thalamic": NeuronModelSpec.thalamic,
-    "stn":      NeuronModelSpec.stn,
-    "gpe":      NeuronModelSpec.gpe,
-    "gpi":      NeuronModelSpec.gpi,
-    "striatum": NeuronModelSpec.striatum,
-}
-
-
-def _add_neuron_by_type(net: Network, ntype):
-    """Add a neuron of specified type; ntype may be NetworkNeuronType or NeuronModelSpec."""
-    if isinstance(ntype, NeuronModelSpec):
-        return net.add_neuron(ntype)
-    return net.add_neuron(ntype)
-
-
-@pytest.mark.parametrize("pre_type,post_type,I_pre", [
+@pytest.mark.parametrize("pre_factory,post_factory,I_pre", [
     # HH × HH
-    (_HH_TYPE,     _HH_TYPE,     10.0),
+    (_hh_model,     _hh_model,     10.0),
     # HH × Izhikevich variants
-    (_HH_TYPE,     _IZ_RS_TYPE,  10.0),
-    (_HH_TYPE,     _IZ_FS_TYPE,  10.0),
-    (_HH_TYPE,     _IZ_IB_TYPE,  10.0),
-    (_HH_TYPE,     _IZ_CH_TYPE,  10.0),
+    (_hh_model,     _iz_rs_model,  10.0),
+    (_hh_model,     _iz_fs_model,  10.0),
+    (_hh_model,     _iz_ib_model,  10.0),
+    (_hh_model,     _iz_ch_model,  10.0),
     # Izhikevich × HH
-    (_IZ_RS_TYPE,  _HH_TYPE,     10.0),
-    (_IZ_FS_TYPE,  _HH_TYPE,     10.0),
+    (_iz_rs_model,  _hh_model,     10.0),
+    (_iz_fs_model,  _hh_model,     10.0),
     # Izhikevich × Izhikevich
-    (_IZ_RS_TYPE,  _IZ_RS_TYPE,  10.0),
-    (_IZ_FS_TYPE,  _IZ_FS_TYPE,  10.0),
-    (_IZ_RS_TYPE,  _IZ_FS_TYPE,  10.0),
+    (_iz_rs_model,  _iz_rs_model,  10.0),
+    (_iz_fs_model,  _iz_fs_model,  10.0),
+    (_iz_rs_model,  _iz_fs_model,  10.0),
     # Silent pre (I=0)
-    (_HH_TYPE,     _HH_TYPE,      0.0),
-    (_IZ_RS_TYPE,  _IZ_RS_TYPE,   0.0),
+    (_hh_model,     _hh_model,      0.0),
+    (_iz_rs_model,  _iz_rs_model,   0.0),
 ])
-def test_stability_all_neuron_types_gaba_kinetic(pre_type, post_type, I_pre):
+def test_stability_all_neuron_types_gaba_kinetic(pre_factory, post_factory, I_pre):
     """GABA kinetic synapse between various neuron pairs: no crash, no NaN."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net = Network()
-    pre  = _add_neuron_by_type(net, pre_type)
-    post = _add_neuron_by_type(net, post_type)
-    net.add_kinetic_synapse(pre, post, 1.0, spec)
-
-    n = int(300.0 / DT)
-    I_ext = [[I_pre] * n, [0.0] * n]
-    traces = np.array(net.simulate(300.0, DT, I_ext))
-    assert _all_finite(traces), f"NaN/Inf for pre={pre_type} post={post_type}"
+    rn = RegionalNetwork()
+    rn.add_population("pre",  1, model=pre_factory())
+    rn.add_population("post", 1, model=post_factory())
+    rn.add_kinetic_connection("pre", 0, "post", 0, weight=1.0, spec=spec)
+    traces = _run(rn, 300.0, DT, I_pre, 0.0)
+    assert _all_finite(traces), f"NaN/Inf for {pre_factory.__name__} → {post_factory.__name__}"
 
 
 @pytest.mark.parametrize("model_name", list(_COMPOSABLE_MODELS.keys()))
 def test_stability_composable_pre_gaba_kinetic(model_name):
     """ComposableNeuron as pre-synaptic neuron: no crash, no NaN."""
-    spec_model = _COMPOSABLE_MODELS[model_name]()
-    net = Network()
-    pre  = net.add_neuron(spec_model)
-    post = net.add_neuron(_HH_TYPE)
-    net.add_kinetic_synapse(pre, post, 0.5, KineticSynapseSpec.gaba_kinetic())
-
-    n = int(300.0 / DT)
-    I_ext = [[5.0] * n, [0.0] * n]
-    traces = np.array(net.simulate(300.0, DT, I_ext))
+    rn = RegionalNetwork()
+    rn.add_population("pre",  1, model=_COMPOSABLE_MODELS[model_name]())
+    rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
+    rn.add_kinetic_connection("pre", 0, "post", 0, weight=0.5,
+                               spec=KineticSynapseSpec.gaba_kinetic())
+    traces = _run(rn, 300.0, DT, 5.0, 0.0)
     assert _all_finite(traces)
 
 
 @pytest.mark.parametrize("model_name", list(_COMPOSABLE_MODELS.keys()))
 def test_stability_composable_post_gaba_kinetic(model_name):
     """ComposableNeuron as post-synaptic neuron: no crash, no NaN."""
-    spec_model = _COMPOSABLE_MODELS[model_name]()
-    net = Network()
-    pre  = net.add_neuron(_HH_TYPE)
-    post = net.add_neuron(spec_model)
-    net.add_kinetic_synapse(pre, post, 0.5, KineticSynapseSpec.gaba_kinetic())
-
-    n = int(300.0 / DT)
-    I_ext = [[10.0] * n, [0.0] * n]
-    traces = np.array(net.simulate(300.0, DT, I_ext))
+    rn = RegionalNetwork()
+    rn.add_population("pre",  1, model=NeuronModelSpec.hh_default())
+    rn.add_population("post", 1, model=_COMPOSABLE_MODELS[model_name]())
+    rn.add_kinetic_connection("pre", 0, "post", 0, weight=0.5,
+                               spec=KineticSynapseSpec.gaba_kinetic())
+    traces = _run(rn, 300.0, DT, 10.0, 0.0)
     assert _all_finite(traces)
 
 
@@ -617,11 +580,10 @@ def _make_ab_mg_spec() -> KineticSynapseSpec:
 def test_all_update_current_form_combinations(spec_factory, I_pre):
     """All 6 update × current form combos: run cleanly, finite traces, S bounded."""
     spec = spec_factory()
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    n = int(300.0 / DT)
-    traces = np.array(net.simulate(300.0, DT, [[I_pre] * n, [0.0] * n]))
+    rn, syn = _fresh_rn_with_spec(spec)
+    traces = _run(rn, 300.0, DT, I_pre, 0.0)
     assert _all_finite(traces), f"NaN in {spec.name}"
-    S = net.get_kin_S(syn)
+    S = _get_S(rn, syn)
     assert 0.0 - 1e-9 <= S <= 1.0 + 1e-9, f"S={S:.4f} out of bounds for {spec.name}"
 
 
@@ -634,21 +596,20 @@ def test_all_update_current_form_combinations(spec_factory, I_pre):
     KineticSynapseSpec.nmda_kinetic,
     KineticSynapseSpec.gaba_b,
 ])
-@pytest.mark.parametrize("pre_type,post_type", [
-    (_HH_TYPE,     _HH_TYPE),
-    (_IZ_RS_TYPE,  _HH_TYPE),
-    (_HH_TYPE,     _IZ_RS_TYPE),
-    (_IZ_FS_TYPE,  _IZ_RS_TYPE),
+@pytest.mark.parametrize("pre_factory,post_factory", [
+    (_hh_model,     _hh_model),
+    (_iz_rs_model,  _hh_model),
+    (_hh_model,     _iz_rs_model),
+    (_iz_fs_model,  _iz_rs_model),
 ])
-def test_preset_neuron_stability_matrix(preset_factory, pre_type, post_type):
+def test_preset_neuron_stability_matrix(preset_factory, pre_factory, post_factory):
     """Every preset × every HH/Iz neuron combination finishes without NaN."""
     spec = preset_factory()
-    net = Network()
-    pre  = net.add_neuron(pre_type)
-    post = net.add_neuron(post_type)
-    net.add_kinetic_synapse(pre, post, 1.0, spec)
-    n = int(200.0 / DT)
-    traces = np.array(net.simulate(200.0, DT, [[8.0] * n, [0.0] * n]))
+    rn = RegionalNetwork()
+    rn.add_population("pre",  1, model=pre_factory())
+    rn.add_population("post", 1, model=post_factory())
+    rn.add_kinetic_connection("pre", 0, "post", 0, weight=1.0, spec=spec)
+    traces = _run(rn, 200.0, DT, 8.0, 0.0)
     assert _all_finite(traces)
 
 
@@ -658,52 +619,68 @@ def test_preset_neuron_stability_matrix(preset_factory, pre_type, post_type):
 
 def test_kinetic_plus_exponential():
     """Kinetic + EXP synapse on same post: no crash, no NaN."""
-    net = Network()
-    pre1 = net.add_neuron(); pre2 = net.add_neuron(); post = net.add_neuron()
-    net.add_kinetic_synapse(pre1, post, 0.5, KineticSynapseSpec.gaba_kinetic())
-    net.add_synapse(pre2, post, 0.5, E_syn=0.0, tau=2.0)
-    n = int(200.0 / DT)
-    traces = np.array(net.simulate(200.0, DT, [[10.0]*n, [10.0]*n, [0.0]*n]))
+    rn = RegionalNetwork()
+    rn.add_population("N0",  1, model=NeuronModelSpec.hh_default())
+    rn.add_population("N1",  1, model=NeuronModelSpec.hh_default())
+    rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
+    rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5,
+                               spec=KineticSynapseSpec.gaba_kinetic())
+    rn.connect("N1", "post", "all_to_all", weight=0.5,
+                synapse=SynapseSpec.exponential(0.0, 2.0))
+    result = rn.simulate(200.0, DT, {"N0": 10.0, "N1": 10.0, "post": 0.0})
+    traces = np.vstack([result["N0"], result["N1"], result["post"]])
     assert _all_finite(traces)
 
 
 def test_kinetic_plus_alpha():
     """Kinetic + alpha synapse: no crash, no NaN."""
-    net = Network()
-    pre1 = net.add_neuron(); pre2 = net.add_neuron(); post = net.add_neuron()
-    net.add_kinetic_synapse(pre1, post, 0.5, KineticSynapseSpec.gaba_kinetic())
-    net.add_alpha_synapse(pre2, post, 0.5, E_syn=0.0, tau=2.0)
-    n = int(200.0 / DT)
-    traces = np.array(net.simulate(200.0, DT, [[10.0]*n, [10.0]*n, [0.0]*n]))
+    rn = RegionalNetwork()
+    rn.add_population("N0",  1, model=NeuronModelSpec.hh_default())
+    rn.add_population("N1",  1, model=NeuronModelSpec.hh_default())
+    rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
+    rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5,
+                               spec=KineticSynapseSpec.gaba_kinetic())
+    rn.connect("N1", "post", "all_to_all", weight=0.5,
+                synapse=SynapseSpec.alpha(0.0, 2.0))
+    result = rn.simulate(200.0, DT, {"N0": 10.0, "N1": 10.0, "post": 0.0})
+    traces = np.vstack([result["N0"], result["N1"], result["post"]])
     assert _all_finite(traces)
 
 
 def test_kinetic_plus_double_exp():
     """Kinetic + DEXP synapse: no crash, no NaN."""
-    net = Network()
-    pre1 = net.add_neuron(); pre2 = net.add_neuron(); post = net.add_neuron()
-    net.add_kinetic_synapse(pre1, post, 0.5, KineticSynapseSpec.gaba_kinetic())
-    net.add_double_exp_synapse(pre2, post, 0.5, E_syn=0.0, tau_rise=0.4, tau_decay=2.5)
-    n = int(200.0 / DT)
-    traces = np.array(net.simulate(200.0, DT, [[10.0]*n, [10.0]*n, [0.0]*n]))
+    rn = RegionalNetwork()
+    rn.add_population("N0",  1, model=NeuronModelSpec.hh_default())
+    rn.add_population("N1",  1, model=NeuronModelSpec.hh_default())
+    rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
+    rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5,
+                               spec=KineticSynapseSpec.gaba_kinetic())
+    rn.connect("N1", "post", "all_to_all", weight=0.5,
+                synapse=SynapseSpec.double_exponential(0.0, 0.4, 2.5))
+    result = rn.simulate(200.0, DT, {"N0": 10.0, "N1": 10.0, "post": 0.0})
+    traces = np.vstack([result["N0"], result["N1"], result["post"]])
     assert _all_finite(traces)
 
 
 def test_all_synapse_types_together():
     """Kinetic + EXP + ALPHA + DEXP all on one post-neuron simultaneously."""
-    net = Network()
-    pre1 = net.add_neuron(); pre2 = net.add_neuron()
-    pre3 = net.add_neuron(); pre4 = net.add_neuron()
-    post = net.add_neuron()
+    rn = RegionalNetwork()
+    for i in range(4):
+        rn.add_population(f"N{i}", 1, model=NeuronModelSpec.hh_default())
+    rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
 
-    net.add_kinetic_synapse(pre1, post, 0.2, KineticSynapseSpec.gaba_kinetic())
-    net.add_synapse(pre2, post, 0.2, E_syn=0.0, tau=2.0)
-    net.add_alpha_synapse(pre3, post, 0.2, E_syn=0.0, tau=2.0)
-    net.add_double_exp_synapse(pre4, post, 0.2, E_syn=0.0, tau_rise=0.5, tau_decay=3.0)
+    rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.2,
+                               spec=KineticSynapseSpec.gaba_kinetic())
+    rn.connect("N1", "post", "all_to_all", weight=0.2,
+                synapse=SynapseSpec.exponential(0.0, 2.0))
+    rn.connect("N2", "post", "all_to_all", weight=0.2,
+                synapse=SynapseSpec.alpha(0.0, 2.0))
+    rn.connect("N3", "post", "all_to_all", weight=0.2,
+                synapse=SynapseSpec.double_exponential(0.0, 0.5, 3.0))
 
-    n = int(200.0 / DT)
-    I_ext = [[10.0]*n, [10.0]*n, [10.0]*n, [10.0]*n, [0.0]*n]
-    traces = np.array(net.simulate(200.0, DT, I_ext))
+    I_dict = {"N0": 10.0, "N1": 10.0, "N2": 10.0, "N3": 10.0, "post": 0.0}
+    result = rn.simulate(200.0, DT, I_dict)
+    traces = np.vstack([result[f"N{i}"] for i in range(4)] + [result["post"]])
     assert _all_finite(traces)
 
 
@@ -711,24 +688,24 @@ def test_kinetic_before_and_after_regular_synapses():
     """Order of synapse addition should not matter for correctness."""
     spec = KineticSynapseSpec.gaba_kinetic(); spec.name = "order_test"
 
-    def build_net_a():
-        net = Network()
-        pre1 = net.add_neuron(); pre2 = net.add_neuron(); post = net.add_neuron()
-        net.add_kinetic_synapse(pre1, post, 0.5, spec)
-        net.add_synapse(pre2, post, 0.5)
-        return net
+    def _build(kin_first):
+        rn = RegionalNetwork()
+        rn.add_population("N0",   1, model=NeuronModelSpec.hh_default())
+        rn.add_population("N1",   1, model=NeuronModelSpec.hh_default())
+        rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
+        if kin_first:
+            rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5, spec=spec)
+            rn.connect("N1", "post", "all_to_all", weight=0.5,
+                        synapse=SynapseSpec.exponential(0.0, 2.0))
+        else:
+            rn.connect("N1", "post", "all_to_all", weight=0.5,
+                        synapse=SynapseSpec.exponential(0.0, 2.0))
+            rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5, spec=spec)
+        return rn
 
-    def build_net_b():
-        net = Network()
-        pre1 = net.add_neuron(); pre2 = net.add_neuron(); post = net.add_neuron()
-        net.add_synapse(pre2, post, 0.5)
-        net.add_kinetic_synapse(pre1, post, 0.5, spec)
-        return net
-
-    n = int(200.0 / DT)
-    I_ext = [[10.0]*n, [10.0]*n, [0.0]*n]
-    ta = np.array(build_net_a().simulate(200.0, DT, I_ext))
-    tb = np.array(build_net_b().simulate(200.0, DT, I_ext))
+    I_dict = {"N0": 10.0, "N1": 10.0, "post": 0.0}
+    ta = np.vstack(list(_build(True).simulate(200.0, DT, I_dict).values()))
+    tb = np.vstack(list(_build(False).simulate(200.0, DT, I_dict).values()))
     assert _all_finite(ta) and _all_finite(tb)
 
 
@@ -738,26 +715,24 @@ def test_kinetic_before_and_after_regular_synapses():
 
 def test_two_kinetic_synapses_additive():
     """Two kinetic synapses from the same pre are additive (double effect)."""
-    spec_single = KineticSynapseSpec.gaba_kinetic(); spec_single.name = "single"
+    spec_single  = KineticSynapseSpec.gaba_kinetic(); spec_single.name  = "single"
     spec_double_a = KineticSynapseSpec.gaba_kinetic(); spec_double_a.name = "d1"
     spec_double_b = KineticSynapseSpec.gaba_kinetic(); spec_double_b.name = "d2"
 
-    dt = DT; dur = 300.0; n = int(dur / dt)
+    dt = DT; dur = 300.0
     I_pre = 10.0; I_post = 12.0
 
-    net_s = Network()
-    pre_s = net_s.add_neuron(); post_s = net_s.add_neuron()
-    net_s.add_kinetic_synapse(pre_s, post_s, 1.0, spec_single)
-    tr_single = np.array(net_s.simulate(dur, dt, [[I_pre]*n, [I_post]*n]))
+    rn_s, _ = _fresh_rn_with_spec(spec_single)
+    tr_single = _run(rn_s, dur, dt, I_pre, I_post)
 
-    net_d = Network()
-    pre_d = net_d.add_neuron(); post_d = net_d.add_neuron()
-    net_d.add_kinetic_synapse(pre_d, post_d, 1.0, spec_double_a)
-    net_d.add_kinetic_synapse(pre_d, post_d, 1.0, spec_double_b)
-    tr_double = np.array(net_d.simulate(dur, dt, [[I_pre]*n, [I_post]*n]))
+    rn_d = RegionalNetwork()
+    rn_d.add_population("pre",  1, model=NeuronModelSpec.hh_default())
+    rn_d.add_population("post", 1, model=NeuronModelSpec.hh_default())
+    rn_d.add_kinetic_connection("pre", 0, "post", 0, weight=1.0, spec=spec_double_a)
+    rn_d.add_kinetic_connection("pre", 0, "post", 0, weight=1.0, spec=spec_double_b)
+    tr_double = _run(rn_d, dur, dt, I_pre, I_post)
 
     assert _all_finite(tr_single) and _all_finite(tr_double)
-    # Double inhibition → post fires less than single
     spikes_s = _count_spikes(tr_single[1])
     spikes_d = _count_spikes(tr_double[1])
     assert spikes_d <= spikes_s, \
@@ -766,18 +741,17 @@ def test_two_kinetic_synapses_additive():
 
 def test_ten_kinetic_synapses_no_crash():
     """10 kinetic synapses from 10 different pre-neurons: no crash, no NaN."""
-    spec = KineticSynapseSpec.gaba_kinetic()
-    net = Network()
-    post = net.add_neuron()
-    pre_neurons = [net.add_neuron() for _ in range(10)]
-    for i, pre in enumerate(pre_neurons):
-        s = KineticSynapseSpec.gaba_kinetic()
-        s.name = f"kin_{i}"
-        net.add_kinetic_synapse(pre, post, 0.1, s)
+    rn = RegionalNetwork()
+    rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
+    for i in range(10):
+        rn.add_population(f"N{i}", 1, model=NeuronModelSpec.hh_default())
+        s = KineticSynapseSpec.gaba_kinetic(); s.name = f"kin_{i}"
+        rn.add_kinetic_connection(f"N{i}", 0, "post", 0, weight=0.1, spec=s)
 
-    n = int(200.0 / DT)
-    I_ext = [[8.0] * n for _ in range(10)] + [[5.0] * n]  # pre + post
-    traces = np.array(net.simulate(200.0, DT, I_ext))
+    I_dict = {f"N{i}": 8.0 for i in range(10)}
+    I_dict["post"] = 5.0
+    result = rn.simulate(200.0, DT, I_dict)
+    traces = np.vstack([result[f"N{i}"] for i in range(10)] + [result["post"]])
     assert _all_finite(traces)
 
 
@@ -790,13 +764,15 @@ def test_deduplication_same_name_reuses_spec():
     spec_a = KineticSynapseSpec.gaba_kinetic()
     spec_b = KineticSynapseSpec.gaba_kinetic()   # same name "GABA_kinetic"
 
-    net = Network()
-    pre1 = net.add_neuron(); pre2 = net.add_neuron(); post = net.add_neuron()
-    syn1 = net.add_kinetic_synapse(pre1, post, 1.0, spec_a)
-    syn2 = net.add_kinetic_synapse(pre2, post, 1.0, spec_b)
+    rn = RegionalNetwork()
+    rn.add_population("N0",   1, model=NeuronModelSpec.hh_default())
+    rn.add_population("N1",   1, model=NeuronModelSpec.hh_default())
+    rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
+    rn.add_kinetic_connection("N0", 0, "post", 0, weight=1.0, spec=spec_a)
+    rn.add_kinetic_connection("N1", 0, "post", 0, weight=1.0, spec=spec_b)
 
-    n = int(200.0 / DT)
-    traces = np.array(net.simulate(200.0, DT, [[10.0]*n, [10.0]*n, [0.0]*n]))
+    result = rn.simulate(200.0, DT, {"N0": 10.0, "N1": 10.0, "post": 0.0})
+    traces = np.vstack([result["N0"], result["N1"], result["post"]])
     assert _all_finite(traces)
 
 
@@ -808,17 +784,16 @@ def test_different_names_different_specs():
     spec_slow = KineticSynapseSpec.gaba_kinetic(); spec_slow.name = "slow"
     spec_slow.tau_decay = 50.0
 
-    net = Network()
-    pre1 = net.add_neuron(); pre2 = net.add_neuron(); post = net.add_neuron()
-    syn1 = net.add_kinetic_synapse(pre1, post, 1.0, spec_fast)
-    syn2 = net.add_kinetic_synapse(pre2, post, 1.0, spec_slow)
+    rn = RegionalNetwork()
+    rn.add_population("pre",  1, model=NeuronModelSpec.hh_default())
+    rn.add_population("pre2", 1, model=NeuronModelSpec.hh_default())
+    rn.add_population("post", 1, model=NeuronModelSpec.hh_default())
+    rn.add_kinetic_connection("pre", 0, "post", 0, weight=1.0, spec=spec_fast)
+    rn.add_kinetic_connection("pre", 0, "post", 0, weight=1.0, spec=spec_slow)
 
-    n = int(300.0 / DT)
-    I_ext = [[10.0]*n, [0.0]*n, [0.0]*n]
-    net.simulate(300.0, DT, I_ext)
-
-    # Both synapses from pre1 but with different specs → run cleanly
-    assert _all_finite(np.array([[0.0]]))   # just verify no crash above
+    result = rn.simulate(300.0, DT, {"pre": 10.0, "pre2": 0.0, "post": 0.0})
+    traces = np.vstack([result["pre"], result["pre2"], result["post"]])
+    assert _all_finite(traces)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -827,21 +802,17 @@ def test_different_names_different_specs():
 
 def test_gaba_kinetic_suppresses_post_firing():
     """Active GABA kinetic pre reduces post firing below baseline."""
-    dt = DT; dur = 500.0; n = int(dur / dt)
+    dt = DT; dur = 500.0
     I_post = 12.0; I_pre = 10.0
 
-    # Baseline: isolated post
-    net_b = Network()
-    net_b.add_neuron()
-    t_base = np.array(net_b.simulate(dur, dt, [[I_post]*n]))
-    spikes_base = _count_spikes(t_base[0])
+    rn_b = RegionalNetwork()
+    rn_b.add_population("E", 1, model=NeuronModelSpec.hh_default())
+    t_base = rn_b.simulate(dur, dt, {"E": I_post})["E"][0]
+    spikes_base = _count_spikes(t_base)
 
-    # With GABA kinetic inhibition
     spec = KineticSynapseSpec.gaba_kinetic(); spec.g = 0.5
-    net_i = Network()
-    pre = net_i.add_neuron(); post = net_i.add_neuron()
-    net_i.add_kinetic_synapse(pre, post, 1.0, spec)
-    t_inh = np.array(net_i.simulate(dur, dt, [[I_pre]*n, [I_post]*n]))
+    rn_i, _ = _fresh_rn_with_spec(spec)
+    t_inh = _run(rn_i, dur, dt, I_pre, I_post)
     spikes_inh = _count_spikes(t_inh[1])
 
     assert spikes_base > 0, "Baseline must spike"
@@ -851,17 +822,15 @@ def test_gaba_kinetic_suppresses_post_firing():
 
 def test_nmda_kinetic_excites_post():
     """NMDA kinetic synapse should increase post firing above subthreshold baseline."""
-    dt = DT; dur = 500.0; n = int(dur / dt)
+    dt = DT; dur = 500.0
     I_post = 5.0   # sub-threshold for HH alone
-    I_pre  = 12.0  # pre fires continuously
+    I_pre  = 12.0
 
-    # Baseline: sub-threshold post alone
-    net_b = Network()
-    net_b.add_neuron()
-    t_base = np.array(net_b.simulate(dur, dt, [[I_post]*n]))
-    spikes_base = _count_spikes(t_base[0])
+    rn_b = RegionalNetwork()
+    rn_b.add_population("E", 1, model=NeuronModelSpec.hh_default())
+    t_base = rn_b.simulate(dur, dt, {"E": I_post})["E"][0]
+    spikes_base = _count_spikes(t_base)
 
-    # With excitatory NMDA kinetic
     spec = KineticSynapseSpec()
     spec.name = "excit_nmda"
     spec.update_form = KineticUpdateForm.BOLTZMANN_GATE
@@ -870,12 +839,10 @@ def test_nmda_kinetic_excites_post():
     t = TauParams(); t.form = TauForm.CONSTANT; t.set_param(0, 80.0)
     spec.tau = t
     spec.current_form = KineticCurrentForm.LINEAR
-    spec.g = 0.3; spec.E_syn = 0.0; spec.power = 1   # excitatory
+    spec.g = 0.3; spec.E_syn = 0.0; spec.power = 1
 
-    net_e = Network()
-    pre = net_e.add_neuron(); post = net_e.add_neuron()
-    net_e.add_kinetic_synapse(pre, post, 1.0, spec)
-    t_exc = np.array(net_e.simulate(dur, dt, [[I_pre]*n, [I_post]*n]))
+    rn_e, _ = _fresh_rn_with_spec(spec)
+    t_exc = _run(rn_e, dur, dt, I_pre, I_post)
     spikes_exc = _count_spikes(t_exc[1])
 
     assert spikes_exc >= spikes_base, \
@@ -892,17 +859,12 @@ def test_e_syn_equals_v_post_no_driving_force():
     spec.E_syn = -65.0   # ≈ V_rest for HH → zero driving force
     spec.g = 1.0
 
-    net_base = Network()
-    net_base.add_neuron()
-    n = int(200.0 / DT)
-    t_base = np.array(net_base.simulate(200.0, DT, [[8.0]*n]))
+    rn_base = RegionalNetwork()
+    rn_base.add_population("E", 1, model=NeuronModelSpec.hh_default())
+    rn_base.simulate(200.0, DT, {"E": 8.0})  # just for stability check
 
-    net_syn = Network()
-    pre = net_syn.add_neuron(); post = net_syn.add_neuron()
-    net_syn.add_kinetic_synapse(pre, post, 1.0, spec)
-    t_syn = np.array(net_syn.simulate(200.0, DT, [[12.0]*n, [8.0]*n]))
-
-    # Very small effect expected (near zero driving force)
+    rn_syn, _ = _fresh_rn_with_spec(spec)
+    t_syn = _run(rn_syn, 200.0, I_pre=12.0, I_post=8.0)
     assert _all_finite(t_syn)
 
 
@@ -912,8 +874,8 @@ def test_tau_decay_range_tanh_gate(tau_decay):
     spec = KineticSynapseSpec.gaba_kinetic()
     spec.tau_decay = tau_decay
     spec.name = f"tau_{tau_decay}"
-    net, _, _, _ = _fresh_net_with_spec(spec)
-    traces = _run(net, duration=200.0, I_pre=10.0)
+    rn, _ = _fresh_rn_with_spec(spec)
+    traces = _run(rn, 200.0, I_pre=10.0)
     assert _all_finite(traces), f"NaN for tau_decay={tau_decay}"
 
 
@@ -923,51 +885,48 @@ def test_tanh_k_range(tanh_k):
     spec = KineticSynapseSpec.gaba_kinetic()
     spec.tanh_k = tanh_k
     spec.name = f"k_{tanh_k}"
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    traces = _run(net, duration=200.0, I_pre=10.0)
+    rn, syn = _fresh_rn_with_spec(spec)
+    traces = _run(rn, 200.0, I_pre=10.0)
     assert _all_finite(traces)
-    S = net.get_kin_S(syn)
+    S = _get_S(rn, syn)
     assert 0.0 - 1e-9 <= S <= 1.0 + 1e-9
 
 
 def test_very_small_dt():
     """dt=0.001 ms: no crash, no NaN."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, _ = _fresh_net_with_spec(spec)
-    dt = 0.001; dur = 5.0
-    n = int(dur / dt)
-    traces = np.array(net.simulate(dur, dt, [[10.0]*n, [0.0]*n]))
+    rn, _ = _fresh_rn_with_spec(spec)
+    traces = _run(rn, 5.0, 0.001, I_pre=10.0)
     assert _all_finite(traces)
 
 
 def test_very_large_dt():
     """dt=0.5 ms (large step): no crash, no NaN."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, _ = _fresh_net_with_spec(spec)
-    dt = 0.5; dur = 200.0
-    n = int(dur / dt)
-    traces = np.array(net.simulate(dur, dt, [[10.0]*n, [0.0]*n]))
+    rn, _ = _fresh_rn_with_spec(spec)
+    traces = _run(rn, 200.0, 0.5, I_pre=10.0)
     assert _all_finite(traces)
 
 
 def test_long_simulation_no_nan():
     """5000 ms simulation: no NaN, no Inf."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    n = int(5000.0 / DT)
-    traces = np.array(net.simulate(5000.0, DT, [[10.0]*n, [5.0]*n]))
+    rn, syn = _fresh_rn_with_spec(spec)
+    traces = _run(rn, 5000.0, DT, I_pre=10.0, I_post=5.0)
     assert _all_finite(traces)
-    S = net.get_kin_S(syn)
+    S = _get_S(rn, syn)
     assert 0.0 - 1e-9 <= S <= 1.0 + 1e-9
 
 
 def test_single_step_no_crash():
     """Single simulation step: should not crash and S=S_init."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    net._network.step(DT, [0.0, 0.0])
-    assert _all_finite(np.array([net._network.neuron(0).V, net._network.neuron(1).V]))
-    S = net.get_kin_S(syn)
+    rn, syn = _fresh_rn_with_spec(spec)
+    rn.simulate(DT, DT, {"pre": 0.0, "post": 0.0})
+    V0 = rn._rnet.network().neuron(0).V
+    V1 = rn._rnet.network().neuron(1).V
+    assert _all_finite(np.array([V0, V1]))
+    S = _get_S(rn, syn)
     assert 0.0 - 1e-9 <= S <= 1.0 + 1e-9
 
 
@@ -975,14 +934,12 @@ def test_s_init_one_decays():
     """S_init=1.0 with silent pre: S should decay toward 0."""
     spec = KineticSynapseSpec.gaba_kinetic()
     spec.S_init = 1.0
-    net, _, _, syn = _fresh_net_with_spec(spec)
+    rn, syn = _fresh_rn_with_spec(spec)
 
-    assert math.isclose(net.get_kin_S(syn), 1.0)
+    assert math.isclose(_get_S(rn, syn), 1.0)
 
-    # Silent pre (V at rest ≈ -65): rate_open ≈ 0 → S decays with tau_decay
-    n = int(200.0 / DT)
-    net.simulate(200.0, DT, [[0.0]*n, [0.0]*n])
-    S_after = net.get_kin_S(syn)
+    rn.simulate(200.0, DT, {"pre": 0.0, "post": 0.0})
+    S_after = _get_S(rn, syn)
     # Should have decayed substantially from 1.0 in 200 ms (tau_decay=13 ms)
     assert S_after < 0.5, f"S_init=1 should decay; got S={S_after:.4f}"
 
@@ -999,10 +956,10 @@ def test_alpha_beta_with_very_fast_rates():
     s.alpha = ra; s.beta = rb
     s.current_form = KineticCurrentForm.LINEAR
     s.g = 0.1; s.E_syn = -80.0; s.power = 1
-    net, _, _, syn = _fresh_net_with_spec(s)
-    traces = _run(net, duration=100.0, I_pre=10.0)
+    rn, syn = _fresh_rn_with_spec(s)
+    traces = _run(rn, 100.0, I_pre=10.0)
     assert _all_finite(traces)
-    S = net.get_kin_S(syn)
+    S = _get_S(rn, syn)
     assert 0.0 - 1e-9 <= S <= 1.0 + 1e-9
 
 
@@ -1011,9 +968,9 @@ def test_boltzmann_gate_v_half_above_v_pre():
     s = _boltzmann_spec_manual("high_vhalf")
     s.s_inf.v_half = +50.0    # far above V_rest → S_inf(−65) ≈ 0
     s.s_inf.k = 5.0
-    net, _, _, syn = _fresh_net_with_spec(s)
-    _run(net, duration=LONG, I_pre=0.0)
-    S = net.get_kin_S(syn)
+    rn, syn = _fresh_rn_with_spec(s)
+    _run(rn, LONG, I_pre=0.0)
+    S = _get_S(rn, syn)
     assert S < 0.05, f"S should be near 0 with v_half far above V_pre: {S:.4f}"
 
 
@@ -1022,20 +979,20 @@ def test_boltzmann_gate_v_half_below_v_pre():
     s = _boltzmann_spec_manual("low_vhalf")
     s.s_inf.v_half = -100.0   # far below V_rest → S_inf(−65) ≈ 1
     s.s_inf.k = 5.0
-    net, _, _, syn = _fresh_net_with_spec(s)
-    _run(net, duration=LONG, I_pre=0.0)
-    S = net.get_kin_S(syn)
+    rn, syn = _fresh_rn_with_spec(s)
+    _run(rn, LONG, I_pre=0.0)
+    S = _get_S(rn, syn)
     assert S > 0.95, f"S should be near 1 with v_half far below V_pre: {S:.4f}"
 
 
 def test_self_connection_no_crash():
     """Kinetic synapse from a neuron to itself (pre=post): no crash."""
-    net = Network()
-    n0 = net.add_neuron()
-    net.add_kinetic_synapse(n0, n0, 0.5, KineticSynapseSpec.gaba_kinetic())
-    n = int(200.0 / DT)
-    traces = np.array(net.simulate(200.0, DT, [[10.0]*n]))
-    assert _all_finite(traces)
+    rn = RegionalNetwork()
+    rn.add_population("E", 1, model=NeuronModelSpec.hh_default())
+    rn.add_kinetic_connection("E", 0, "E", 0, weight=0.5,
+                               spec=KineticSynapseSpec.gaba_kinetic())
+    result = rn.simulate(200.0, DT, {"E": 10.0})
+    assert _all_finite(result["E"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1044,8 +1001,8 @@ def test_self_connection_no_crash():
 
 def _make_rnet(pre_n=3, post_n=3):
     rnet = RegionalNetwork()
-    rnet.add_population("pre", pre_n, neuron_type="HH")
-    rnet.add_population("post", post_n, neuron_type="HH")
+    rnet.add_population("pre",  pre_n,  model=NeuronModelSpec.hh_default())
+    rnet.add_population("post", post_n, model=NeuronModelSpec.hh_default())
     return rnet
 
 
@@ -1104,10 +1061,8 @@ def test_regional_add_kinetic_connection_single():
 def test_regional_kinetic_plus_regular_mixed():
     """RegionalNetwork with both kinetic and regular synapses: no crash."""
     rnet = _make_rnet(2, 2)
-    # Regular excitatory
     rnet.connect("pre", "post", "all_to_all",
                  synapse=SynapseSpec.ampa(), weight=0.5)
-    # Kinetic inhibitory
     rnet.connect("post", "pre", "all_to_all", weight=0.3,
                  kinetic_spec=KineticSynapseSpec.gaba_kinetic())
     assert rnet.num_synapses == 4 + 4
@@ -1120,8 +1075,8 @@ def test_regional_kinetic_plus_regular_mixed():
 def test_regional_kinetic_composable_neurons():
     """RegionalNetwork with ComposableNeuron populations and kinetic synapse."""
     rnet = RegionalNetwork()
-    rnet.add_population("stn", 3, model=NeuronModelSpec.stn())
-    rnet.add_population("gpe", 3, model=NeuronModelSpec.gpe())
+    rnet.add_population("stn", 3, model=make_stn())
+    rnet.add_population("gpe", 3, model=make_gpe())
     rnet.connect("stn", "gpe", "all_to_all", weight=0.2,
                  kinetic_spec=KineticSynapseSpec.gaba_kinetic())
     traces = rnet.simulate(200.0, DT, {"stn": 5.0, "gpe": 0.0})
@@ -1238,10 +1193,10 @@ def test_builder_spec_runs_in_simulation():
             .tanh_gate(amp=2.0, v_half=0.0, k=4.0, tau_decay=13.0)
             .linear_current(g=0.1, E_syn=-80.0)
             .to_spec())
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    traces = _run(net, duration=300.0, I_pre=10.0)
+    rn, syn = _fresh_rn_with_spec(spec)
+    traces = _run(rn, 300.0, I_pre=10.0)
     assert _all_finite(traces)
-    assert 0.0 <= net.get_kin_S(syn) <= 1.0
+    assert 0.0 <= _get_S(rn, syn) <= 1.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1249,7 +1204,6 @@ def test_builder_spec_runs_in_simulation():
 # ═══════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("spec_factory,I_pre,I_post,dt_val", [
-    # All presets × various drive levels × two dt values
     (KineticSynapseSpec.gaba_kinetic,  0.0,  0.0, 0.025),
     (KineticSynapseSpec.gaba_kinetic, 10.0,  5.0, 0.025),
     (KineticSynapseSpec.gaba_kinetic, 15.0, 12.0, 0.1),
@@ -1262,28 +1216,27 @@ def test_builder_spec_runs_in_simulation():
 ])
 def test_numerical_stability_sweep(spec_factory, I_pre, I_post, dt_val):
     spec = spec_factory()
-    net, _, _, syn = _fresh_net_with_spec(spec)
-    dur = 300.0; n = int(dur / dt_val)
-    traces = np.array(net.simulate(dur, dt_val, [[I_pre]*n, [I_post]*n]))
+    rn, syn = _fresh_rn_with_spec(spec)
+    traces = _run(rn, 300.0, dt_val, I_pre, I_post)
     assert _all_finite(traces), \
         f"NaN/Inf: {spec.name} I_pre={I_pre} I_post={I_post} dt={dt_val}"
-    S = net.get_kin_S(syn)
+    S = _get_S(rn, syn)
     assert 0.0 - 1e-9 <= S <= 1.0 + 1e-9
 
 
-@pytest.mark.parametrize("pre_type,post_type", [
-    (_IZ_RS_TYPE,  _IZ_RS_TYPE),
-    (_IZ_FS_TYPE,  _IZ_LTS_TYPE),
-    (_HH_TYPE,     _IZ_CH_TYPE),
-    (_IZ_IB_TYPE,  _HH_TYPE),
+@pytest.mark.parametrize("pre_factory,post_factory", [
+    (_iz_rs_model,  _iz_rs_model),
+    (_iz_fs_model,  _iz_lts_model),
+    (_hh_model,     _iz_ch_model),
+    (_iz_ib_model,  _hh_model),
 ])
-def test_numerical_stability_iz_variants(pre_type, post_type):
+def test_numerical_stability_iz_variants(pre_factory, post_factory):
     """All Izhikevich sub-types as pre/post with GABA kinetic: finite traces."""
     spec = KineticSynapseSpec.gaba_kinetic()
-    net = Network()
-    pre  = net.add_neuron(pre_type)
-    post = net.add_neuron(post_type)
-    net.add_kinetic_synapse(pre, post, 1.0, spec)
-    n = int(300.0 / DT)
-    traces = np.array(net.simulate(300.0, DT, [[10.0]*n, [5.0]*n]))
-    assert _all_finite(traces), f"NaN for {pre_type} → {post_type}"
+    rn = RegionalNetwork()
+    rn.add_population("pre",  1, model=pre_factory())
+    rn.add_population("post", 1, model=post_factory())
+    rn.add_kinetic_connection("pre", 0, "post", 0, weight=1.0, spec=spec)
+    traces = _run(rn, 300.0, DT, 10.0, 5.0)
+    assert _all_finite(traces), \
+        f"NaN for {pre_factory.__name__} → {post_factory.__name__}"

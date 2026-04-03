@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import List, Tuple, Dict
 
-from hodgkin_huxley import Network
+from hodgkin_huxley import RegionalNetwork, SynapseSpec
 import os
 import time
 import threading
@@ -462,17 +462,27 @@ TOPOLOGIES = {
 # Benchmark runner
 # =============================================================================
 
+def _make_cpp_net(N: int, synapses) -> "RegionalNetwork":
+    """Build a RegionalNetwork with the given synapses (all same weight/E_syn/tau)."""
+    rn = RegionalNetwork()
+    rn.add_population("E", N)
+    if synapses:
+        pairs = [(s[0], s[1]) for s in synapses]
+        w, e, tau = synapses[0][2], synapses[0][3], synapses[0][4]
+        rn.connect("E", "E", lambda ns, nd: pairs, weight=w,
+                   synapse=SynapseSpec.exponential(E_syn=e, tau=tau))
+    return rn
+
+
 def _bench_cpp(N: int, synapses, duration: float, dt: float,
                I_val: float) -> float:
-    """Return wall time (s) for C++ Network.simulate()."""
-    net = Network(N)
-    for pre, post, w, e, tau in synapses:
-        net.add_synapse(pre, post, w, e, tau)
+    """Return wall time (s) for RegionalNetwork.simulate()."""
+    rn = _make_cpp_net(N, synapses)
     num_steps = int(duration / dt)
     I_ext = np.full((N, num_steps), I_val)
 
     start = time.perf_counter()
-    net.simulate(duration, dt, I_ext)
+    rn.simulate(duration, dt, {"E": I_ext})
     return time.perf_counter() - start
 
 
@@ -503,10 +513,8 @@ def validate_implementations(duration: float = 50.0, dt: float = 0.05,
     I_ext = np.full((N, num_steps), I_val)
 
     # C++
-    cpp_net = Network(N)
-    for pre, post, w, e, tau in synapses:
-        cpp_net.add_synapse(pre, post, w, e, tau)
-    cpp_traces = np.array(cpp_net.simulate(duration, dt, I_ext))
+    cpp_net = _make_cpp_net(N, synapses)
+    cpp_traces = cpp_net.simulate(duration, dt, {"E": I_ext})["E"]
 
     # NumPy
     np_net = NumpyHHNetwork(N)
@@ -840,11 +848,9 @@ def run_duration_scaling(dt: float = 0.05, I_val: float = 10.0):
         I_ext = np.full((N, num_steps), I_val)
 
         # C++
-        cpp_net = Network(N)
-        for pre, post, w, e, tau in synapses:
-            cpp_net.add_synapse(pre, post, w, e, tau)
+        cpp_net = _make_cpp_net(N, synapses)
         start = time.perf_counter()
-        cpp_net.simulate(dur, dt, I_ext)
+        cpp_net.simulate(dur, dt, {"E": I_ext})
         t_cpp = time.perf_counter() - start
 
         # NumPy
@@ -965,15 +971,13 @@ def _measure_memory_cpp(N: int, synapses, duration: float, dt: float, I_val: flo
 
     I_ext = np.full((N, num_steps), I_val)
 
-    net = Network(N)
-    for pre, post, w, e, tau in synapses:
-        net.add_synapse(pre, post, w, e, tau)
+    rn = _make_cpp_net(N, synapses)
 
     # IMPORTANT: do not keep traces around; we want peak during simulate, not after
-    peak_mb = _peak_rss_mb_during(net.simulate, duration, dt, I_ext)
+    peak_mb = _peak_rss_mb_during(rn.simulate, duration, dt, {"E": I_ext})
 
     # Cleanup to reduce cross-run carryover (RSS may not immediately drop due to allocators)
-    del net, I_ext
+    del rn, I_ext
     gc.collect()
 
     return peak_mb

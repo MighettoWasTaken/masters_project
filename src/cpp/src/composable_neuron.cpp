@@ -1,4 +1,5 @@
 #include "hodgkin_huxley/composable_neuron.hpp"
+#include "hodgkin_huxley/model/kinetics.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -45,13 +46,13 @@ void ComposableNeuron::reset_gates_to_steady_state() {
         switch (gs.update_form) {
             case GateSpec::UpdateForm::INF_TAU: {
                 double dep = (gs.dependency == GateSpec::Dependency::CALCIUM) ? Ca_ : V_;
-                gate_states_[i] = boltzmann(dep, gs.inf);
+                gate_states_[i] = boltzmann_scalar(dep, gs.inf);
                 gate_states_[i] = std::max(0.0, std::min(1.0, gate_states_[i]));
                 break;
             }
             case GateSpec::UpdateForm::ALPHA_BETA: {
-                double alpha = compute_rate(V_, gs.alpha);
-                double beta  = compute_rate(V_, gs.beta);
+                double alpha = compute_rate_scalar(V_, gs.alpha);
+                double beta  = compute_rate_scalar(V_, gs.beta);
                 double rate  = alpha + beta;
                 if (rate > 1e-10) gate_states_[i] = alpha / rate;
                 gate_states_[i] = std::max(0.0, std::min(1.0, gate_states_[i]));
@@ -59,7 +60,7 @@ void ComposableNeuron::reset_gates_to_steady_state() {
             }
             case GateSpec::UpdateForm::INSTANT: {
                 double dep = (gs.dependency == GateSpec::Dependency::CALCIUM) ? Ca_ : V_;
-                gate_states_[i] = boltzmann(dep, gs.inf);
+                gate_states_[i] = boltzmann_scalar(dep, gs.inf);
                 gate_states_[i] = std::max(0.0, std::min(1.0, gate_states_[i]));
                 break;
             }
@@ -97,129 +98,6 @@ void ComposableNeuron::reset() {
     }
 }
 
-// Boltzmann sigmoid: 1 / (1 + exp(-(x - v_half) / k))
-double ComposableNeuron::boltzmann(double x, const BoltzmannParams& p) {
-    double arg = -(x - p.v_half) / p.k;
-    // Clamp to prevent overflow
-    if (arg > 500.0) return 0.0;
-    if (arg < -500.0) return 1.0;
-    return 1.0 / (1.0 + std::exp(arg));
-}
-
-double ComposableNeuron::compute_tau(double V, const TauParams& tau) {
-    switch (tau.form) {
-        case TauParams::Form::CONSTANT:
-            return tau.params[0];
-
-        case TauParams::Form::BOLTZMANN: {
-            // tau = base + amp / (1 + exp(-(V - v_half) / k))
-            double base = tau.params[0];
-            double amp = tau.params[1];
-            double vh = tau.params[2];
-            double k = tau.params[3];
-            double arg = -(V - vh) / k;
-            arg = std::max(-500.0, std::min(500.0, arg));
-            return base + amp / (1.0 + std::exp(arg));
-        }
-
-        case TauParams::Form::DOUBLE_EXP_SUM: {
-            // tau = base + amp / (exp((V + v1) / s1) + exp(-(V + v2) / s2))
-            double base = tau.params[0];
-            double amp = tau.params[1];
-            double v1 = tau.params[2];
-            double s1 = tau.params[3];
-            double v2 = tau.params[5];
-            double s2 = tau.params[6];
-            double e1 = std::exp((V + v1) / s1);
-            double e2 = std::exp(-(V + v2) / s2);
-            double denom = e1 + e2;
-            if (denom < 1e-10) denom = 1e-10;
-            return base + amp / denom;
-        }
-
-        case TauParams::Form::OFFSET_DOUBLE_EXP: {
-            // tau = base + a1*exp(-((V+v1)/s1)^2) + a2*exp(-((V+v2)/s2)^2)
-            double base = tau.params[0];
-            double a1 = tau.params[1];
-            double v1 = tau.params[2];
-            double s1 = tau.params[3];
-            double a2 = tau.params[4];
-            double v2 = tau.params[5];
-            double s2 = tau.params[6];
-            double x1 = (V + v1) / s1;
-            double x2 = (V + v2) / s2;
-            return base + a1 * std::exp(-x1 * x1) + a2 * std::exp(-x2 * x2);
-        }
-
-        case TauParams::Form::SCALED_EXP: {
-            // tau = scale / cosh((V - v_half) / (2 * k))
-            double scale = tau.params[0];
-            double vh = tau.params[1];
-            double k = tau.params[2];
-            double arg = (V - vh) / (2.0 * k);
-            arg = std::max(-500.0, std::min(500.0, arg));
-            double ch = std::cosh(arg);
-            if (ch < 1e-10) ch = 1e-10;
-            return scale / ch;
-        }
-
-        case TauParams::Form::COMPOUND_AB: {
-            // alpha and beta as rate functions, tau = 1/(alpha+beta)
-            double aA = tau.params[0], aB = tau.params[1], aC = tau.params[2];
-            double bA = tau.params[3], bB = tau.params[4], bC = tau.params[5];
-            // Simple exp-based rates
-            double alpha = aA * std::exp((V + aB) / aC);
-            double beta = bA * std::exp((V + bB) / bC);
-            double sum = alpha + beta;
-            if (sum < 1e-10) sum = 1e-10;
-            return 1.0 / sum;
-        }
-    }
-    return 1.0;
-}
-
-double ComposableNeuron::compute_rate(double V, const RateFuncParams& rate) {
-    switch (rate.form) {
-        case RateFuncParams::Form::LINEAR_OVER_EXP: {
-            // A*(V+B) / (exp((V+B)/C) - 1)
-            double x = V + rate.B;
-            double xc = x / rate.C;
-            // Handle singularity using L'Hopital: limit -> A*C
-            if (std::abs(xc) < 1e-6) {
-                return rate.A * rate.C * (1.0 + xc * 0.5);
-            }
-            double e = std::exp(xc);
-            return rate.A * x / (e - 1.0);
-        }
-
-        case RateFuncParams::Form::EXP_DECAY: {
-            // A * exp((V+B)/C)
-            double arg = (V + rate.B) / rate.C;
-            arg = std::max(-500.0, std::min(500.0, arg));
-            return rate.A * std::exp(arg);
-        }
-
-        case RateFuncParams::Form::LINEAR_OVER_EXPM1: {
-            // A*(V+B) / (1 - exp(-(V+B)/C))
-            double x = V + rate.B;
-            double xc = x / rate.C;
-            // Handle singularity: limit -> A*C
-            if (std::abs(xc) < 1e-6) {
-                return rate.A * rate.C * (1.0 + xc * 0.5);
-            }
-            double e = std::exp(-xc);
-            return rate.A * x / (1.0 - e);
-        }
-
-        case RateFuncParams::Form::SIGMOID: {
-            // A / (1 + exp((V+B)/C))
-            double arg = (V + rate.B) / rate.C;
-            arg = std::max(-500.0, std::min(500.0, arg));
-            return rate.A / (1.0 + std::exp(arg));
-        }
-    }
-    return 0.0;
-}
 
 void ComposableNeuron::update_gates(double dt) {
     const size_t ng = spec_.gates.size();
@@ -230,16 +108,16 @@ void ComposableNeuron::update_gates(double dt) {
         switch (gs.update_form) {
             case GateSpec::UpdateForm::INF_TAU: {
                 double dep_var = (gs.dependency == GateSpec::Dependency::CALCIUM) ? Ca_ : V_;
-                double x_inf = boltzmann(dep_var, gs.inf);
-                double tau_x = compute_tau(V_, gs.tau);
+                double x_inf = boltzmann_scalar(dep_var, gs.inf);
+                double tau_x = compute_tau_scalar(V_, gs.tau);
                 if (tau_x < 1e-10) tau_x = 1e-10;
                 gate_states_[i] = x_inf + (gate_states_[i] - x_inf) * std::exp(-dt * gs.scale / tau_x);
                 break;
             }
 
             case GateSpec::UpdateForm::ALPHA_BETA: {
-                double alpha = compute_rate(V_, gs.alpha);
-                double beta  = compute_rate(V_, gs.beta);
+                double alpha = compute_rate_scalar(V_, gs.alpha);
+                double beta  = compute_rate_scalar(V_, gs.beta);
                 double rate  = alpha + beta;
                 double x_inf = (rate > 1e-10) ? alpha / rate : gate_states_[i];
                 double tau_x = (rate > 1e-10) ? 1.0 / rate  : 1e10;
@@ -249,7 +127,7 @@ void ComposableNeuron::update_gates(double dt) {
 
             case GateSpec::UpdateForm::INSTANT: {
                 double dep_var = (gs.dependency == GateSpec::Dependency::CALCIUM) ? Ca_ : V_;
-                gate_states_[i] = boltzmann(dep_var, gs.inf);
+                gate_states_[i] = boltzmann_scalar(dep_var, gs.inf);
                 break;
             }
 
@@ -361,7 +239,7 @@ void ComposableNeuron::step(double dt, double I_ext) {
         const auto& gs = spec_.gates[i];
         if (gs.update_form == GateSpec::UpdateForm::INSTANT) {
             double dep = (gs.dependency == GateSpec::Dependency::CALCIUM) ? Ca_ : V_;
-            gate_states_[i] = boltzmann(dep, gs.inf);
+            gate_states_[i] = boltzmann_scalar(dep, gs.inf);
         } else if (gs.update_form == GateSpec::UpdateForm::DERIVED) {
             int src = gs.derived_source_gate;
             if (src >= 0 && src < static_cast<int>(ng)) {

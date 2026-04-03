@@ -1,6 +1,7 @@
 #pragma once
 
-#include "izhikevich.hpp"
+#include "hodgkin_huxley/izhikevich.hpp"
+#include "hodgkin_huxley/pool/pool_base.hpp"
 #include <Eigen/Core>
 #include <vector>
 #include <memory>
@@ -16,7 +17,7 @@ namespace hodgkin_huxley {
  *
  * Used internally by Network::simulate() for the hot loop.
  */
-class IzPool {
+class IzPool : public PoolBase {
 public:
     IzPool() = default;
     explicit IzPool(size_t capacity);
@@ -24,14 +25,17 @@ public:
     void add(size_t network_idx, const IzhikevichNeuron::Parameters& params,
              const IzhikevichNeuron::State& state);
 
-    size_t size() const { return N_; }
+    size_t size() const override { return N_; }
     bool empty() const { return N_ == 0; }
     size_t network_idx(size_t pool_idx) const { return net_idx_[pool_idx]; }
 
-    void scatter_voltages(double* V_buf) const;
-    void gather_currents(const double* I_buf);
+    void scatter_voltages(double* V_buf) const override;
+    void scatter_recoveries(double* u_buf, size_t n_rec, size_t tr) const override;
+    void gather_currents(const double* I_buf) override;
+    // PoolBase::step() delegates to step_euler()
+    void step(double dt) override { step_euler(dt); }
     void step_euler(double dt);
-    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const;
+    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const override;
 
 private:
     size_t N_ = 0;

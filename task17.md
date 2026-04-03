@@ -25,6 +25,8 @@ if(USE_CUDA)
 endif()
 ```
 
+> **Environment note:** conda is the required environment manager for CUDA work — cuDNN, NCCL, and CUDA toolkit packages are not pip/UV installable and must be managed via conda (`conda install -c nvidia cuda-toolkit cudnn`). The project `.venv` (UV-managed) is for pure-Python testing on other machines only; it cannot support the CUDA build. Always build with the `rebuild` conda env active.
+
 ### Device Model
 
 Devices are first-class objects following PyTorch conventions. The `Device` struct is the canonical way to specify compute targets; `Backend` is kept as a legacy alias.

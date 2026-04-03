@@ -20,13 +20,11 @@ import pytest
 from hodgkin_huxley import (
     RegionalNetwork,
     ConnectivityPattern,
+    NeuronModelSpec,
     SynapseSpec,
     SynapseSpecType,
     WeightDistribution,
     WeightDistType,
-    NetworkNeuronType,
-    HHParameters,
-    IzhikevichParameters,
     IzhikevichType,
 )
 
@@ -63,22 +61,22 @@ class TestPopulation:
 
     def test_add_population_with_type_enum(self):
         rn = RegionalNetwork()
-        rn.add_population("X", 2, neuron_type=NetworkNeuronType.IZHIKEVICH_FS)
+        rn.add_population("X", 2, model=NeuronModelSpec.izhikevich(IzhikevichType.FAST_SPIKING))
         assert rn.num_neurons == 2
 
     def test_add_population_custom_hh_params(self):
         rn = RegionalNetwork()
-        params = HHParameters()
-        params.g_Na = 100.0
-        rn.add_population("custom", 3, parameters=params)
+        spec = NeuronModelSpec.hh_default()
+        spec.channels[0].g = 100.0  # Na conductance
+        rn.add_population("custom", 3, model=spec)
         assert rn.population_size("custom") == 3
 
     def test_add_population_custom_iz_params(self):
         rn = RegionalNetwork()
-        params = IzhikevichParameters()
-        params.a = 0.1
-        params.b = 0.2
-        rn.add_population("iz", 4, parameters=params)
+        spec = NeuronModelSpec.izhikevich()
+        spec.iz_params.a = 0.1
+        spec.iz_params.b = 0.2
+        rn.add_population("iz", 4, model=spec)
         assert rn.population_size("iz") == 4
 
     def test_duplicate_name_raises(self):
@@ -1004,10 +1002,10 @@ class TestParameterSensitivity:
         spikes_default = sum(count_spikes(traces_default["A"][i]) for i in range(5))
 
         # Reduced Na conductance — harder to spike
-        params = HHParameters()
-        params.g_Na = 40.0  # Default is 120.0
+        spec = NeuronModelSpec.hh_default()
+        spec.channels[0].g = 40.0  # Na conductance; default is 120.0
         rn_custom = RegionalNetwork()
-        rn_custom.add_population("A", 5, parameters=params)
+        rn_custom.add_population("A", 5, model=spec)
         traces_custom = rn_custom.simulate(200.0, 0.01, {"A": 10.0})
         spikes_custom = sum(count_spikes(traces_custom["A"][i]) for i in range(5))
 

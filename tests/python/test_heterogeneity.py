@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from hodgkin_huxley import RegionalNetwork, NeuronModelSpec, SynapseSpec
+from neuron_specs import make_stn
 
 
 # ---------------------------------------------------------------------------
@@ -22,7 +23,7 @@ def make_rnet_stn(n=10, heterogeneity=None, seed=None):
     rnet = RegionalNetwork()
     rnet.add_population(
         "STN", n,
-        model=NeuronModelSpec.stn(),
+        model=make_stn(),
         heterogeneity=heterogeneity,
         seed=seed,
     )
@@ -66,7 +67,7 @@ class TestChannelGNormal:
         assert len(set(gs)) > 1, "All conductances are identical — heterogeneity not applied"
 
     def test_mean_near_base(self):
-        base_g = NeuronModelSpec.stn().channels[0].g
+        base_g = make_stn().channels[0].g
         n = 200
         rnet = make_rnet_stn(n, {"channels[0].g": ("normal", 1.0, 0.10)}, seed=1)
         gs = np.array([get_channel_g(rnet, "STN", i, 0) for i in range(n)])
@@ -74,7 +75,7 @@ class TestChannelGNormal:
         assert abs(gs.mean() - base_g) / base_g < 0.10
 
     def test_std_near_expected(self):
-        base_g = NeuronModelSpec.stn().channels[0].g
+        base_g = make_stn().channels[0].g
         n = 500
         rnet = make_rnet_stn(n, {"channels[0].g": ("normal", 1.0, 0.20)}, seed=2)
         gs = np.array([get_channel_g(rnet, "STN", i, 0) for i in range(n)])
@@ -90,7 +91,7 @@ class TestChannelGNormal:
 class TestChannelGUniform:
 
     def test_all_within_range(self):
-        base_g = NeuronModelSpec.stn().channels[0].g
+        base_g = make_stn().channels[0].g
         n = 50
         rnet = make_rnet_stn(n, {"channels[0].g": ("uniform", 0.8, 1.2)}, seed=3)
         gs = np.array([get_channel_g(rnet, "STN", i, 0) for i in range(n)])
@@ -136,7 +137,7 @@ class TestVInitHeterogeneity:
         assert len(set(vinits)) > 1
 
     def test_V_init_near_base(self):
-        base_v = NeuronModelSpec.stn().V_init
+        base_v = make_stn().V_init
         n = 100
         rnet = make_rnet_stn(n, {"V_init": ("normal", 1.0, 0.05)}, seed=8)
         vinits = np.array([get_V_init(rnet, "STN", i) for i in range(n)])
@@ -153,7 +154,7 @@ class TestGateInitialHeterogeneity:
     def test_gate_initial_varies(self):
         n = 20
         # STN gate 0 has non-zero initial value
-        base_spec = NeuronModelSpec.stn()
+        base_spec = make_stn()
         gate_idx = 0
         rnet = RegionalNetwork()
         rnet.add_population(
@@ -177,7 +178,7 @@ class TestMultipleFields:
         rnet = RegionalNetwork()
         rnet.add_population(
             "STN", n,
-            model=NeuronModelSpec.stn(),
+            model=make_stn(),
             heterogeneity={
                 "channels[0].g": ("normal", 1.0, 0.15),
                 "channels[1].g": ("normal", 1.0, 0.15),
@@ -235,7 +236,7 @@ class TestFiringVariability:
         rnet = RegionalNetwork()
         rnet.add_population(
             "STN", n,
-            model=NeuronModelSpec.stn(),
+            model=make_stn(),
             heterogeneity={"channels[1].g": ("normal", 1.0, 0.25)},
             seed=77,
         )
@@ -265,7 +266,7 @@ class TestErrorHandling:
         with pytest.raises(ValueError, match="Unknown heterogeneity field path"):
             rnet.add_population(
                 "STN", 5,
-                model=NeuronModelSpec.stn(),
+                model=make_stn(),
                 heterogeneity={"bad_field": ("normal", 1.0, 0.1)},
             )
 
@@ -283,7 +284,7 @@ class TestErrorHandling:
         with pytest.raises(ValueError, match="Unknown heterogeneity distribution"):
             rnet.add_population(
                 "STN", 5,
-                model=NeuronModelSpec.stn(),
+                model=make_stn(),
                 heterogeneity={"C_m": ("lognormal", 1.0, 0.1)},
             )
 
@@ -292,6 +293,6 @@ class TestErrorHandling:
         with pytest.raises((IndexError, ValueError)):
             rnet.add_population(
                 "STN", 5,
-                model=NeuronModelSpec.stn(),
+                model=make_stn(),
                 heterogeneity={"channels[99].g": ("normal", 1.0, 0.1)},
             )

@@ -26,11 +26,7 @@ except ImportError:
     print("Warning: networkx not installed. Using basic layout.")
 
 from hodgkin_huxley import (
-    Network,
-    HHNeuron,
-    IzhikevichNeuron,
-    IzhikevichType,
-    NetworkNeuronType,
+    IzhikevichType, RegionalNetwork, NeuronModelSpec, SynapseSpec, RecordingConfig,
 )
 
 
@@ -43,7 +39,7 @@ class NetworkVisualization:
     firing_rates: List[float]
     stimulation: Dict[int, float]  # neuron_idx -> current
     title: str = "Neural Network"
-    neuron_labels: Optional[List[str]] = None  # Custom labels for each neuron (e.g., "RS", "FS", "E1")
+    neuron_labels: Optional[List[str]] = None  # Custom labels for each neuron
 
 
 def count_spikes(trace: np.ndarray, threshold: float = 0.0) -> int:
@@ -53,29 +49,35 @@ def count_spikes(trace: np.ndarray, threshold: float = 0.0) -> int:
     return int(np.sum(crossings == 1))
 
 
+def _pop_info(rn: RegionalNetwork) -> Dict[str, Tuple[int, int]]:
+    """Return {pop_name: (global_start, count)} in insertion order."""
+    return {
+        name: (rn._rnet.population_start(name), rn._rnet.population_size(name))
+        for name in rn.population_names()
+    }
+
+
 def simulate_and_analyze(
-    net: Network,
+    rn: RegionalNetwork,
     duration: float,
     dt: float,
-    I_ext: np.ndarray,
-    threshold: float = 0.0
+    I_ext_dict: dict,
 ) -> Tuple[List[float], np.ndarray]:
     """
     Simulate network and compute firing rates.
 
     Returns:
-        firing_rates: List of firing rates (Hz) for each neuron
-        traces: Voltage traces for all neurons
+        firing_rates: List of firing rates (Hz) in global neuron order
+        traces: Voltage traces (n_neurons, n_steps) in global neuron order
     """
-    traces = net.simulate(duration, dt, I_ext)
-    traces = np.array(traces)
-
+    result = rn.simulate(duration, dt, I_ext_dict,
+                         record=RecordingConfig(["V", "firing_rate"]))
     firing_rates = []
-    for i in range(net.num_neurons):
-        spikes = count_spikes(traces[i], threshold)
-        rate = spikes / (duration / 1000.0)  # Convert to Hz
-        firing_rates.append(rate)
-
+    trace_rows = []
+    for pop_name in rn.population_names():
+        firing_rates.extend(result[pop_name]["firing_rate"].tolist())
+        trace_rows.append(result[pop_name]["V"])
+    traces = np.vstack(trace_rows) if trace_rows else np.empty((0, 0))
     return firing_rates, traces
 
 
@@ -110,13 +112,11 @@ def visualize_network(
         for pre, post, weight, E_syn in vis_data.synapses:
             G.add_edge(pre, post, weight=weight, E_syn=E_syn)
 
-        # Use spring layout for nice positioning
         if n <= 10:
             pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
         else:
             pos = nx.kamada_kawai_layout(G)
     else:
-        # Fallback: circular layout
         pos = {}
         for i in range(n):
             angle = 2 * np.pi * i / n
@@ -132,10 +132,8 @@ def visualize_network(
         x_pre, y_pre = pos[pre]
         x_post, y_post = pos[post]
 
-        # Determine synapse type (excitatory vs inhibitory)
-        is_excitatory = E_syn > -60  # E_syn > V_rest is excitatory
+        is_excitatory = E_syn > -60
 
-        # Edge style based on type
         if is_excitatory:
             color = 'green'
             style = '-'
@@ -145,10 +143,8 @@ def visualize_network(
             style = '--'
             alpha = 0.4 + 0.4 * min(weight / 10.0, 1.0)
 
-        # Line width based on weight
         linewidth = 0.5 + 2.0 * min(weight / 10.0, 1.0)
 
-        # Draw arrow
         ax_network.annotate(
             '',
             xy=(x_post, y_post),
@@ -171,18 +167,15 @@ def visualize_network(
         rate = vis_data.firing_rates[i]
         neuron_type = vis_data.neuron_types[i]
 
-        # Node color based on firing rate
         node_color = cmap(norm(rate))
 
-        # Node shape based on neuron type
         if neuron_type == "HH":
-            marker = 'o'  # Circle for HH
+            marker = 'o'
             size = 800
         else:
-            marker = 's'  # Square for Izhikevich
+            marker = 's'
             size = 700
 
-        # Draw neuron
         ax_network.scatter(
             [x], [y],
             s=size,
@@ -193,7 +186,6 @@ def visualize_network(
             zorder=3
         )
 
-        # Add neuron index label
         ax_network.annotate(
             str(i),
             (x, y),
@@ -204,7 +196,6 @@ def visualize_network(
             zorder=4
         )
 
-        # Mark stimulated neurons with a ring
         if i in vis_data.stimulation:
             stim_current = vis_data.stimulation[i]
             ring_size = 1200 + 200 * min(stim_current / 20.0, 1.0)
@@ -216,7 +207,6 @@ def visualize_network(
                 linewidths=3,
                 zorder=2
             )
-            # Add stimulation label
             ax_network.annotate(
                 f'{stim_current:.0f}',
                 (x, y + 0.15),
@@ -227,20 +217,17 @@ def visualize_network(
                 fontweight='bold'
             )
 
-    # Add colorbar for firing rate
     sm = ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=ax_network, shrink=0.6, pad=0.02)
     cbar.set_label('Firing Rate (Hz)', fontsize=10)
 
-    # Network plot styling
     ax_network.set_xlim(-1.5, 1.5)
     ax_network.set_ylim(-1.5, 1.5)
     ax_network.set_aspect('equal')
     ax_network.axis('off')
     ax_network.set_title(vis_data.title, fontsize=14, fontweight='bold')
 
-    # Create legend
     legend_elements = [
         mpatches.Patch(facecolor='white', edgecolor='black', label='HH Neuron (circle)'),
         mpatches.Patch(facecolor='white', edgecolor='black', label='Izhikevich (square)'),
@@ -252,10 +239,8 @@ def visualize_network(
     ]
     ax_network.legend(handles=legend_elements, loc='upper left', fontsize=9)
 
-    # Info panel
     ax_info.axis('off')
 
-    # Build neuron type summary
     hh_count = sum(1 for t in vis_data.neuron_types if t == 'HH')
     iz_count = sum(1 for t in vis_data.neuron_types if t == 'Izhikevich')
 
@@ -273,7 +258,6 @@ Synapses: {len(vis_data.synapses)}
 Stimulated neurons: {len(vis_data.stimulation)}
 """
 
-    # Add neuron key if custom labels are provided
     if vis_data.neuron_labels:
         info_text += f"""
 Neuron Key:
@@ -321,9 +305,10 @@ Most active: Neuron {max_rate_idx} ({vis_data.firing_rates[max_rate_idx]:.1f} Hz
 
 
 def create_network_visualization(
-    net: Network,
+    rn: RegionalNetwork,
     synapses: List[Tuple[int, int, float, float]],
     stimulation: Dict[int, float],
+    neuron_types: List[str],
     duration: float = 500.0,
     dt: float = 0.01,
     title: str = "Neural Network",
@@ -333,35 +318,30 @@ def create_network_visualization(
     Create visualization data by simulating the network.
 
     Args:
-        net: Network object
-        synapses: List of (pre, post, weight, E_syn) tuples
-        stimulation: Dict mapping neuron index to stimulation current
+        rn: RegionalNetwork to simulate
+        synapses: List of (pre, post, weight, E_syn) tuples with global neuron indices
+        stimulation: Dict mapping global neuron index to stimulation current
+        neuron_types: List of "HH" or "Izhikevich" per global neuron index
         duration: Simulation duration in ms
         dt: Time step in ms
         title: Title for the visualization
         neuron_labels: Optional list of custom labels for each neuron
-                      (e.g., ["E1", "E2", "I1"] or ["RS", "FS", "IB"])
-
-    Returns:
-        NetworkVisualization object with simulation results
     """
-    num_neurons = net.num_neurons
-    num_steps = int(duration / dt)
+    info = _pop_info(rn)
+    n_steps = int(duration / dt)
 
-    # Get neuron types
-    neuron_types = [net.neuron_type(i) for i in range(num_neurons)]
+    # Build per-population I_ext from global stimulation dict
+    I_ext_dict = {name: np.zeros((size, n_steps)) for name, (_, size) in info.items()}
+    for global_idx, current in stimulation.items():
+        for name, (start, size) in info.items():
+            if start <= global_idx < start + size:
+                I_ext_dict[name][global_idx - start, :] = current
+                break
 
-    # Create external current array
-    I_ext = np.zeros((num_neurons, num_steps))
-    for idx, current in stimulation.items():
-        I_ext[idx, :] = current
-
-    # Simulate and get firing rates
-    # Use threshold=0 for HH, threshold=30 for Izhikevich
-    firing_rates, traces = simulate_and_analyze(net, duration, dt, I_ext, threshold=0)
+    firing_rates, _ = simulate_and_analyze(rn, duration, dt, I_ext_dict)
 
     return NetworkVisualization(
-        num_neurons=num_neurons,
+        num_neurons=sum(size for _, (_, size) in info.items()),
         neuron_types=neuron_types,
         synapses=synapses,
         firing_rates=firing_rates,
@@ -379,237 +359,196 @@ def example_feedforward_chain():
     """Feedforward chain: 0 -> 1 -> 2 -> 3"""
     print("\n1. Feedforward Chain (HH neurons)")
 
-    net = Network(4)
-    synapses = []
+    rn = RegionalNetwork()
+    rn.add_population("E", 4, model=NeuronModelSpec.hh_default())
+    rn.connect("E", "E", lambda ns, nd: [(i, i + 1) for i in range(3)],
+               weight=0.1, synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
 
-    # Add excitatory chain
-    for i in range(3):
-        weight, E_syn, tau = 0.1, 0.0, 2.0
-        net.add_synapse(i, i+1, weight, E_syn, tau)
-        synapses.append((i, i+1, weight, E_syn))
-
+    neuron_types = ["HH"] * 4
+    synapses = [(i, i + 1, 0.1, 0.0) for i in range(3)]
     stimulation = {0: 15.0}
 
-    vis_data = create_network_visualization(
-        net, synapses, stimulation,
-        duration=500.0,
-        title="Feedforward Chain (HH)"
+    return create_network_visualization(
+        rn, synapses, stimulation, neuron_types,
+        duration=500.0, title="Feedforward Chain (HH)"
     )
-
-    return vis_data
 
 
 def example_divergent_network():
     """One neuron driving multiple targets"""
     print("\n2. Divergent Network (HH neurons)")
 
-    net = Network(5)
-    synapses = []
+    rn = RegionalNetwork()
+    rn.add_population("E", 5, model=NeuronModelSpec.hh_default())
+    rn.connect("E", "E", lambda ns, nd: [(0, i) for i in range(1, 5)],
+               weight=10.0, synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
 
-    # Neuron 0 drives neurons 1-4
-    for i in range(1, 5):
-        weight, E_syn, tau = 10.0, 0.0, 2.0
-        net.add_synapse(0, i, weight, E_syn, tau)
-        synapses.append((0, i, weight, E_syn))
-
+    neuron_types = ["HH"] * 5
+    synapses = [(0, i, 10.0, 0.0) for i in range(1, 5)]
     stimulation = {0: 15.0}
 
-    vis_data = create_network_visualization(
-        net, synapses, stimulation,
-        duration=500.0,
-        title="Divergent Network (1-to-many)"
+    return create_network_visualization(
+        rn, synapses, stimulation, neuron_types,
+        duration=500.0, title="Divergent Network (1-to-many)"
     )
-
-    return vis_data
 
 
 def example_convergent_network():
     """Multiple neurons converging on one target"""
     print("\n3. Convergent Network (HH neurons)")
 
-    net = Network(5)
-    synapses = []
+    rn = RegionalNetwork()
+    rn.add_population("E", 5, model=NeuronModelSpec.hh_default())
+    rn.connect("E", "E", lambda ns, nd: [(i, 4) for i in range(4)],
+               weight=3.0, synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
 
-    # Neurons 0-3 drive neuron 4
-    for i in range(4):
-        weight, E_syn, tau = 3.0, 0.0, 2.0
-        net.add_synapse(i, 4, weight, E_syn, tau)
-        synapses.append((i, 4, weight, E_syn))
-
+    neuron_types = ["HH"] * 5
+    synapses = [(i, 4, 3.0, 0.0) for i in range(4)]
     stimulation = {0: 12.0, 1: 12.0, 2: 12.0, 3: 12.0}
 
-    vis_data = create_network_visualization(
-        net, synapses, stimulation,
-        duration=500.0,
-        title="Convergent Network (many-to-1)"
+    return create_network_visualization(
+        rn, synapses, stimulation, neuron_types,
+        duration=500.0, title="Convergent Network (many-to-1)"
     )
-
-    return vis_data
 
 
 def example_recurrent_ei_network():
     """Small E-I network with recurrent connections"""
     print("\n4. E-I Recurrent Network (HH neurons)")
 
-    net = Network(6)
-    synapses = []
+    # E population: global 0-3, I population: global 4-5
+    rn = RegionalNetwork()
+    rn.add_population("E", 4, model=NeuronModelSpec.hh_default())
+    rn.add_population("I", 2, model=NeuronModelSpec.hh_default())
 
-    # Excitatory neurons: 0, 1, 2, 3
-    # Inhibitory neurons: 4, 5
+    # E -> E (weak): local 0,1 -> 2,3
+    rn.connect("E", "E", lambda ns, nd: [(0, 2), (0, 3), (1, 2), (1, 3)],
+               weight=2.0, synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+    # E -> I (all-to-all)
+    rn.connect("E", "I", "all_to_all", weight=4.0,
+               synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+    # I -> E (inhibitory, all-to-all)
+    rn.connect("I", "E", "all_to_all", weight=3.0,
+               synapse=SynapseSpec.exponential(E_syn=-80.0, tau=5.0))
+
     neuron_labels = ["E1", "E2", "E3", "E4", "I1", "I2"]
+    neuron_types = ["HH"] * 6
 
-    # E -> E connections (weak)
+    synapses = []
     for pre in [0, 1]:
         for post in [2, 3]:
-            weight, E_syn, tau = 2.0, 0.0, 2.0
-            net.add_synapse(pre, post, weight, E_syn, tau)
-            synapses.append((pre, post, weight, E_syn))
-
-    # E -> I connections
-    for pre in [0, 1, 2, 3]:
+            synapses.append((pre, post, 2.0, 0.0))
+    for pre in range(4):
         for post in [4, 5]:
-            weight, E_syn, tau = 4.0, 0.0, 2.0
-            net.add_synapse(pre, post, weight, E_syn, tau)
-            synapses.append((pre, post, weight, E_syn))
-
-    # I -> E connections (inhibitory)
+            synapses.append((pre, post, 4.0, 0.0))
     for pre in [4, 5]:
-        for post in [0, 1, 2, 3]:
-            weight, E_syn, tau = 3.0, -80.0, 5.0
-            net.add_synapse(pre, post, weight, E_syn, tau)
-            synapses.append((pre, post, weight, E_syn))
+        for post in range(4):
+            synapses.append((pre, post, 3.0, -80.0))
 
     stimulation = {0: 12.0, 1: 12.0}
 
-    vis_data = create_network_visualization(
-        net, synapses, stimulation,
-        duration=500.0,
-        title="E-I Recurrent Network",
+    return create_network_visualization(
+        rn, synapses, stimulation, neuron_types,
+        duration=500.0, title="E-I Recurrent Network",
         neuron_labels=neuron_labels
     )
-
-    return vis_data
 
 
 def example_mixed_neuron_types():
     """Network with both HH and Izhikevich neurons"""
     print("\n5. Mixed Neuron Types (HH + Izhikevich)")
 
-    net = Network()
-    synapses = []
+    # HH: global 0-1; Iz-RS: global 2; Iz-FS: global 3; Iz-IB: global 4
+    rn = RegionalNetwork()
+    rn.add_population("HH", 2, model=NeuronModelSpec.hh_default())
+    rn.add_population("IZ_RS", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
+    rn.add_population("IZ_FS", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.FAST_SPIKING))
+    rn.add_population("IZ_IB", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.INTRINSICALLY_BURSTING))
 
-    # Add HH neurons (0, 1)
-    net.add_hh_neuron()
-    net.add_hh_neuron()
+    # HH[0] -> all Izhikevich
+    for dst in ["IZ_RS", "IZ_FS", "IZ_IB"]:
+        rn.connect("HH", dst, lambda ns, nd: [(0, 0)], weight=8.0,
+                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+    # IZ_RS[0] and IZ_FS[0] -> HH[1]
+    for src in ["IZ_RS", "IZ_FS"]:
+        rn.connect(src, "HH", lambda ns, nd: [(0, 1)], weight=5.0,
+                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+    # IZ_FS inhibits IZ_IB
+    rn.connect("IZ_FS", "IZ_IB", "all_to_all", weight=4.0,
+               synapse=SynapseSpec.exponential(E_syn=-80.0, tau=5.0))
 
-    # Add Izhikevich neurons (2: RS, 3: FS, 4: IB)
-    net.add_izhikevich_neuron(IzhikevichType.REGULAR_SPIKING)
-    net.add_izhikevich_neuron(IzhikevichType.FAST_SPIKING)
-    net.add_izhikevich_neuron(IzhikevichType.INTRINSICALLY_BURSTING)
-
-    # Labels indicating model and type
     neuron_labels = ["HH-1", "HH-2", "Iz-RS", "Iz-FS", "Iz-IB"]
-
-    # HH -> Izhikevich connections
-    for post in [2, 3, 4]:
-        weight, E_syn, tau = 8.0, 0.0, 2.0
-        net.add_synapse(0, post, weight, E_syn, tau)
-        synapses.append((0, post, weight, E_syn))
-
-    # Izhikevich -> HH connections
-    for pre in [2, 3]:
-        weight, E_syn, tau = 5.0, 0.0, 2.0
-        net.add_synapse(pre, 1, weight, E_syn, tau)
-        synapses.append((pre, 1, weight, E_syn))
-
-    # FS inhibits IB
-    weight, E_syn, tau = 4.0, -80.0, 5.0
-    net.add_synapse(3, 4, weight, E_syn, tau)
-    synapses.append((3, 4, weight, E_syn))
-
+    neuron_types = ["HH", "HH", "Izhikevich", "Izhikevich", "Izhikevich"]
+    synapses = (
+        [(0, post, 8.0, 0.0) for post in [2, 3, 4]] +
+        [(pre, 1, 5.0, 0.0) for pre in [2, 3]] +
+        [(3, 4, 4.0, -80.0)]
+    )
     stimulation = {0: 15.0, 2: 8.0}
 
-    vis_data = create_network_visualization(
-        net, synapses, stimulation,
-        duration=500.0,
-        title="Mixed Network (HH + Izhikevich)",
+    return create_network_visualization(
+        rn, synapses, stimulation, neuron_types,
+        duration=500.0, title="Mixed Network (HH + Izhikevich)",
         neuron_labels=neuron_labels
     )
-
-    return vis_data
 
 
 def example_winner_take_all():
     """Mutual inhibition network (winner-take-all)"""
     print("\n6. Winner-Take-All Network")
 
-    net = Network(4)
-    synapses = []
+    rn = RegionalNetwork()
+    rn.add_population("E", 4, model=NeuronModelSpec.hh_default())
+    rn.connect("E", "E", "all_to_all", weight=4.0,
+               synapse=SynapseSpec.exponential(E_syn=-80.0, tau=5.0))
 
-    # Labels showing competition ranking by drive strength
     neuron_labels = ["HH-Hi", "HH-Med", "HH-Low", "HH-Min"]
-
-    # All-to-all inhibition (except self)
-    for pre in range(4):
-        for post in range(4):
-            if pre != post:
-                weight, E_syn, tau = 4.0, -80.0, 5.0
-                net.add_synapse(pre, post, weight, E_syn, tau)
-                synapses.append((pre, post, weight, E_syn))
-
-    # Asymmetric stimulation - neuron 0 gets most
+    neuron_types = ["HH"] * 4
+    synapses = [(pre, post, 4.0, -80.0)
+                for pre in range(4) for post in range(4) if pre != post]
     stimulation = {0: 15.0, 1: 12.0, 2: 10.0, 3: 8.0}
 
-    vis_data = create_network_visualization(
-        net, synapses, stimulation,
-        duration=500.0,
-        title="Winner-Take-All (Mutual Inhibition)",
+    return create_network_visualization(
+        rn, synapses, stimulation, neuron_types,
+        duration=500.0, title="Winner-Take-All (Mutual Inhibition)",
         neuron_labels=neuron_labels
     )
-
-    return vis_data
 
 
 def example_izhikevich_variety():
     """Network showcasing different Izhikevich neuron types"""
     print("\n7. Izhikevich Neuron Variety")
 
-    net = Network()
-    synapses = []
+    # RS: global 0, FS: 1, IB: 2, CH: 3, LTS: 4
+    rn = RegionalNetwork()
+    rn.add_population("RS",  1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
+    rn.add_population("FS",  1, model=NeuronModelSpec.izhikevich(IzhikevichType.FAST_SPIKING))
+    rn.add_population("IB",  1, model=NeuronModelSpec.izhikevich(IzhikevichType.INTRINSICALLY_BURSTING))
+    rn.add_population("CH",  1, model=NeuronModelSpec.izhikevich(IzhikevichType.CHATTERING))
+    rn.add_population("LTS", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.LOW_THRESHOLD_SPIKING))
 
-    # Add different Izhikevich types
-    net.add_izhikevich_neuron(IzhikevichType.REGULAR_SPIKING)    # 0
-    net.add_izhikevich_neuron(IzhikevichType.FAST_SPIKING)       # 1
-    net.add_izhikevich_neuron(IzhikevichType.INTRINSICALLY_BURSTING)  # 2
-    net.add_izhikevich_neuron(IzhikevichType.CHATTERING)         # 3
-    net.add_izhikevich_neuron(IzhikevichType.LOW_THRESHOLD_SPIKING)  # 4
-
-    # Labels for Izhikevich neuron types
-    neuron_labels = ["RS", "FS", "IB", "CH", "LTS"]
-
-    # Connect RS -> all others
-    for post in [1, 2, 3, 4]:
-        weight, E_syn, tau = 5.0, 0.0, 2.0
-        net.add_synapse(0, post, weight, E_syn, tau)
-        synapses.append((0, post, weight, E_syn))
-
+    # RS -> all others (excitatory)
+    for dst in ["FS", "IB", "CH", "LTS"]:
+        rn.connect("RS", dst, "all_to_all", weight=5.0,
+                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
     # FS inhibits IB and CH
-    for post in [2, 3]:
-        weight, E_syn, tau = 3.0, -80.0, 5.0
-        net.add_synapse(1, post, weight, E_syn, tau)
-        synapses.append((1, post, weight, E_syn))
+    for dst in ["IB", "CH"]:
+        rn.connect("FS", dst, "all_to_all", weight=3.0,
+                   synapse=SynapseSpec.exponential(E_syn=-80.0, tau=5.0))
 
-    # Stimulate all with different currents
+    neuron_labels = ["RS", "FS", "IB", "CH", "LTS"]
+    neuron_types = ["Izhikevich"] * 5
+    synapses = (
+        [(0, post, 5.0, 0.0) for post in [1, 2, 3, 4]] +
+        [(1, post, 3.0, -80.0) for post in [2, 3]]
+    )
     stimulation = {0: 10.0, 1: 10.0, 2: 8.0, 3: 8.0, 4: 5.0}
 
-    vis_data = create_network_visualization(
-        net, synapses, stimulation,
-        duration=500.0,
-        title="Izhikevich Neuron Types",
+    return create_network_visualization(
+        rn, synapses, stimulation, neuron_types,
+        duration=500.0, title="Izhikevich Neuron Types",
         neuron_labels=neuron_labels
     )
-
-    return vis_data
 
 
 def setup_output_dir():
@@ -627,7 +566,6 @@ def main():
     figs_dir = setup_output_dir()
     print(f"\nOutput directory: {figs_dir}\n")
 
-    # Generate all example visualizations
     examples = [
         ("network_01_feedforward_chain.png", example_feedforward_chain),
         ("network_02_divergent.png", example_divergent_network),

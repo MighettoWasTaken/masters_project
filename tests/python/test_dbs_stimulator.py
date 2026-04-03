@@ -18,9 +18,9 @@ from hodgkin_huxley import (
     DBSStimulator,
     DBSParameters,
     RegionalNetwork,
-    Network,
     NeuronModelSpec,
 )
+from neuron_specs import make_stn
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +443,7 @@ def test_option1_generate_trace_in_simulate():
 def test_dbs_on_composable_stn_neurons():
     """DBS 130 Hz on STN (composable) should not crash and should affect voltage."""
     rn = RegionalNetwork()
-    rn.add_population("STN", 4, model=NeuronModelSpec.stn())
+    rn.add_population("STN", 4, model=make_stn())
     dbs = DBSStimulator(frequency=130.0, amplitude=300.0, pulse_width=0.06)
     rn.attach_stimulator("STN", dbs)
     traces = rn.simulate(100.0, DT, {})

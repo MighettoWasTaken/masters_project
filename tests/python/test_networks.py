@@ -24,14 +24,10 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 from hodgkin_huxley import (
-    HHNeuron,
-    Network,
-    HHParameters,
-    IntegrationMethod,
-    IzhikevichNeuron,
+    RegionalNetwork,
+    NeuronModelSpec,
+    SynapseSpec,
     IzhikevichType,
-    IzhikevichParameters,
-    NetworkNeuronType,
 )
 
 
@@ -90,6 +86,13 @@ def spike_follows(
     return False
 
 
+def _hh_rn(n: int) -> RegionalNetwork:
+    """Create a RegionalNetwork with n HH neurons in population 'E'."""
+    rn = RegionalNetwork()
+    rn.add_population("E", n, model=NeuronModelSpec.hh_default())
+    return rn
+
+
 # =============================================================================
 # Synapse Parameter Constants
 # =============================================================================
@@ -108,6 +111,9 @@ WEIGHT_MODERATE = 2.0
 WEIGHT_STRONG = 5.0
 WEIGHT_VERY_STRONG = 10.0
 
+EXC = SynapseSpec.exponential(E_syn=E_SYN_EXCITATORY, tau=TAU_EXCITATORY)
+INH = SynapseSpec.exponential(E_syn=E_SYN_INHIBITORY, tau=TAU_INHIBITORY)
+
 
 # =============================================================================
 # Test Class: Basic Synaptic Transmission
@@ -123,30 +129,25 @@ class TestBasicSynapticTransmission:
         Network: [0] --exc--> [1]
         Drive neuron 0, verify neuron 1 responds.
         """
-        net = Network(2)
-        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(2)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_STRONG, synapse=EXC)
 
         duration = 200.0
         dt = 0.01
         num_steps = int(duration / dt)
 
-        # Drive neuron 0
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        # Neuron 0 should spike
-        spikes_0 = count_spikes(traces[0])
-        assert spikes_0 > 0, "Presynaptic neuron should spike"
+        assert count_spikes(result["E"][0]) > 0, "Presynaptic neuron should spike"
 
-        # Compare to control without synapse
-        net_ctrl = Network(2)
-        traces_ctrl = net_ctrl.simulate(duration, dt, I_ext)
+        rn_ctrl = _hh_rn(2)
+        result_ctrl = rn_ctrl.simulate(duration, dt, {"E": I_ext})
 
-        # Postsynaptic neuron should have higher mean voltage with synapse
-        mean_with_synapse = get_mean_voltage(traces[1])
-        mean_without_synapse = get_mean_voltage(traces_ctrl[1])
+        mean_with_synapse = get_mean_voltage(result["E"][1])
+        mean_without_synapse = get_mean_voltage(result_ctrl["E"][1])
 
         assert mean_with_synapse > mean_without_synapse, \
             f"Excitatory synapse should increase postsynaptic voltage ({mean_with_synapse:.2f} vs {mean_without_synapse:.2f})"
@@ -155,8 +156,8 @@ class TestBasicSynapticTransmission:
         """
         A strong excitatory synapse should be able to trigger postsynaptic spikes.
         """
-        net = Network(2)
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(2)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
         duration = 500.0
         dt = 0.01
@@ -165,13 +166,10 @@ class TestBasicSynapticTransmission:
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        spikes_0 = count_spikes(traces[0])
-        spikes_1 = count_spikes(traces[1])
-
-        assert spikes_0 > 0, "Presynaptic neuron should spike"
-        assert spikes_1 > 0, "Strong excitatory synapse should trigger postsynaptic spikes"
+        assert count_spikes(result["E"][0]) > 0, "Presynaptic neuron should spike"
+        assert count_spikes(result["E"][1]) > 0, "Strong excitatory synapse should trigger postsynaptic spikes"
 
     def test_inhibitory_synapse_reduces_activity(self):
         """
@@ -181,22 +179,19 @@ class TestBasicSynapticTransmission:
         dt = 0.01
         num_steps = int(duration / dt)
 
-        # With inhibition
-        net_inh = Network(2)
-        net_inh.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_INHIBITORY, TAU_INHIBITORY)
-
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0
         I_ext[1, :] = 10.0  # Drive both, inhibition should reduce neuron 1
 
-        traces_inh = net_inh.simulate(duration, dt, I_ext)
+        rn_inh = _hh_rn(2)
+        rn_inh.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_STRONG, synapse=INH)
+        result_inh = rn_inh.simulate(duration, dt, {"E": I_ext})
 
-        # Without inhibition
-        net_ctrl = Network(2)
-        traces_ctrl = net_ctrl.simulate(duration, dt, I_ext)
+        rn_ctrl = _hh_rn(2)
+        result_ctrl = rn_ctrl.simulate(duration, dt, {"E": I_ext})
 
-        rate_with_inh = get_firing_rate(traces_inh[1], duration)
-        rate_without_inh = get_firing_rate(traces_ctrl[1], duration)
+        rate_with_inh = get_firing_rate(result_inh["E"][1], duration)
+        rate_without_inh = get_firing_rate(result_ctrl["E"][1], duration)
 
         assert rate_with_inh < rate_without_inh, \
             f"Inhibition should reduce firing rate ({rate_with_inh:.1f} Hz vs {rate_without_inh:.1f} Hz)"
@@ -205,7 +200,7 @@ class TestBasicSynapticTransmission:
         """
         Without synaptic connections, neurons should be independent.
         """
-        net = Network(2)
+        rn = _hh_rn(2)
 
         duration = 200.0
         dt = 0.01
@@ -214,13 +209,10 @@ class TestBasicSynapticTransmission:
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        spikes_0 = count_spikes(traces[0])
-        spikes_1 = count_spikes(traces[1])
-
-        assert spikes_0 > 0, "Driven neuron should spike"
-        assert spikes_1 == 0, "Unconnected, undriven neuron should not spike"
+        assert count_spikes(result["E"][0]) > 0, "Driven neuron should spike"
+        assert count_spikes(result["E"][1]) == 0, "Unconnected, undriven neuron should not spike"
 
 
 # =============================================================================
@@ -241,17 +233,15 @@ class TestSynapticWeightEffects:
         dt = 0.01
         num_steps = int(duration / dt)
 
+        I_ext = np.zeros((2, num_steps))
+        I_ext[0, :] = 15.0
+
         for weight in weights:
-            net = Network(2)
-            net.add_synapse(0, 1, weight, E_SYN_EXCITATORY, TAU_EXCITATORY)
+            rn = _hh_rn(2)
+            rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=weight, synapse=EXC)
+            result = rn.simulate(duration, dt, {"E": I_ext})
+            mean_voltages.append(get_mean_voltage(result["E"][1]))
 
-            I_ext = np.zeros((2, num_steps))
-            I_ext[0, :] = 15.0
-
-            traces = net.simulate(duration, dt, I_ext)
-            mean_voltages.append(get_mean_voltage(traces[1]))
-
-        # Each stronger weight should produce higher mean voltage
         for i in range(len(weights) - 1):
             assert mean_voltages[i+1] > mean_voltages[i], \
                 f"Weight {weights[i+1]} should produce higher voltage than {weights[i]}"
@@ -264,20 +254,18 @@ class TestSynapticWeightEffects:
         dt = 0.01
         num_steps = int(duration / dt)
 
-        net_zero = Network(2)
-        net_zero.add_synapse(0, 1, 0.0, E_SYN_EXCITATORY, TAU_EXCITATORY)
-
-        net_none = Network(2)
-
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0
 
-        traces_zero = net_zero.simulate(duration, dt, I_ext)
-        traces_none = net_none.simulate(duration, dt, I_ext)
+        rn_zero = _hh_rn(2)
+        rn_zero.connect("E", "E", lambda ns, nd: [(0, 1)], weight=0.0, synapse=EXC)
+        result_zero = rn_zero.simulate(duration, dt, {"E": I_ext})
 
-        # Should be essentially identical
+        rn_none = _hh_rn(2)
+        result_none = rn_none.simulate(duration, dt, {"E": I_ext})
+
         np.testing.assert_array_almost_equal(
-            traces_zero[1], traces_none[1], decimal=5,
+            result_zero["E"][1], result_none["E"][1], decimal=5,
             err_msg="Zero weight synapse should have no effect"
         )
 
@@ -293,8 +281,8 @@ class TestChainPropagation:
         """
         Spikes should propagate through a 2-neuron chain: [0] -> [1]
         """
-        net = Network(2)
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(2)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
         duration = 300.0
         dt = 0.01
@@ -303,19 +291,19 @@ class TestChainPropagation:
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        assert count_spikes(traces[0]) > 0, "Neuron 0 should spike"
-        assert count_spikes(traces[1]) > 0, "Neuron 1 should spike from synaptic input"
-        assert spike_follows(traces[0], traces[1], dt), "Neuron 1 spikes should follow neuron 0"
+        assert count_spikes(result["E"][0]) > 0, "Neuron 0 should spike"
+        assert count_spikes(result["E"][1]) > 0, "Neuron 1 should spike from synaptic input"
+        assert spike_follows(result["E"][0], result["E"][1], dt), "Neuron 1 spikes should follow neuron 0"
 
     def test_three_neuron_chain(self):
         """
         Spikes should propagate through a 3-neuron chain: [0] -> [1] -> [2]
         """
-        net = Network(3)
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(1, 2, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(3)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
+        rn.connect("E", "E", lambda ns, nd: [(1, 2)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
         duration = 500.0
         dt = 0.01
@@ -324,21 +312,19 @@ class TestChainPropagation:
         I_ext = np.zeros((3, num_steps))
         I_ext[0, :] = 15.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        spikes = [count_spikes(traces[i]) for i in range(3)]
-
-        assert spikes[0] > 0, "Neuron 0 should spike"
-        assert spikes[1] > 0, "Neuron 1 should spike"
-        assert spikes[2] > 0, "Neuron 2 should spike (chain propagation)"
+        assert count_spikes(result["E"][0]) > 0, "Neuron 0 should spike"
+        assert count_spikes(result["E"][1]) > 0, "Neuron 1 should spike"
+        assert count_spikes(result["E"][2]) > 0, "Neuron 2 should spike (chain propagation)"
 
     def test_chain_maintains_causality(self):
         """
         In a chain, spike times should increase along the chain.
         """
-        net = Network(3)
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(1, 2, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(3)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
+        rn.connect("E", "E", lambda ns, nd: [(1, 2)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
         duration = 100.0
         dt = 0.01
@@ -347,16 +333,12 @@ class TestChainPropagation:
         I_ext = np.zeros((3, num_steps))
         I_ext[0, :] = 15.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        # Get first spike time for each neuron
         spike_times = []
         for i in range(3):
-            times = get_spike_times(traces[i], dt)
-            if len(times) > 0:
-                spike_times.append(times[0])
-            else:
-                spike_times.append(float('inf'))
+            times = get_spike_times(result["E"][i], dt)
+            spike_times.append(times[0] if len(times) > 0 else float('inf'))
 
         assert spike_times[0] < spike_times[1] < spike_times[2], \
             f"Spike times should increase along chain: {spike_times}"
@@ -377,10 +359,9 @@ class TestNetworkTopologies:
             --> [2]
             --> [3]
         """
-        net = Network(4)
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(0, 2, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(0, 3, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(4)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1), (0, 2), (0, 3)],
+                   weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
         duration = 300.0
         dt = 0.01
@@ -389,15 +370,11 @@ class TestNetworkTopologies:
         I_ext = np.zeros((4, num_steps))
         I_ext[0, :] = 15.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        spikes_0 = count_spikes(traces[0])
-        assert spikes_0 > 0, "Source neuron should spike"
-
-        # All targets should receive input and respond
+        assert count_spikes(result["E"][0]) > 0, "Source neuron should spike"
         for i in [1, 2, 3]:
-            spikes_i = count_spikes(traces[i])
-            assert spikes_i > 0, f"Target neuron {i} should spike"
+            assert count_spikes(result["E"][i]) > 0, f"Target neuron {i} should spike"
 
     def test_convergent_connectivity(self):
         """
@@ -411,31 +388,27 @@ class TestNetworkTopologies:
         dt = 0.01
         num_steps = int(duration / dt)
 
-        # Convergent: 3 inputs to neuron 3
-        net_conv = Network(4)
-        net_conv.add_synapse(0, 3, WEIGHT_MODERATE, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net_conv.add_synapse(1, 3, WEIGHT_MODERATE, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net_conv.add_synapse(2, 3, WEIGHT_MODERATE, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn_conv = _hh_rn(4)
+        rn_conv.connect("E", "E", lambda ns, nd: [(0, 3), (1, 3), (2, 3)],
+                        weight=WEIGHT_MODERATE, synapse=EXC)
 
         I_ext = np.zeros((4, num_steps))
         I_ext[0, :] = 12.0
         I_ext[1, :] = 12.0
         I_ext[2, :] = 12.0
 
-        traces_conv = net_conv.simulate(duration, dt, I_ext)
+        result_conv = rn_conv.simulate(duration, dt, {"E": I_ext})
 
-        # Single input
-        net_single = Network(2)
-        net_single.add_synapse(0, 1, WEIGHT_MODERATE, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn_single = _hh_rn(2)
+        rn_single.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_MODERATE, synapse=EXC)
 
         I_ext_single = np.zeros((2, num_steps))
         I_ext_single[0, :] = 12.0
 
-        traces_single = net_single.simulate(duration, dt, I_ext_single)
+        result_single = rn_single.simulate(duration, dt, {"E": I_ext_single})
 
-        # Convergent should produce more activity
-        mean_conv = get_mean_voltage(traces_conv[3])
-        mean_single = get_mean_voltage(traces_single[1])
+        mean_conv = get_mean_voltage(result_conv["E"][3])
+        mean_single = get_mean_voltage(result_single["E"][1])
 
         assert mean_conv > mean_single, \
             f"Convergent input should produce larger effect ({mean_conv:.1f} vs {mean_single:.1f} mV)"
@@ -446,24 +419,21 @@ class TestNetworkTopologies:
 
         [0] <--> [1]
         """
-        net = Network(2)
-        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(1, 0, WEIGHT_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(2)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1), (1, 0)], weight=WEIGHT_STRONG, synapse=EXC)
 
         duration = 500.0
         dt = 0.01
         num_steps = int(duration / dt)
 
-        # Drive both slightly
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 10.0
         I_ext[1, :] = 10.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        # Both should spike
-        assert count_spikes(traces[0]) > 0, "Neuron 0 should spike"
-        assert count_spikes(traces[1]) > 0, "Neuron 1 should spike"
+        assert count_spikes(result["E"][0]) > 0, "Neuron 0 should spike"
+        assert count_spikes(result["E"][1]) > 0, "Neuron 1 should spike"
 
 
 # =============================================================================
@@ -481,23 +451,19 @@ class TestExcitatoryInhibitoryBalance:
         dt = 0.01
         num_steps = int(duration / dt)
 
-        # Driven neuron with inhibition from another spiking neuron
-        net_inh = Network(2)
-        net_inh.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_INHIBITORY, TAU_INHIBITORY)
-
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0  # Inhibitory source
         I_ext[1, :] = 10.0  # Target neuron
 
-        traces_inh = net_inh.simulate(duration, dt, I_ext)
+        rn_inh = _hh_rn(2)
+        rn_inh.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_STRONG, synapse=INH)
+        result_inh = rn_inh.simulate(duration, dt, {"E": I_ext})
 
-        # Same but without inhibition
-        net_ctrl = Network(2)
+        rn_ctrl = _hh_rn(2)
+        result_ctrl = rn_ctrl.simulate(duration, dt, {"E": I_ext})
 
-        traces_ctrl = net_ctrl.simulate(duration, dt, I_ext)
-
-        rate_inh = get_firing_rate(traces_inh[1], duration)
-        rate_ctrl = get_firing_rate(traces_ctrl[1], duration)
+        rate_inh = get_firing_rate(result_inh["E"][1], duration)
+        rate_ctrl = get_firing_rate(result_ctrl["E"][1], duration)
 
         assert rate_inh < rate_ctrl, \
             f"Inhibition should reduce firing ({rate_inh:.1f} vs {rate_ctrl:.1f} Hz)"
@@ -506,25 +472,22 @@ class TestExcitatoryInhibitoryBalance:
         """
         With mutual inhibition and asymmetric drive, stronger-driven should win.
         """
-        net = Network(2)
-        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_INHIBITORY, TAU_INHIBITORY)
-        net.add_synapse(1, 0, WEIGHT_STRONG, E_SYN_INHIBITORY, TAU_INHIBITORY)
+        rn = _hh_rn(2)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1), (1, 0)], weight=WEIGHT_STRONG, synapse=INH)
 
         duration = 500.0
         dt = 0.01
         num_steps = int(duration / dt)
 
-        # Asymmetric drive - neuron 0 gets more
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0  # Strong drive
         I_ext[1, :] = 8.0   # Weak drive
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        rate_0 = get_firing_rate(traces[0], duration)
-        rate_1 = get_firing_rate(traces[1], duration)
+        rate_0 = get_firing_rate(result["E"][0], duration)
+        rate_1 = get_firing_rate(result["E"][1], duration)
 
-        # Neuron 0 (stronger drive) should have higher rate
         assert rate_0 > rate_1, \
             f"Stronger driven neuron should dominate ({rate_0:.1f} vs {rate_1:.1f} Hz)"
 
@@ -540,8 +503,8 @@ class TestTimingAndDelays:
         """
         Postsynaptic spikes should occur after presynaptic spikes.
         """
-        net = Network(2)
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(2)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
         duration = 100.0
         dt = 0.01
@@ -550,15 +513,14 @@ class TestTimingAndDelays:
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        pre_times = get_spike_times(traces[0], dt)
-        post_times = get_spike_times(traces[1], dt)
+        pre_times = get_spike_times(result["E"][0], dt)
+        post_times = get_spike_times(result["E"][1], dt)
 
         assert len(pre_times) > 0, "Should have presynaptic spikes"
         assert len(post_times) > 0, "Should have postsynaptic spikes"
 
-        # First postsynaptic spike should come after first presynaptic spike
         assert post_times[0] > pre_times[0], \
             f"Post spike ({post_times[0]:.2f} ms) should follow pre spike ({pre_times[0]:.2f} ms)"
 
@@ -566,10 +528,10 @@ class TestTimingAndDelays:
         """
         Spike latency should accumulate through a chain.
         """
-        net = Network(4)
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(1, 2, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(2, 3, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(4)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
+        rn.connect("E", "E", lambda ns, nd: [(1, 2)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
+        rn.connect("E", "E", lambda ns, nd: [(2, 3)], weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
         duration = 150.0
         dt = 0.01
@@ -578,17 +540,13 @@ class TestTimingAndDelays:
         I_ext = np.zeros((4, num_steps))
         I_ext[0, :] = 15.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
         first_spike_times = []
         for i in range(4):
-            times = get_spike_times(traces[i], dt)
-            if len(times) > 0:
-                first_spike_times.append(times[0])
-            else:
-                first_spike_times.append(float('inf'))
+            times = get_spike_times(result["E"][i], dt)
+            first_spike_times.append(times[0] if len(times) > 0 else float('inf'))
 
-        # Each subsequent neuron should spike later
         for i in range(3):
             if first_spike_times[i] < float('inf') and first_spike_times[i+1] < float('inf'):
                 assert first_spike_times[i+1] > first_spike_times[i], \
@@ -607,9 +565,9 @@ class TestNetworkStability:
         Large networks should remain numerically stable.
         """
         n = 20
-        net = Network(n)
-        for i in range(n):
-            net.add_synapse(i, (i+1) % n, WEIGHT_MODERATE, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(n)
+        rn.connect("E", "E", lambda ns, nd: [(i, (i+1) % n) for i in range(n)],
+                   weight=WEIGHT_MODERATE, synapse=EXC)
 
         duration = 200.0
         dt = 0.01
@@ -618,39 +576,32 @@ class TestNetworkStability:
         I_ext = np.zeros((n, num_steps))
         I_ext[0, :] = 12.0
 
-        traces = net.simulate(duration, dt, I_ext)
+        result = rn.simulate(duration, dt, {"E": I_ext})
 
-        # Check no NaN or Inf
-        for i in range(n):
-            assert not np.any(np.isnan(traces[i])), f"Neuron {i} has NaN"
-            assert not np.any(np.isinf(traces[i])), f"Neuron {i} has Inf"
+        assert np.all(np.isfinite(result["E"])), "All neurons should remain finite"
 
     def test_no_input_quiescence(self):
         """
         Without input, connected network should remain quiescent.
         """
-        net = Network(3)
-        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(1, 2, WEIGHT_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(3)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_STRONG, synapse=EXC)
+        rn.connect("E", "E", lambda ns, nd: [(1, 2)], weight=WEIGHT_STRONG, synapse=EXC)
 
         duration = 200.0
         dt = 0.01
-        num_steps = int(duration / dt)
 
-        I_ext = np.zeros((3, num_steps))
+        result = rn.simulate(duration, dt, {"E": 0.0})
 
-        traces = net.simulate(duration, dt, I_ext)
-
-        # No spikes should occur
         for i in range(3):
-            assert count_spikes(traces[i]) == 0, f"Neuron {i} should not spike without input"
+            assert count_spikes(result["E"][i]) == 0, f"Neuron {i} should not spike without input"
 
     def test_reset_clears_state(self):
         """
         Network reset should clear all state and synaptic variables.
         """
-        net = Network(2)
-        net.add_synapse(0, 1, WEIGHT_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = _hh_rn(2)
+        rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_STRONG, synapse=EXC)
 
         duration = 100.0
         dt = 0.01
@@ -659,15 +610,12 @@ class TestNetworkStability:
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0
 
-        traces1 = net.simulate(duration, dt, I_ext)
-        net.reset()
+        result1 = rn.simulate(duration, dt, {"E": I_ext})
+        rn.reset()
+        result2 = rn.simulate(duration, dt, {"E": I_ext})
 
-        # Run again from fresh state
-        traces2 = net.simulate(duration, dt, I_ext)
-
-        # Should be identical
         np.testing.assert_array_almost_equal(
-            traces1, traces2, decimal=5,
+            result1["E"], result2["E"], decimal=5,
             err_msg="Reset should produce identical simulation"
         )
 
@@ -679,146 +627,87 @@ class TestNetworkStability:
 class TestMixedNeuronTypes:
     """Tests for networks with mixed HH and Izhikevich neurons."""
 
-    def test_create_mixed_network(self):
-        """
-        Can create a network with both HH and Izhikevich neurons.
-        """
-        net = Network()
-        idx_hh = net.add_hh_neuron()
-        idx_iz = net.add_izhikevich_neuron(IzhikevichType.REGULAR_SPIKING)
-
-        assert net.num_neurons == 2
-        assert net.neuron_type(idx_hh) == "HH"
-        assert net.neuron_type(idx_iz) == "Izhikevich"
-
     def test_hh_to_izhikevich_synapse(self):
         """
         HH neuron can drive Izhikevich neuron through synapse.
         """
-        net = Network()
-        net.add_hh_neuron()
-        net.add_izhikevich_neuron(IzhikevichType.REGULAR_SPIKING)
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = RegionalNetwork()
+        rn.add_population("HH", 1, model=NeuronModelSpec.hh_default())
+        rn.add_population("IZ", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
+        rn.connect("HH", "IZ", "all_to_all", weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
         duration = 300.0
         dt = 0.01
-        num_steps = int(duration / dt)
 
-        I_ext = np.zeros((2, num_steps))
-        I_ext[0, :] = 15.0  # Drive HH neuron
+        result = rn.simulate(duration, dt, {"HH": 15.0, "IZ": 0.0})
 
-        traces = net.simulate(duration, dt, I_ext)
-
-        # Both should spike
-        assert count_spikes(traces[0]) > 0, "HH neuron should spike"
-        assert count_spikes(traces[1], threshold=0) > 0, "Izhikevich neuron should spike"
+        assert count_spikes(result["HH"][0]) > 0, "HH neuron should spike"
+        assert count_spikes(result["IZ"][0]) > 0, "Izhikevich neuron should spike"
 
     def test_izhikevich_to_hh_synapse(self):
         """
         Izhikevich neuron can drive HH neuron through synapse.
         """
-        net = Network()
-        net.add_izhikevich_neuron(IzhikevichType.REGULAR_SPIKING)
-        net.add_hh_neuron()
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn = RegionalNetwork()
+        rn.add_population("IZ", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
+        rn.add_population("HH", 1, model=NeuronModelSpec.hh_default())
+        rn.connect("IZ", "HH", "all_to_all", weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
-        # Note: Izhikevich needs different dt, but we use HH dt for network
         duration = 300.0
         dt = 0.01
-        num_steps = int(duration / dt)
 
-        I_ext = np.zeros((2, num_steps))
-        I_ext[0, :] = 10.0  # Drive Izhikevich neuron
+        result = rn.simulate(duration, dt, {"IZ": 10.0, "HH": 0.0})
 
-        traces = net.simulate(duration, dt, I_ext)
-
-        # Both should spike
-        assert count_spikes(traces[0], threshold=0) > 0, "Izhikevich neuron should spike"
-        assert count_spikes(traces[1]) > 0, "HH neuron should spike"
+        assert count_spikes(result["IZ"][0]) > 0, "Izhikevich neuron should spike"
+        assert count_spikes(result["HH"][0]) > 0, "HH neuron should spike"
 
     def test_mixed_network_chain(self):
         """
         Chain of alternating HH and Izhikevich neurons.
         """
-        net = Network()
-        net.add_hh_neuron()        # 0
-        net.add_izhikevich_neuron()  # 1
-        net.add_hh_neuron()        # 2
-        net.add_izhikevich_neuron()  # 3
+        rn = RegionalNetwork()
+        rn.add_population("N0", 1, model=NeuronModelSpec.hh_default())
+        rn.add_population("N1", 1, model=NeuronModelSpec.izhikevich())
+        rn.add_population("N2", 1, model=NeuronModelSpec.hh_default())
+        rn.add_population("N3", 1, model=NeuronModelSpec.izhikevich())
 
-        net.add_synapse(0, 1, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(1, 2, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net.add_synapse(2, 3, WEIGHT_VERY_STRONG, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn.connect("N0", "N1", "all_to_all", weight=WEIGHT_VERY_STRONG, synapse=EXC)
+        rn.connect("N1", "N2", "all_to_all", weight=WEIGHT_VERY_STRONG, synapse=EXC)
+        rn.connect("N2", "N3", "all_to_all", weight=WEIGHT_VERY_STRONG, synapse=EXC)
 
         duration = 500.0
         dt = 0.01
-        num_steps = int(duration / dt)
 
-        I_ext = np.zeros((4, num_steps))
-        I_ext[0, :] = 15.0
+        result = rn.simulate(duration, dt, {"N0": 15.0, "N1": 0.0, "N2": 0.0, "N3": 0.0})
 
-        traces = net.simulate(duration, dt, I_ext)
-
-        # All should eventually spike
-        assert count_spikes(traces[0]) > 0, "Neuron 0 (HH) should spike"
-        assert count_spikes(traces[1], threshold=0) > 0, "Neuron 1 (Iz) should spike"
-        assert count_spikes(traces[2]) > 0, "Neuron 2 (HH) should spike"
-        assert count_spikes(traces[3], threshold=0) > 0, "Neuron 3 (Iz) should spike"
+        assert count_spikes(result["N0"][0]) > 0, "Neuron 0 (HH) should spike"
+        assert count_spikes(result["N1"][0]) > 0, "Neuron 1 (Iz) should spike"
+        assert count_spikes(result["N2"][0]) > 0, "Neuron 2 (HH) should spike"
+        assert count_spikes(result["N3"][0]) > 0, "Neuron 3 (Iz) should spike"
 
     def test_izhikevich_network_types(self):
         """
         Network with different Izhikevich neuron types.
         """
-        net = Network()
-        net.add_izhikevich_neuron(IzhikevichType.REGULAR_SPIKING)
-        net.add_izhikevich_neuron(IzhikevichType.FAST_SPIKING)
-        net.add_izhikevich_neuron(IzhikevichType.INTRINSICALLY_BURSTING)
+        rn = RegionalNetwork()
+        rn.add_population("RS", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
+        rn.add_population("FS", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.FAST_SPIKING))
+        rn.add_population("IB", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.INTRINSICALLY_BURSTING))
 
         duration = 500.0
-        dt = 0.1  # Larger dt ok for Izhikevich
-        num_steps = int(duration / dt)
+        dt = 0.1
 
-        I_ext = np.zeros((3, num_steps))
-        I_ext[0, :] = 10.0
-        I_ext[1, :] = 10.0
-        I_ext[2, :] = 10.0
+        result = rn.simulate(duration, dt, {"RS": 10.0, "FS": 10.0, "IB": 10.0})
 
-        traces = net.simulate(duration, dt, I_ext)
+        assert count_spikes(result["RS"][0]) > 0, "RS should spike"
+        assert count_spikes(result["FS"][0]) > 0, "FS should spike"
+        assert count_spikes(result["IB"][0]) > 0, "IB should spike"
 
-        # All should spike
-        for i in range(3):
-            assert count_spikes(traces[i], threshold=0) > 0, f"Neuron {i} should spike"
-
-        # FS should spike faster than RS with same input
-        rate_rs = get_firing_rate(traces[0], duration, threshold=0)
-        rate_fs = get_firing_rate(traces[1], duration, threshold=0)
+        rate_rs = get_firing_rate(result["RS"][0], duration)
+        rate_fs = get_firing_rate(result["FS"][0], duration)
 
         assert rate_fs > rate_rs, \
             f"Fast spiking should have higher rate ({rate_fs:.1f} vs {rate_rs:.1f} Hz)"
-
-    def test_network_neuron_type_enum(self):
-        """
-        Test using NetworkNeuronType enum to create networks.
-        """
-        net = Network(3, NetworkNeuronType.IZHIKEVICH_FS)
-
-        assert net.num_neurons == 3
-        for i in range(3):
-            assert net.neuron_type(i) == "Izhikevich"
-
-    def test_add_neuron_with_type(self):
-        """
-        Test adding neurons using NetworkNeuronType.
-        """
-        net = Network()
-        net.add_neuron(neuron_type=NetworkNeuronType.HH)
-        net.add_neuron(neuron_type=NetworkNeuronType.IZHIKEVICH_RS)
-        net.add_neuron(neuron_type=NetworkNeuronType.IZHIKEVICH_FS)
-
-        assert net.num_neurons == 3
-        assert net.neuron_type(0) == "HH"
-        assert net.neuron_type(1) == "Izhikevich"
-        assert net.neuron_type(2) == "Izhikevich"
 
 
 # =============================================================================
@@ -836,27 +725,25 @@ class TestQuantitativeVerification:
         dt = 0.01
         num_steps = int(duration / dt)
 
-        # Excitatory (E_syn = 0 > V_rest ~ -65)
-        net_exc = Network(2)
-        net_exc.add_synapse(0, 1, WEIGHT_STRONG, 0.0, TAU_EXCITATORY)
-
-        # Inhibitory (E_syn = -80 < V_rest ~ -65)
-        net_inh = Network(2)
-        net_inh.add_synapse(0, 1, WEIGHT_STRONG, -80.0, TAU_INHIBITORY)
-
-        # Control (no synapse)
-        net_ctrl = Network(2)
-
         I_ext = np.zeros((2, num_steps))
         I_ext[0, :] = 15.0
 
-        traces_exc = net_exc.simulate(duration, dt, I_ext)
-        traces_inh = net_inh.simulate(duration, dt, I_ext)
-        traces_ctrl = net_ctrl.simulate(duration, dt, I_ext)
+        rn_exc = _hh_rn(2)
+        rn_exc.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_STRONG,
+                       synapse=SynapseSpec.exponential(E_syn=0.0, tau=TAU_EXCITATORY))
+        result_exc = rn_exc.simulate(duration, dt, {"E": I_ext})
 
-        mean_exc = get_mean_voltage(traces_exc[1])
-        mean_inh = get_mean_voltage(traces_inh[1])
-        mean_ctrl = get_mean_voltage(traces_ctrl[1])
+        rn_inh = _hh_rn(2)
+        rn_inh.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_STRONG,
+                       synapse=SynapseSpec.exponential(E_syn=-80.0, tau=TAU_INHIBITORY))
+        result_inh = rn_inh.simulate(duration, dt, {"E": I_ext})
+
+        rn_ctrl = _hh_rn(2)
+        result_ctrl = rn_ctrl.simulate(duration, dt, {"E": I_ext})
+
+        mean_exc = get_mean_voltage(result_exc["E"][1])
+        mean_inh = get_mean_voltage(result_inh["E"][1])
+        mean_ctrl = get_mean_voltage(result_ctrl["E"][1])
 
         assert mean_exc > mean_ctrl, \
             f"Excitatory should depolarize ({mean_exc:.1f} vs {mean_ctrl:.1f} mV)"
@@ -872,28 +759,26 @@ class TestQuantitativeVerification:
         num_steps = int(duration / dt)
 
         # Single input
-        net_1 = Network(2)
-        net_1.add_synapse(0, 1, WEIGHT_MODERATE, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        rn_1 = _hh_rn(2)
+        rn_1.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_MODERATE, synapse=EXC)
 
         I_ext_1 = np.zeros((2, num_steps))
         I_ext_1[0, :] = 15.0
 
-        traces_1 = net_1.simulate(duration, dt, I_ext_1)
+        result_1 = rn_1.simulate(duration, dt, {"E": I_ext_1})
 
-        # Double input (two presynaptic neurons)
-        net_2 = Network(3)
-        net_2.add_synapse(0, 2, WEIGHT_MODERATE, E_SYN_EXCITATORY, TAU_EXCITATORY)
-        net_2.add_synapse(1, 2, WEIGHT_MODERATE, E_SYN_EXCITATORY, TAU_EXCITATORY)
+        # Double input (two presynaptic neurons driving neuron 2)
+        rn_2 = _hh_rn(3)
+        rn_2.connect("E", "E", lambda ns, nd: [(0, 2), (1, 2)], weight=WEIGHT_MODERATE, synapse=EXC)
 
         I_ext_2 = np.zeros((3, num_steps))
         I_ext_2[0, :] = 15.0
         I_ext_2[1, :] = 15.0
 
-        traces_2 = net_2.simulate(duration, dt, I_ext_2)
+        result_2 = rn_2.simulate(duration, dt, {"E": I_ext_2})
 
-        mean_1 = get_mean_voltage(traces_1[1])
-        mean_2 = get_mean_voltage(traces_2[2])
+        mean_1 = get_mean_voltage(result_1["E"][1])
+        mean_2 = get_mean_voltage(result_2["E"][2])
 
-        # Double input should produce larger effect
         assert mean_2 > mean_1, \
             f"Two inputs should produce larger effect ({mean_2:.1f} vs {mean_1:.1f} mV)"

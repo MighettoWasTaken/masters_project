@@ -304,8 +304,7 @@ class TestIntegration:
 
     def test_apply_to_iext_hh_network(self):
         """NoiseInjector.apply_to() output can be passed directly as I_ext."""
-        from hodgkin_huxley import Network, HHParameters
-        import hodgkin_huxley._core as _core
+        from hodgkin_huxley import RegionalNetwork, NeuronModelSpec
 
         n_neurons = 3
         duration = 50.0
@@ -319,20 +318,16 @@ class TestIntegration:
 
         assert I_noisy.shape == (n_neurons, n_steps)
 
-        net = Network()
-        for _ in range(n_neurons):
-            net.add_hh_neuron(_core.HHParameters())
-
-        I_list = I_noisy.tolist()
-        traces = net.simulate(duration, dt, I_list)
+        rn = RegionalNetwork()
+        rn.add_population("E", n_neurons, model=NeuronModelSpec.hh_default())
+        traces = rn.simulate(duration, dt, {"E": I_noisy})["E"]
         assert traces.shape == (n_neurons, n_steps)
         # With I_ext≈10 + small noise, neurons should spike
         assert np.any(traces > 0.0)
 
     def test_broadcast_1d_noise_hh(self):
         """1-D broadcast noise is applied identically to all neurons."""
-        from hodgkin_huxley import Network
-        import hodgkin_huxley._core as _core
+        from hodgkin_huxley import RegionalNetwork, NeuronModelSpec
 
         n_neurons = 4
         duration = 30.0
@@ -348,8 +343,7 @@ class TestIntegration:
         for row in I_noisy[1:]:
             np.testing.assert_array_equal(row, I_noisy[0])
 
-        net = Network()
-        for _ in range(n_neurons):
-            net.add_hh_neuron(_core.HHParameters())
-        traces = net.simulate(duration, dt, I_noisy.tolist())
+        rn = RegionalNetwork()
+        rn.add_population("E", n_neurons, model=NeuronModelSpec.hh_default())
+        traces = rn.simulate(duration, dt, {"E": I_noisy})["E"]
         assert traces.shape == (n_neurons, n_steps)

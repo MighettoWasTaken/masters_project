@@ -37,9 +37,6 @@ private:
     double E_Ca_;
 
     // Helpers
-    static double boltzmann(double x, const BoltzmannParams& p);
-    static double compute_tau(double V, const TauParams& tau);
-    static double compute_rate(double V, const RateFuncParams& rate);
     void update_gates(double dt);
     double compute_channel_current() const;
     void update_calcium(double dt);

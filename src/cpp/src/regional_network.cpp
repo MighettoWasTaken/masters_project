@@ -111,6 +111,10 @@ void RegionalNetwork::add_population(const std::string& name, size_t count,
 
 void RegionalNetwork::add_population(const std::string& name, size_t count,
                                      const NeuronModelSpec& spec) {
+    if (spec.is_izhikevich) {
+        add_population(name, count, spec.iz_params);
+        return;
+    }
     if (pop_index_.count(name)) {
         throw std::runtime_error("Population '" + name + "' already exists");
     }

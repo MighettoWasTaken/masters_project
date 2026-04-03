@@ -10,7 +10,7 @@ Covers:
   6. apply_to() — scalar and array base currents
   7. Properties — n_pulses, charge_per_phase, is_charge_balanced
   8. Validation — ValueError on bad inputs
-  9. Integration — waveforms passed to Network / RegionalNetwork simulate()
+  9. Integration — waveforms passed to RegionalNetwork simulate()
 """
 
 import numpy as np
@@ -18,11 +18,11 @@ import pytest
 
 from hodgkin_huxley import (
     PulseStimulator,
-    Network,
     RegionalNetwork,
     NeuronModelSpec,
     RecordingConfig,
 )
+from neuron_specs import make_thalamic, make_stn
 
 DT   = 0.1   # ms  — fast enough for most tests, avoids huge arrays
 TOTAL = 100.0  # ms
@@ -399,17 +399,17 @@ class TestIntegration:
         n_steps  = int(duration / dt)
 
         # No pulse → no spikes
-        net_rest = Network()
-        net_rest.add_hh_neuron()
-        V_rest = net_rest.simulate(duration, dt, [[0.0] * n_steps])
+        rn_rest = RegionalNetwork()
+        rn_rest.add_population("E", 1, model=NeuronModelSpec.hh_default())
+        V_rest = rn_rest.simulate(duration, dt, {"E": 0.0})["E"]
         assert np.max(V_rest) < -20.0, "HH at rest should not spike"
 
         # Strong pulse → at least one spike
         pulse  = PulseStimulator.single(onset=50.0, duration=5.0, amplitude=50.0)
         I_ext  = pulse.generate(duration, dt)
-        net_stim = Network()
-        net_stim.add_hh_neuron()
-        V_stim = net_stim.simulate(duration, dt, [I_ext.tolist()])
+        rn_stim = RegionalNetwork()
+        rn_stim.add_population("E", 1, model=NeuronModelSpec.hh_default())
+        V_stim = rn_stim.simulate(duration, dt, {"E": I_ext})["E"]
         assert np.max(V_stim) > 0.0, "HH should spike under strong pulse"
 
     def test_train_drives_multiple_spikes(self):
@@ -424,11 +424,11 @@ class TestIntegration:
         )
         I_ext = train.generate(duration, dt)
 
-        net = Network()
-        net.add_hh_neuron()
-        V = net.simulate(duration, dt, [I_ext.tolist()])
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=NeuronModelSpec.hh_default())
+        V = rn.simulate(duration, dt, {"E": I_ext})["E"][0]
 
-        above = (np.array(V) > 0.0).astype(int)
+        above = (V > 0.0).astype(int)
         n_spikes = int(np.sum(np.diff(above) == 1))
         assert n_spikes >= 3, f"Expected multiple spikes from 50 Hz train, got {n_spikes}"
 
@@ -441,7 +441,7 @@ class TestIntegration:
         I_arr = pulse.generate(duration, dt)
 
         rn = RegionalNetwork()
-        rn.add_population("TH", 3, model=NeuronModelSpec.thalamic())
+        rn.add_population("TH", 3, model=make_thalamic())
         traces = rn.simulate(duration, dt, {"TH": I_arr})
         assert np.all(np.isfinite(traces["TH"])), "RegionalNetwork produced NaN/Inf"
 
@@ -454,7 +454,7 @@ class TestIntegration:
         I_net = pulse.apply_to(base_current=3.0, total_duration=duration, dt=dt)
 
         rn = RegionalNetwork()
-        rn.add_population("STN", 3, model=NeuronModelSpec.stn())
+        rn.add_population("STN", 3, model=make_stn())
         traces = rn.simulate(duration, dt, {"STN": I_net})
         assert np.all(np.isfinite(traces["STN"]))
 

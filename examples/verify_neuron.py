@@ -5,18 +5,17 @@ Comprehensive verification of HH neuron behavior.
 Generates multiple figures to verify:
 1. Single neuron membrane potential with constant current
 2. Gating variables over time
-3. Comparison of integration methods
-4. F-I curve (firing rate vs current)
-5. Phase plane analysis
-6. Current clamp series
-7. Parameter sensitivity
+3. F-I curve (firing rate vs current)
+4. Phase plane analysis
+5. Current clamp series
+6. Parameter sensitivity
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-from hodgkin_huxley import HHNeuron, IntegrationMethod, HHParameters
+from hodgkin_huxley import RegionalNetwork, NeuronModelSpec, RecordingConfig
 
 
 def setup_output_dir():
@@ -33,6 +32,12 @@ def count_spikes(trace, threshold=0.0):
     return np.sum(crossings == 1)
 
 
+def _make_rn():
+    rn = RegionalNetwork()
+    rn.add_population("E", 1, model=NeuronModelSpec.hh_default())
+    return rn
+
+
 def plot_membrane_potential(figs_dir):
     """Plot membrane potential with constant current injection."""
     print("Generating membrane potential plot...")
@@ -41,9 +46,10 @@ def plot_membrane_potential(figs_dir):
     dt = 0.01
     I_ext = 10.0
 
-    neuron = HHNeuron()
-    trace = neuron.simulate(duration=duration, dt=dt, I_ext=I_ext)
-    time = np.arange(0, duration, dt)
+    rn = _make_rn()
+    result = rn.simulate(duration, dt, {"E": I_ext}, record=RecordingConfig(["V"]))
+    trace = result["E"]["V"][0]
+    time = result["E"].time
 
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.plot(time, trace, 'b-', linewidth=0.8)
@@ -60,7 +66,7 @@ def plot_membrane_potential(figs_dir):
     plt.close(fig)
 
     print(f"  Spikes detected: {count_spikes(trace)}")
-    print(f"  Voltage range: [{min(trace):.1f}, {max(trace):.1f}] mV")
+    print(f"  Voltage range: [{trace.min():.1f}, {trace.max():.1f}] mV")
 
 
 def plot_gating_variables(figs_dir):
@@ -71,7 +77,9 @@ def plot_gating_variables(figs_dir):
     dt = 0.01
     I_ext = 15.0
 
-    neuron = HHNeuron()
+    rn = _make_rn()
+    net_core = rn._rnet.network()
+
     time_points = []
     V_trace = []
     m_trace = []
@@ -80,13 +88,14 @@ def plot_gating_variables(figs_dir):
 
     num_steps = int(duration / dt)
     for i in range(num_steps):
-        state = neuron.state
+        neuron = net_core.neuron(0)
         time_points.append(i * dt)
-        V_trace.append(state.V)
-        m_trace.append(state.m)
-        h_trace.append(state.h)
-        n_trace.append(state.n)
-        neuron.step(dt, I_ext)
+        V_trace.append(neuron.V)
+        gates = neuron.gate_states  # [m, h, n]
+        m_trace.append(gates[0])
+        h_trace.append(gates[1])
+        n_trace.append(gates[2])
+        net_core.step(dt, [I_ext])
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
 
@@ -111,66 +120,6 @@ def plot_gating_variables(figs_dir):
     plt.close(fig)
 
 
-def plot_integration_comparison(figs_dir):
-    """Compare Euler and RK4 integration methods."""
-    print("Generating integration method comparison...")
-
-    duration = 50.0
-    dt_coarse = 0.05
-    dt_fine = 0.001
-    I_ext = 15.0
-
-    # Reference (RK4 with very fine dt)
-    ref = HHNeuron()
-    ref.integration_method = IntegrationMethod.RK4
-    trace_ref = ref.simulate(duration, dt_fine, I_ext)
-    time_ref = np.arange(0, duration, dt_fine)
-
-    # Euler with coarse dt
-    euler = HHNeuron()
-    euler.integration_method = IntegrationMethod.EULER
-    trace_euler = euler.simulate(duration, dt_coarse, I_ext)
-    time_euler = np.arange(0, duration, dt_coarse)
-
-    # RK4 with coarse dt
-    rk4 = HHNeuron()
-    rk4.integration_method = IntegrationMethod.RK4
-    trace_rk4 = rk4.simulate(duration, dt_coarse, I_ext)
-    time_rk4 = np.arange(0, duration, dt_coarse)
-
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
-
-    # Full traces
-    axes[0].plot(time_ref, trace_ref, 'k-', label=f'Reference (RK4, dt={dt_fine})', linewidth=0.8, alpha=0.7)
-    axes[0].plot(time_euler, trace_euler, 'r--', label=f'Euler (dt={dt_coarse})', linewidth=1.5)
-    axes[0].plot(time_rk4, trace_rk4, 'b--', label=f'RK4 (dt={dt_coarse})', linewidth=1.5)
-    axes[0].set_xlabel('Time (ms)')
-    axes[0].set_ylabel('Membrane Potential (mV)')
-    axes[0].set_title('Integration Method Comparison')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    # Zoomed view of first spike
-    axes[1].plot(time_ref, trace_ref, 'k-', label='Reference', linewidth=0.8)
-    axes[1].plot(time_euler, trace_euler, 'r--', label='Euler', linewidth=1.5, marker='o', markersize=3)
-    axes[1].plot(time_rk4, trace_rk4, 'b--', label='RK4', linewidth=1.5, marker='s', markersize=3)
-    axes[1].set_xlabel('Time (ms)')
-    axes[1].set_ylabel('Membrane Potential (mV)')
-    axes[1].set_title('Zoomed View (First Action Potential)')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-    axes[1].set_xlim(0, 15)
-
-    fig.tight_layout()
-    fig.savefig(figs_dir / "03_integration_comparison.png", dpi=150)
-    plt.close(fig)
-
-    # Print error metrics
-    print(f"  Peak voltage - Reference: {max(trace_ref):.2f} mV")
-    print(f"  Peak voltage - Euler:     {max(trace_euler):.2f} mV")
-    print(f"  Peak voltage - RK4:       {max(trace_rk4):.2f} mV")
-
-
 def plot_fi_curve(figs_dir):
     """Plot firing rate vs injected current (F-I curve)."""
     print("Generating F-I curve...")
@@ -181,11 +130,10 @@ def plot_fi_curve(figs_dir):
     firing_rates = []
 
     for I_ext in currents:
-        neuron = HHNeuron()
-        trace = neuron.simulate(duration, dt, I_ext)
-        spikes = count_spikes(trace)
-        rate = spikes / (duration / 1000)  # Hz
-        firing_rates.append(rate)
+        rn = _make_rn()
+        result = rn.simulate(duration, dt, {"E": float(I_ext)},
+                             record=RecordingConfig(["firing_rate"]))
+        firing_rates.append(float(result["E"]["firing_rate"][0]))
 
     fig, ax = plt.subplots(figsize=(8, 6))
     ax.plot(currents, firing_rates, 'bo-', linewidth=1.5, markersize=5)
@@ -197,10 +145,9 @@ def plot_fi_curve(figs_dir):
     ax.set_ylim(0, max(firing_rates) * 1.1 if max(firing_rates) > 0 else 10)
 
     fig.tight_layout()
-    fig.savefig(figs_dir / "04_fi_curve.png", dpi=150)
+    fig.savefig(figs_dir / "03_fi_curve.png", dpi=150)
     plt.close(fig)
 
-    # Find rheobase (minimum current for spiking)
     rheobase_idx = next((i for i, r in enumerate(firing_rates) if r > 0), None)
     if rheobase_idx is not None:
         print(f"  Rheobase (approx): {currents[rheobase_idx]} uA/cm^2")
@@ -215,20 +162,21 @@ def plot_phase_plane(figs_dir):
     dt = 0.01
     I_ext = 10.0
 
-    neuron = HHNeuron()
+    rn = _make_rn()
+    net_core = rn._rnet.network()
+
     V_trace = []
     n_trace = []
 
     num_steps = int(duration / dt)
     for _ in range(num_steps):
-        state = neuron.state
-        V_trace.append(state.V)
-        n_trace.append(state.n)
-        neuron.step(dt, I_ext)
+        neuron = net_core.neuron(0)
+        V_trace.append(neuron.V)
+        n_trace.append(neuron.gate_states[2])  # n gate (K activation)
+        net_core.step(dt, [I_ext])
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Color by time
     points = np.array([V_trace, n_trace]).T.reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
 
@@ -251,7 +199,7 @@ def plot_phase_plane(figs_dir):
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    fig.savefig(figs_dir / "05_phase_plane.png", dpi=150)
+    fig.savefig(figs_dir / "04_phase_plane.png", dpi=150)
     plt.close(fig)
 
 
@@ -266,9 +214,11 @@ def plot_current_clamp_series(figs_dir):
     fig, axes = plt.subplots(len(currents), 1, figsize=(12, 10), sharex=True)
 
     for ax, I_ext in zip(axes, currents):
-        neuron = HHNeuron()
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        rn = _make_rn()
+        result = rn.simulate(duration, dt, {"E": float(I_ext)},
+                             record=RecordingConfig(["V"]))
+        trace = result["E"]["V"][0]
+        time = result["E"].time
 
         ax.plot(time, trace, 'b-', linewidth=0.8)
         ax.set_ylabel('V (mV)')
@@ -280,7 +230,7 @@ def plot_current_clamp_series(figs_dir):
     fig.suptitle('Current Clamp Series', fontsize=12, y=1.02)
 
     fig.tight_layout()
-    fig.savefig(figs_dir / "06_current_clamp_series.png", dpi=150)
+    fig.savefig(figs_dir / "05_current_clamp_series.png", dpi=150)
     plt.close(fig)
 
 
@@ -294,14 +244,16 @@ def plot_parameter_sensitivity(figs_dir):
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 
-    # Vary g_Na
+    # Vary g_Na (channels[0])
     ax = axes[0, 0]
     for g_Na in [60, 90, 120, 150, 180]:
-        params = HHParameters()
-        params.g_Na = g_Na
-        neuron = HHNeuron(params)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        spec = NeuronModelSpec.hh_default()
+        spec.channels[0].g = g_Na
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        result = rn.simulate(duration, dt, {"E": I_ext}, record=RecordingConfig(["V"]))
+        trace = result["E"]["V"][0]
+        time = result["E"].time
         ax.plot(time, trace, label=f'g_Na={g_Na}', linewidth=0.8)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('V (mV)')
@@ -309,14 +261,16 @@ def plot_parameter_sensitivity(figs_dir):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Vary g_K
+    # Vary g_K (channels[1])
     ax = axes[0, 1]
     for g_K in [18, 27, 36, 45, 54]:
-        params = HHParameters()
-        params.g_K = g_K
-        neuron = HHNeuron(params)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        spec = NeuronModelSpec.hh_default()
+        spec.channels[1].g = g_K
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        result = rn.simulate(duration, dt, {"E": I_ext}, record=RecordingConfig(["V"]))
+        trace = result["E"]["V"][0]
+        time = result["E"].time
         ax.plot(time, trace, label=f'g_K={g_K}', linewidth=0.8)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('V (mV)')
@@ -324,14 +278,16 @@ def plot_parameter_sensitivity(figs_dir):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
-    # Vary g_L
+    # Vary g_L (channels[2])
     ax = axes[1, 0]
     for g_L in [0.1, 0.2, 0.3, 0.5, 1.0]:
-        params = HHParameters()
-        params.g_L = g_L
-        neuron = HHNeuron(params)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        spec = NeuronModelSpec.hh_default()
+        spec.channels[2].g = g_L
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        result = rn.simulate(duration, dt, {"E": I_ext}, record=RecordingConfig(["V"]))
+        trace = result["E"]["V"][0]
+        time = result["E"].time
         ax.plot(time, trace, label=f'g_L={g_L}', linewidth=0.8)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('V (mV)')
@@ -342,11 +298,13 @@ def plot_parameter_sensitivity(figs_dir):
     # Vary C_m
     ax = axes[1, 1]
     for C_m in [0.5, 0.75, 1.0, 1.5, 2.0]:
-        params = HHParameters()
-        params.C_m = C_m
-        neuron = HHNeuron(params)
-        trace = neuron.simulate(duration, dt, I_ext)
-        time = np.arange(0, duration, dt)
+        spec = NeuronModelSpec.hh_default()
+        spec.C_m = C_m
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        result = rn.simulate(duration, dt, {"E": I_ext}, record=RecordingConfig(["V"]))
+        trace = result["E"]["V"][0]
+        time = result["E"].time
         ax.plot(time, trace, label=f'C_m={C_m}', linewidth=0.8)
     ax.set_xlabel('Time (ms)')
     ax.set_ylabel('V (mV)')
@@ -356,7 +314,7 @@ def plot_parameter_sensitivity(figs_dir):
 
     fig.suptitle('Parameter Sensitivity Analysis', fontsize=12, y=1.02)
     fig.tight_layout()
-    fig.savefig(figs_dir / "07_parameter_sensitivity.png", dpi=150)
+    fig.savefig(figs_dir / "06_parameter_sensitivity.png", dpi=150)
     plt.close(fig)
 
 
@@ -370,7 +328,6 @@ def main():
 
     plot_membrane_potential(figs_dir)
     plot_gating_variables(figs_dir)
-    plot_integration_comparison(figs_dir)
     plot_fi_curve(figs_dir)
     plot_phase_plane(figs_dir)
     plot_current_clamp_series(figs_dir)

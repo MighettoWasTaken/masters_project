@@ -21,7 +21,7 @@ except ImportError:
     HAS_MATPLOTLIB = False
     print("matplotlib not installed - skipping visualization")
 
-from hodgkin_huxley import HHNeuron, Network, HHParameters
+from hodgkin_huxley import RegionalNetwork, NeuronModelSpec, SynapseSpec
 
 
 def get_figs_dir():
@@ -35,21 +35,19 @@ def single_neuron_example():
     """Simulate a single Hodgkin-Huxley neuron."""
     print("=== Single Neuron Simulation ===\n")
 
-    # Create a neuron with default parameters
-    neuron = HHNeuron()
-    print(f"Initial state: {neuron}")
-    print(f"Resting potential: {neuron.V:.2f} mV")
+    spec = NeuronModelSpec.hh_default()
+    rn = RegionalNetwork()
+    rn.add_population("E", 1, model=spec)
+    print(f"Resting potential: {spec.V_init:.2f} mV")
 
     # Simulation parameters
     duration = 100.0  # ms
     dt = 0.01         # ms
     I_ext = 10.0      # uA/cm^2
 
-    # Run simulation
     print(f"\nRunning simulation for {duration} ms with I_ext = {I_ext} uA/cm^2...")
-    trace = neuron.simulate(duration=duration, dt=dt, I_ext=I_ext)
+    trace = rn.simulate(duration=duration, dt=dt, I_ext={"E": I_ext})["E"][0]
 
-    # Analyze results
     print(f"Simulation complete. {len(trace)} time points recorded.")
     print(f"Voltage range: [{trace.min():.2f}, {trace.max():.2f}] mV")
 
@@ -59,7 +57,6 @@ def single_neuron_example():
     num_spikes = len(crossings) // 2
     print(f"Number of action potentials: {num_spikes}")
 
-    # No plot here - see verify_neuron.py for comprehensive plots
     return trace
 
 
@@ -73,8 +70,9 @@ def current_injection_example():
 
     results = []
     for I_ext in currents:
-        neuron = HHNeuron()
-        trace = neuron.simulate(duration=duration, dt=dt, I_ext=I_ext)
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=NeuronModelSpec.hh_default())
+        trace = rn.simulate(duration=duration, dt=dt, I_ext={"E": float(I_ext)})["E"][0]
 
         # Count spikes
         threshold = 0.0
@@ -92,14 +90,12 @@ def network_example():
     """Simulate a small network of neurons."""
     print("\n=== Network Simulation ===\n")
 
-    # Create a network with 3 neurons
-    net = Network(3)
-    print(f"Created network: {net}")
-
-    # Add excitatory connections: 0 -> 1, 1 -> 2
-    net.add_synapse(pre_idx=0, post_idx=1, weight=0.1, E_syn=0.0, tau=2.0)
-    net.add_synapse(pre_idx=1, post_idx=2, weight=0.1, E_syn=0.0, tau=2.0)
-    print(f"Added synapses: {net.num_synapses}")
+    # Create a network with 3 neurons, chain: 0 -> 1 -> 2
+    rn = RegionalNetwork()
+    rn.add_population("E", 3, model=NeuronModelSpec.hh_default())
+    rn.connect("E", "E", lambda ns, nd: [(0, 1), (1, 2)], weight=0.1,
+               synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+    print(f"Network: {rn}")
 
     # Simulation parameters
     duration = 200.0  # ms
@@ -109,10 +105,9 @@ def network_example():
     # Create input currents - only stimulate neuron 0
     I_ext = np.zeros((3, num_steps))
     I_ext[0, :] = 10.0  # Constant current to neuron 0
-    print(I_ext)
 
     print(f"\nRunning network simulation for {duration} ms...")
-    traces = net.simulate(duration=duration, dt=dt, I_ext=I_ext)
+    traces = rn.simulate(duration=duration, dt=dt, I_ext={"E": I_ext})["E"]
 
     print(f"Simulation complete. Shape: {traces.shape}")
     for i in range(3):
@@ -120,7 +115,7 @@ def network_example():
 
     if HAS_MATPLOTLIB:
         figs_dir = get_figs_dir()
-        time = np.arange(0, duration, dt)
+        time = np.linspace(0, duration, num_steps)
         fig, axes = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
 
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
@@ -144,19 +139,20 @@ def custom_parameters_example():
     """Demonstrate custom neuron parameters."""
     print("\n=== Custom Parameters Example ===\n")
 
-    # Create custom parameters
-    params = HHParameters()
+    spec = NeuronModelSpec.hh_default()
+    # channels[0] = Na (g_Na), channels[1] = K (g_K), channels[2] = L (g_L)
     print("Default parameters:")
-    print(f"  g_Na = {params.g_Na} mS/cm²")
-    print(f"  g_K  = {params.g_K} mS/cm²")
-    print(f"  g_L  = {params.g_L} mS/cm²")
+    print(f"  g_Na = {spec.channels[0].g} mS/cm²")
+    print(f"  g_K  = {spec.channels[1].g} mS/cm²")
+    print(f"  g_L  = {spec.channels[2].g} mS/cm²")
 
     # Modify sodium conductance
-    params.g_Na = 150.0  # Increased from 120
-    print(f"\nModified g_Na to {params.g_Na} mS/cm²")
+    spec.channels[0].g = 150.0  # Increased from 120
+    print(f"\nModified g_Na to {spec.channels[0].g} mS/cm²")
 
-    neuron = HHNeuron(params)
-    trace = neuron.simulate(duration=50.0, dt=0.01, I_ext=10.0)
+    rn = RegionalNetwork()
+    rn.add_population("E", 1, model=spec)
+    trace = rn.simulate(50.0, 0.01, {"E": 10.0})["E"][0]
 
     print(f"Max voltage with modified g_Na: {trace.max():.2f} mV")
 

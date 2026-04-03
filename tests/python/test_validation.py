@@ -16,9 +16,9 @@ import pytest
 from hodgkin_huxley import (
     NeuronModelSpec, GateSpec, GateUpdateForm, ChannelSpec,
     BoltzmannParams, TauParams, TauForm,
-    Network,
 )
 import hodgkin_huxley._core as _core
+from neuron_specs import make_thalamic, make_stn, make_gpe, make_gpi
 
 
 # ---------------------------------------------------------------------------
@@ -59,16 +59,16 @@ class TestValidSpecsPass:
         spec.validate()  # must not raise
 
     def test_stn_preset_valid(self):
-        NeuronModelSpec.stn().validate()
+        make_stn().validate()
 
     def test_thalamic_preset_valid(self):
-        NeuronModelSpec.thalamic().validate()
+        make_thalamic().validate()
 
     def test_gpe_preset_valid(self):
-        NeuronModelSpec.gpe().validate()
+        make_gpe().validate()
 
     def test_gpi_preset_valid(self):
-        NeuronModelSpec.gpi().validate()
+        make_gpi().validate()
 
     def test_empty_spec_valid(self):
         """No gates, no channels, C_m=1 → valid."""
@@ -243,7 +243,7 @@ class TestCalciumSourceChannels:
 
 
 # ---------------------------------------------------------------------------
-# Validation triggered automatically by Network.add_neuron
+# Validation triggered automatically by ComposableNeuron constructor
 # ---------------------------------------------------------------------------
 
 class TestAutoValidationViaNetwork:
@@ -251,22 +251,19 @@ class TestAutoValidationViaNetwork:
     def test_invalid_spec_add_neuron_raises(self):
         spec = make_valid_spec()
         spec.channels[0].gates = [(99, 1)]  # gate 99 doesn't exist
-        net = Network()
         with pytest.raises(ValueError, match="gate index"):
-            net.add_neuron(spec)
+            _core.ComposableNeuron(spec)
 
     def test_negative_g_add_neuron_raises(self):
         spec = make_valid_spec()
         spec.channels[0].g = -2.0
-        net = Network()
         with pytest.raises(ValueError, match="negative conductance"):
-            net.add_neuron(spec)
+            _core.ComposableNeuron(spec)
 
     def test_valid_spec_add_neuron_ok(self):
         spec = make_valid_spec()
-        net = Network()
-        idx = net.add_neuron(spec)
-        assert idx == 0
+        neuron = _core.ComposableNeuron(spec)
+        assert neuron is not None
 
 
 # ---------------------------------------------------------------------------

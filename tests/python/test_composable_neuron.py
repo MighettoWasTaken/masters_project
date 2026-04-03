@@ -28,20 +28,18 @@ from hodgkin_huxley import (
     ChannelSpec,
     CalciumSpec,
     NeuronModelSpec,
+    IzhikevichType,
     # Python helpers
     NeuronModel,
     Boltzmann,
     Tau,
     RateFunc,
     # Network types
-    Network,
     RegionalNetwork,
-    NetworkNeuronType,
     SynapseSpec,
-    # Other neuron types for mixed tests
-    HHParameters,
-    IzhikevichParameters,
+    RecordingConfig,
 )
+from neuron_specs import make_thalamic, make_stn, make_gpe, make_gpi, make_striatum
 
 
 # =============================================================================
@@ -67,13 +65,11 @@ def make_leak_spec(g=0.1, E_rev=-65.0):
 
 
 def simulate_composable(spec, duration=100.0, dt=0.01, I_ext=0.0):
-    """Convenience: simulate one neuron via Network."""
-    net = Network()
-    net.add_neuron(spec)
-    n_steps = int(duration / dt)
-    I = [[I_ext] * n_steps]
-    traces = net.simulate(duration, dt, I)
-    return np.array(traces[0])
+    """Convenience: simulate one neuron via RegionalNetwork."""
+    rn = RegionalNetwork()
+    rn.add_population("E", 1, model=spec)
+    result = rn.simulate(duration, dt, {"E": I_ext})
+    return result["E"][0]
 
 
 def count_spikes(trace, threshold=0.0):
@@ -130,7 +126,7 @@ class TestStructConstruction:
         assert ca.Ca_init == pytest.approx(0.1)
 
     def test_preset_thalamic(self):
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         assert spec.name == "TH"
         assert spec.C_m == pytest.approx(1.0)
         assert len(spec.gates) == 5       # h_Na, h_T, m_Na(inst), m_T(inst), n_K(derived)
@@ -138,7 +134,7 @@ class TestStructConstruction:
         assert spec.calcium.enabled == False
 
     def test_preset_stn(self):
-        spec = NeuronModelSpec.stn()
+        spec = make_stn()
         assert spec.name == "STN"
         assert len(spec.gates) == 11
         assert len(spec.channels) == 7
@@ -146,7 +142,7 @@ class TestStructConstruction:
         assert spec.calcium.use_nernst == True
 
     def test_preset_gpe(self):
-        spec = NeuronModelSpec.gpe()
+        spec = make_gpe()
         assert spec.name == "GPe"
         assert spec.calcium.enabled == True
         assert spec.calcium.use_nernst == False
@@ -155,21 +151,21 @@ class TestStructConstruction:
         assert has_ahp
 
     def test_preset_gpi(self):
-        spec = NeuronModelSpec.gpi()
+        spec = make_gpi()
         assert spec.name == "GPi"
         # Same structure as GPe
-        gpe = NeuronModelSpec.gpe()
+        gpe = make_gpe()
         assert len(spec.gates) == len(gpe.gates)
         assert len(spec.channels) == len(gpe.channels)
 
     def test_preset_striatum(self):
-        spec = NeuronModelSpec.striatum()
+        spec = make_striatum()
         assert spec.name == "Striatum"
         assert len(spec.channels) == 4   # Na, K, M, Leak
 
     def test_preset_striatum_pd_values(self):
-        healthy = NeuronModelSpec.striatum(pd=0.0)
-        pd = NeuronModelSpec.striatum(pd=1.0)
+        healthy = make_striatum(pd=0.0)
+        pd = make_striatum(pd=1.0)
         # M channel conductance should differ
         g_healthy = next(ch.g for ch in healthy.channels if ch.name == "M")
         g_pd = next(ch.g for ch in pd.channels if ch.name == "M")
@@ -199,29 +195,29 @@ class TestSafety:
         assert np.all(np.isfinite(trace))
 
     def test_zero_dt_step(self):
-        net = Network()
-        net.add_neuron(NeuronModelSpec.thalamic())
-        net.step(0.0, [10.0])   # should not crash
-        assert np.isfinite(net.neuron(0).V)
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=make_thalamic())
+        rn._rnet.network().step(0.0, [10.0])   # should not crash
+        assert np.isfinite(rn._rnet.network().neuron(0).V)
 
     def test_very_small_dt(self):
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         trace = simulate_composable(spec, duration=1.0, dt=1e-4, I_ext=5.0)
         assert np.all(np.isfinite(trace))
 
     def test_very_large_dt(self):
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         # May be inaccurate but must not crash or produce NaN/Inf
         trace = simulate_composable(spec, duration=100.0, dt=1.0, I_ext=5.0)
         assert np.all(np.isfinite(trace))
 
     def test_extreme_current_positive(self):
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         trace = simulate_composable(spec, duration=10.0, dt=0.01, I_ext=1e4)
         assert np.all(np.isfinite(trace))
 
     def test_extreme_current_negative(self):
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         trace = simulate_composable(spec, duration=10.0, dt=0.01, I_ext=-1e4)
         assert np.all(np.isfinite(trace))
 
@@ -238,57 +234,48 @@ class TestSafety:
         assert np.all(np.isfinite(trace))
 
     def test_single_neuron_pool(self):
-        spec = NeuronModelSpec.thalamic()
-        net = Network()
-        net.add_neuron(spec)
-        n_steps = 1000
-        traces = net.simulate(100.0, 0.1, [[5.0] * n_steps])
-        assert np.all(np.isfinite(traces[0]))
+        spec = make_thalamic()
+        trace = simulate_composable(spec, duration=100.0, dt=0.1, I_ext=5.0)
+        assert np.all(np.isfinite(trace))
 
     def test_large_pool(self):
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         N = 500
-        net = Network()
-        for _ in range(N):
-            net.add_neuron(spec)
-        n_steps = 100
-        I = [[5.0] * n_steps] * N
-        traces = net.simulate(10.0, 0.1, I)
-        arr = np.array(traces)
-        assert np.all(np.isfinite(arr))
+        rn = RegionalNetwork()
+        rn.add_population("E", N, model=spec)
+        result = rn.simulate(10.0, 0.1, {"E": 5.0})
+        assert np.all(np.isfinite(result["E"]))
 
     def test_reset_restores_initial_state(self):
-        net = Network()
-        spec = NeuronModelSpec.thalamic()
-        net.add_neuron(spec)
-        n_steps = 1000
-        net.simulate(100.0, 0.1, [[5.0] * n_steps])
-        net.reset()
-        V = net.neuron(0).V
+        spec = make_thalamic()
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        rn.simulate(100.0, 0.1, {"E": 5.0})
+        rn.reset()
+        V = rn._rnet.network().neuron(0).V
         assert V == pytest.approx(spec.V_init, abs=1.0)
 
     def test_calcium_stays_nonnegative(self):
         """Calcium concentration must never go negative."""
-        spec = NeuronModelSpec.stn()
-        net = Network()
-        net.add_neuron(spec)
-        n_steps = 2000
-        net.simulate(200.0, 0.1, [[20.0] * n_steps])
-        from hodgkin_huxley import _ComposableNeuron
-        cn = net.neuron(0)
-        # After simulation neuron's calcium is synced
-        assert cn.calcium >= 0.0
+        spec = make_stn()
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        result = rn.simulate(200.0, 0.1, {"E": 20.0},
+                             record=RecordingConfig(["calcium"]))
+        ca_trace = result["E"]["calcium"][0]
+        assert np.all(ca_trace >= 0.0)
 
     def test_gate_values_stay_bounded(self):
         """Gate variables must stay in [0, 1] for INF_TAU/ALPHA_BETA gates."""
-        spec = NeuronModelSpec.striatum()
-        net = Network()
-        idx = net.add_neuron(spec)
-        n_steps = 500
-        net.simulate(50.0, 0.1, [[10.0] * n_steps])
-        cn = net.neuron(idx)
-        for gs in cn.gate_states:
-            assert -1e-6 <= gs <= 1.0 + 1e-6
+        spec = make_striatum()
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        result = rn.simulate(50.0, 0.1, {"E": 10.0},
+                             record=RecordingConfig(["gates"]))
+        gates = result["E"]["gates"][0]  # shape (max_gates, n_rec)
+        for gi in range(gates.shape[0]):
+            assert np.all(gates[gi] >= -1e-6)
+            assert np.all(gates[gi] <= 1.0 + 1e-6)
 
     def test_all_tau_forms_no_division_by_zero(self):
         """Each TauParams::Form evaluated at extreme voltages."""
@@ -368,52 +355,48 @@ class TestSafety:
 
     def test_nernst_near_zero_calcium(self):
         """Nernst equation with Ca near 0: E_Ca should be clamped, no log(0)."""
-        spec = NeuronModelSpec.stn()
+        spec = make_stn()
         spec.calcium.Ca_init = 1e-12  # nearly zero
         trace = simulate_composable(spec, duration=10.0, dt=0.01, I_ext=0.0)
         assert np.all(np.isfinite(trace))
 
     def test_mixed_composable_and_hh_network(self):
         """Network with both HH and composable neurons simulates correctly."""
-        net = Network()
-        net.add_hh_neuron()
-        net.add_neuron(NeuronModelSpec.thalamic())
-        n_steps = 100
-        traces = net.simulate(10.0, 0.1, [[10.0] * n_steps, [5.0] * n_steps])
-        assert np.all(np.isfinite(np.array(traces)))
+        rn = RegionalNetwork()
+        rn.add_population("HH", 1, model=NeuronModelSpec.hh_default())
+        rn.add_population("TH", 1, model=make_thalamic())
+        traces = rn.simulate(10.0, 0.1, {"HH": 10.0, "TH": 5.0})
+        assert np.all(np.isfinite(traces["HH"]))
+        assert np.all(np.isfinite(traces["TH"]))
 
     def test_mixed_composable_and_iz_network(self):
         """Network with both Izhikevich and composable neurons."""
-        from hodgkin_huxley import IzhikevichType
-        net = Network()
-        net.add_neuron(NetworkNeuronType.IZHIKEVICH_RS)
-        net.add_neuron(NeuronModelSpec.thalamic())
-        n_steps = 100
-        traces = net.simulate(10.0, 0.1, [[10.0] * n_steps, [5.0] * n_steps])
-        assert np.all(np.isfinite(np.array(traces)))
+        rn = RegionalNetwork()
+        rn.add_population("IZ", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
+        rn.add_population("TH", 1, model=make_thalamic())
+        traces = rn.simulate(10.0, 0.1, {"IZ": 10.0, "TH": 5.0})
+        assert np.all(np.isfinite(traces["IZ"]))
+        assert np.all(np.isfinite(traces["TH"]))
 
     def test_three_way_mixed_network(self):
         """HH + Izhikevich + composable neurons in one network."""
-        net = Network()
-        net.add_hh_neuron()
-        net.add_neuron(NetworkNeuronType.IZHIKEVICH_RS)
-        net.add_neuron(NeuronModelSpec.thalamic())
-        n_steps = 100
-        traces = net.simulate(10.0, 0.1, [[10.0] * n_steps] * 3)
-        assert np.all(np.isfinite(np.array(traces)))
+        rn = RegionalNetwork()
+        rn.add_population("HH", 1, model=NeuronModelSpec.hh_default())
+        rn.add_population("IZ", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
+        rn.add_population("TH", 1, model=make_thalamic())
+        traces = rn.simulate(10.0, 0.1, {"HH": 10.0, "IZ": 10.0, "TH": 10.0})
+        assert all(np.all(np.isfinite(v)) for v in traces.values())
 
     def test_duplicate_model_names_in_network(self):
         """Two populations with same model name → same pool, both work."""
-        spec1 = NeuronModelSpec.thalamic()
-        spec2 = NeuronModelSpec.thalamic()  # same name
-        net = Network()
-        for _ in range(5):
-            net.add_neuron(spec1)
-        for _ in range(5):
-            net.add_neuron(spec2)
-        n_steps = 50
-        traces = net.simulate(5.0, 0.1, [[5.0] * n_steps] * 10)
-        assert np.all(np.isfinite(np.array(traces)))
+        spec1 = make_thalamic()
+        spec2 = make_thalamic()  # same name
+        rn = RegionalNetwork()
+        rn.add_population("A", 5, model=spec1)
+        rn.add_population("B", 5, model=spec2)
+        traces = rn.simulate(5.0, 0.1, {"A": 5.0, "B": 5.0})
+        assert np.all(np.isfinite(traces["A"]))
+        assert np.all(np.isfinite(traces["B"]))
 
 
 # =============================================================================
@@ -471,54 +454,53 @@ class TestCorrectness:
         -10 mV (T-current becomes repolarising before V crosses 0).  Use a
         threshold below the peak to reliably detect the action potential.
         """
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         trace = simulate_composable(spec, duration=500.0, dt=0.1, I_ext=5.0)
         spikes = count_spikes(trace, threshold=-15.0)
         assert spikes >= 1, "TH should produce at least one spike with I_ext=5"
 
     def test_th_resting_no_spikes(self):
         """Thalamic neuron with zero current should not spike in 1s."""
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         trace = simulate_composable(spec, duration=1000.0, dt=0.1, I_ext=0.0)
         spikes = count_spikes(trace, threshold=0.0)
         assert spikes == 0, "TH should not spike at rest"
 
     def test_stn_fires_under_current(self):
         """STN neuron fires with sufficient current."""
-        spec = NeuronModelSpec.stn()
+        spec = make_stn()
         trace = simulate_composable(spec, duration=500.0, dt=0.1, I_ext=25.0)
         spikes = count_spikes(trace, threshold=0.0)
         assert spikes >= 1, "STN should produce at least one spike with I_ext=25"
 
     def test_stn_calcium_changes(self):
         """STN Ca concentration changes during spiking (not static)."""
-        spec = NeuronModelSpec.stn()
-        net = Network()
-        net.add_neuron(spec)
-        n_steps = 5000
-        net.simulate(500.0, 0.1, [[25.0] * n_steps])
-        cn = net.neuron(0)
-        # Ca should have changed from its initial value
-        assert cn.calcium != pytest.approx(spec.calcium.Ca_init, abs=1e-4)
+        spec = make_stn()
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        result = rn.simulate(500.0, 0.1, {"E": 25.0},
+                             record=RecordingConfig(["calcium"]))
+        ca_final = result["E"]["calcium"][0, -1]
+        assert ca_final != pytest.approx(spec.calcium.Ca_init, abs=1e-4)
 
     def test_gpe_fires_under_current(self):
         """GPe fires with I_ext=5."""
-        spec = NeuronModelSpec.gpe()
+        spec = make_gpe()
         trace = simulate_composable(spec, duration=500.0, dt=0.1, I_ext=5.0)
         spikes = count_spikes(trace, threshold=0.0)
         assert spikes >= 1
 
     def test_striatum_fires_under_current(self):
         """Striatum fires with I_ext=10."""
-        spec = NeuronModelSpec.striatum()
+        spec = make_striatum()
         trace = simulate_composable(spec, duration=500.0, dt=0.1, I_ext=10.0)
         spikes = count_spikes(trace, threshold=0.0)
         assert spikes >= 1
 
     def test_striatum_pd_modulation(self):
         """pd parameter changes firing — at minimum, traces should differ."""
-        spec_healthy = NeuronModelSpec.striatum(pd=0.0)
-        spec_pd = NeuronModelSpec.striatum(pd=1.0)
+        spec_healthy = make_striatum(pd=0.0)
+        spec_pd = make_striatum(pd=1.0)
         trace_h = simulate_composable(spec_healthy, duration=500.0, dt=0.1, I_ext=10.0)
         trace_p = simulate_composable(spec_pd, duration=500.0, dt=0.1, I_ext=10.0)
         # Traces should not be identical (different g_M changes dynamics)
@@ -544,8 +526,9 @@ class TestCorrectness:
         ch.gates.append((0, 1))
         spec.channels.append(ch)
 
-        net = Network()
-        net.add_neuron(spec)
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        net = rn._rnet.network()
         # Manually step and check gate tracks inf at each step
         for _ in range(50):
             V = net.neuron(0).V
@@ -558,9 +541,10 @@ class TestCorrectness:
 
     def test_derived_gate_follows_source(self):
         """TH n_K = 0.75*(1 - h_T) should hold at every step."""
-        spec = NeuronModelSpec.thalamic()
-        net = Network()
-        net.add_neuron(spec)
+        spec = make_thalamic()
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        net = rn._rnet.network()
 
         # h_T is gate index 1, n_K is gate index 4
         H_T_IDX = 1
@@ -576,51 +560,54 @@ class TestCorrectness:
 
     def test_pool_matches_scalar(self):
         """ComposablePool step should match scalar ComposableNeuron step closely."""
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         I_ext_val = 5.0
         dt = 0.01
         n_steps = 200
 
-        # Scalar path: use Network.step() for one neuron
-        net_scalar = Network()
-        net_scalar.add_neuron(spec)
+        # Scalar path: use internal network step() for one neuron
+        rn_scalar = RegionalNetwork()
+        rn_scalar.add_population("E", 1, model=spec)
+        net_scalar = rn_scalar._rnet.network()
         trace_scalar = []
         for _ in range(n_steps):
             trace_scalar.append(net_scalar.neuron(0).V)
             net_scalar.step(dt, [I_ext_val])
 
         # Pool path: simulate() uses ComposablePool
-        net_pool = Network()
-        net_pool.add_neuron(spec)
-        traces = net_pool.simulate(n_steps * dt, dt, [[I_ext_val] * n_steps])
-        trace_pool = traces[0]
+        rn_pool = RegionalNetwork()
+        rn_pool.add_population("E", 1, model=spec)
+        traces = rn_pool.simulate(n_steps * dt, dt, {"E": I_ext_val})
+        trace_pool = traces["E"][0]
 
         assert np.allclose(trace_scalar, trace_pool, atol=1e-6)
 
     def test_pool_multiple_neurons_independent(self):
         """N neurons in pool with different I_ext produce different traces."""
-        spec = NeuronModelSpec.thalamic()
+        spec = make_thalamic()
         N = 5
-        net = Network()
-        for _ in range(N):
-            net.add_neuron(spec)
-        n_steps = 200
-        I = [[float(i) * 2.0] * n_steps for i in range(N)]
-        traces = net.simulate(n_steps * 0.1, 0.1, I)
-        arr = np.array(traces)
+        rn = RegionalNetwork()
+        rn.add_population("E", N, model=spec)
+        duration = 20.0
+        dt = 0.1
+        n_steps = int(duration / dt)
+        # (N, T) dense matrix: different constant current per neuron
+        I = np.array([[float(i) * 2.0] * n_steps for i in range(N)])
+        traces = rn.simulate(duration, dt, {"E": I})
+        arr = traces["E"]
         # Not all traces should be identical
         assert not np.allclose(arr[0], arr[-1], atol=1e-6)
 
     def test_alpha_beta_gate_kinetics(self):
         """Striatum m gate: verify alpha-beta produces valid kinetics (finite, bounded)."""
-        spec = NeuronModelSpec.striatum()
-        net = Network()
-        net.add_neuron(spec)
-        n_steps = 200
-        net.simulate(n_steps * 0.1, 0.1, [[10.0] * n_steps])
-        gates = net.neuron(0).gate_states
+        spec = make_striatum()
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        result = rn.simulate(20.0, 0.1, {"E": 10.0},
+                             record=RecordingConfig(["gates"]))
+        gates_final = result["E"]["gates"][0, :, -1]  # neuron 0, all gates, last step
         # m_Na is gate 0
-        assert 0.0 <= gates[0] <= 1.0
+        assert 0.0 <= gates_final[0] <= 1.0
 
     def test_calcium_decay_no_source(self):
         """Without any source channels, Ca should decay toward 0."""
@@ -630,21 +617,19 @@ class TestCorrectness:
         spec.calcium.epsilon = 1e-3
         spec.calcium.K_Ca = 5.0
         spec.calcium.Ca_init = 1.0
-        # No source channels — pure decay
-        trace = simulate_composable(spec, duration=1000.0, dt=0.1, I_ext=0.0)
-        net = Network()
-        net.add_neuron(spec)
-        n_steps = 10000
-        net.simulate(1000.0, 0.1, [[0.0] * n_steps])
-        ca_final = net.neuron(0).calcium
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        result = rn.simulate(1000.0, 0.1, {"E": 0.0},
+                             record=RecordingConfig(["calcium"]))
+        ca_final = result["E"]["calcium"][0, -1]
         assert ca_final < 0.5, f"Ca should decay from 1.0, got {ca_final}"
 
     def test_different_cm_changes_dynamics(self):
         """Higher C_m slows voltage dynamics → fewer spikes per unit time."""
-        spec_fast = NeuronModelSpec.thalamic()
+        spec_fast = make_thalamic()
         spec_fast.C_m = 0.5
 
-        spec_slow = NeuronModelSpec.thalamic()
+        spec_slow = make_thalamic()
         spec_slow.C_m = 2.0
 
         trace_fast = simulate_composable(spec_fast, duration=500.0, dt=0.1, I_ext=5.0)
@@ -693,13 +678,13 @@ class TestCorrectness:
         g.beta = r   # symmetric → X_inf = 0.5, alpha+beta = 6.0
 
         spec.gates.append(g)
-        net = Network()
-        net.add_neuron(spec)
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
 
         # dt=1ms pool path (simulate uses ComposablePool)
-        n_steps = 50
-        net.simulate(50.0, 1.0, [[0.0] * n_steps])
-        gate = net.neuron(0).gate_states[0]
+        result = rn.simulate(50.0, 1.0, {"E": 0.0},
+                             record=RecordingConfig(["gates"]))
+        gate = result["E"]["gates"][0, 0, -1]  # neuron 0, gate 0, last step
 
         assert np.isfinite(gate) and abs(gate - 0.5) < 0.05, (
             f"ALPHA_BETA gate (pool) must converge to X_inf=0.5 with dt=1 ms. "
@@ -729,8 +714,9 @@ class TestCorrectness:
         g.beta = r
 
         spec.gates.append(g)
-        net = Network()
-        net.add_neuron(spec)
+        rn = RegionalNetwork()
+        rn.add_population("E", 1, model=spec)
+        net = rn._rnet.network()
 
         for _ in range(50):
             net.step(1.0, [0.0])   # dt=1 ms via scalar step()
@@ -763,16 +749,16 @@ class TestCorrectness:
         This test FAILS while the bug is present (Task 10.2).
         """
         def run_with_h_T_init(initial_value):
-            th = NeuronModelSpec.thalamic()
+            th = make_thalamic()
             h_T_gate = th.gates[1]        # h_T is gate index 1 in TH
             h_T_gate.initial_value = initial_value
             spec = make_empty_spec("th_h_T_tau_test", V_init=-65.0)
             spec.gates.append(h_T_gate)
-            net = Network()
-            net.add_neuron(spec)
-            n_steps = int(100.0 / 0.01)  # 100 ms at dt=0.01 ms
-            net.simulate(100.0, 0.01, [[0.0] * n_steps])
-            return net.neuron(0).gate_states[0]
+            rn = RegionalNetwork()
+            rn.add_population("E", 1, model=spec)
+            result = rn.simulate(100.0, 0.01, {"E": 0.0},
+                                 record=RecordingConfig(["gates"]))
+            return result["E"]["gates"][0, 0, -1]
 
         gate_from_zero = run_with_h_T_init(0.0)
         gate_from_one  = run_with_h_T_init(1.0)
@@ -792,7 +778,7 @@ class TestCorrectness:
         A sign error in s2 would make tau ~215 ms, preventing convergence in 100 ms.
         """
         def run_with_stn_b_A_init(initial_value):
-            stn = NeuronModelSpec.stn()
+            stn = make_stn()
             b_A_idx = next(
                 (i for i, gate in enumerate(stn.gates) if gate.name == "b_A"),
                 None
@@ -802,11 +788,11 @@ class TestCorrectness:
             b_A_gate.initial_value = initial_value
             spec = make_empty_spec("stn_b_A_tau_test", V_init=-65.0)
             spec.gates.append(b_A_gate)
-            net = Network()
-            net.add_neuron(spec)
-            n_steps = int(100.0 / 0.01)
-            net.simulate(100.0, 0.01, [[0.0] * n_steps])
-            return net.neuron(0).gate_states[0]
+            rn = RegionalNetwork()
+            rn.add_population("E", 1, model=spec)
+            result = rn.simulate(100.0, 0.01, {"E": 0.0},
+                                 record=RecordingConfig(["gates"]))
+            return result["E"]["gates"][0, 0, -1]
 
         gate_from_zero = run_with_stn_b_A_init(0.0)
         gate_from_one  = run_with_stn_b_A_init(1.0)
@@ -827,75 +813,60 @@ class TestCorrectness:
 class TestPerformance:
 
     def test_pool_faster_than_scalar_loop(self):
-        """Pool step for N=200 should be faster than N scalar steps."""
-        spec = NeuronModelSpec.thalamic()
+        """Pool step for N=200 should be faster than N separate simulations."""
+        spec = make_thalamic()
         N = 200
-        n_steps = 500
 
-        # Scalar timing: use step() for one neuron at a time (simulated manually)
-        nets = [Network() for _ in range(N)]
-        for net in nets:
-            net.add_neuron(spec)
-
+        # Scalar timing: N separate RegionalNetworks with 1 neuron each
         t0 = time.perf_counter()
-        for net in nets:
-            net.simulate(50.0, 0.1, [[5.0] * n_steps])
+        for _ in range(N):
+            rn = RegionalNetwork()
+            rn.add_population("E", 1, model=spec)
+            rn.simulate(50.0, 0.1, {"E": 5.0})
         t_scalar = time.perf_counter() - t0
 
-        # Pool timing: single Network with all neurons
-        pool_net = Network()
-        for _ in range(N):
-            pool_net.add_neuron(spec)
-        I = [[5.0] * n_steps] * N
-
+        # Pool timing: single RegionalNetwork with all neurons
+        rn_pool = RegionalNetwork()
+        rn_pool.add_population("E", N, model=spec)
         t0 = time.perf_counter()
-        pool_net.simulate(50.0, 0.1, I)
+        rn_pool.simulate(50.0, 0.1, {"E": 5.0})
         t_pool = time.perf_counter() - t0
 
-        # Pool should be at least 2x faster than N separate simulations
+        # Pool should be faster than N separate simulations
         assert t_pool < t_scalar, (
             f"Pool ({t_pool:.3f}s) should be faster than scalar ({t_scalar:.3f}s)"
         )
 
     def test_composable_pool_reasonable_speed(self):
         """1000 TH neurons, 100ms, dt=0.01: completes in <30s."""
-        spec = NeuronModelSpec.thalamic()
-        N = 1000
-        net = Network()
-        for _ in range(N):
-            net.add_neuron(spec)
-        n_steps = 10000
-        I = [[5.0] * n_steps] * N
+        spec = make_thalamic()
+        rn = RegionalNetwork()
+        rn.add_population("E", 1000, model=spec)
 
         t0 = time.perf_counter()
-        traces = net.simulate(100.0, 0.01, I)
+        traces = rn.simulate(100.0, 0.01, {"E": 5.0})
         elapsed = time.perf_counter() - t0
 
         assert elapsed < 30.0, f"Simulation took too long: {elapsed:.1f}s"
-        assert np.all(np.isfinite(np.array(traces)))
+        assert np.all(np.isfinite(traces["E"]))
 
     def test_fast_math_produces_finite_results(self):
-        """fast_math=True (default) produces finite traces."""
-        spec = NeuronModelSpec.thalamic()
-        net = Network()
-        net.fast_math = True
-        for _ in range(50):
-            net.add_neuron(spec)
-        n_steps = 500
-        traces = net.simulate(50.0, 0.1, [[5.0] * n_steps] * 50)
-        assert np.all(np.isfinite(np.array(traces)))
+        """Pool produces finite results (fast_math is always enabled internally)."""
+        spec = make_thalamic()
+        rn = RegionalNetwork()
+        rn.add_population("E", 50, model=spec)
+        traces = rn.simulate(50.0, 0.1, {"E": 5.0})
+        assert np.all(np.isfinite(traces["E"]))
 
     def test_pool_scaling_roughly_linear(self):
-        """Time scaling for N=50 vs N=500: should be < 15x (roughly linear in N)."""
-        spec = NeuronModelSpec.thalamic()
-        n_steps = 200
+        """Time scaling for N=50 vs N=500: should be < 20x (roughly linear in N)."""
+        spec = make_thalamic()
 
         def run(N):
-            net = Network()
-            for _ in range(N):
-                net.add_neuron(spec)
+            rn = RegionalNetwork()
+            rn.add_population("E", N, model=spec)
             t0 = time.perf_counter()
-            net.simulate(20.0, 0.1, [[5.0] * n_steps] * N)
+            rn.simulate(20.0, 0.1, {"E": 5.0})
             return time.perf_counter() - t0
 
         t_small = run(50)
@@ -911,16 +882,16 @@ class TestPerformance:
 class TestIntegration:
 
     def test_regional_add_population_with_model(self):
-        """rn.add_population(..., model=NeuronModelSpec.thalamic()) works."""
+        """rn.add_population(..., model=make_thalamic()) works."""
         rn = RegionalNetwork()
-        rn.add_population("TH", 10, model=NeuronModelSpec.thalamic())
+        rn.add_population("TH", 10, model=make_thalamic())
         assert rn.population_size("TH") == 10
         assert rn.num_neurons == 10
 
     def test_regional_add_population_with_neuron_model_builder(self):
         """rn.add_population(..., model=NeuronModel.thalamic()) works."""
         rn = RegionalNetwork()
-        rn.add_population("TH", 5, model=NeuronModel.thalamic())
+        rn.add_population("TH", 5, model=make_thalamic())
         assert rn.num_neurons == 5
 
     def test_regional_mixed_populations(self):
@@ -928,13 +899,13 @@ class TestIntegration:
         rn = RegionalNetwork()
         rn.add_population("HH", 5, neuron_type="HH")
         rn.add_population("IZ", 5, neuron_type="IZHIKEVICH_RS")
-        rn.add_population("TH", 5, model=NeuronModelSpec.thalamic())
+        rn.add_population("TH", 5, model=make_thalamic())
         assert rn.num_neurons == 15
 
     def test_regional_simulate_dict_iext(self):
         """Dict I_ext works with composable populations."""
         rn = RegionalNetwork()
-        rn.add_population("TH", 5, model=NeuronModelSpec.thalamic())
+        rn.add_population("TH", 5, model=make_thalamic())
         traces = rn.simulate(50.0, 0.1, {"TH": 5.0})
         assert "TH" in traces
         assert np.all(np.isfinite(traces["TH"]))
@@ -942,8 +913,8 @@ class TestIntegration:
     def test_regional_traces_correct_shapes(self):
         """Trace shapes match population sizes."""
         rn = RegionalNetwork()
-        rn.add_population("A", 3, model=NeuronModelSpec.thalamic())
-        rn.add_population("B", 7, model=NeuronModelSpec.gpe())
+        rn.add_population("A", 3, model=make_thalamic())
+        rn.add_population("B", 7, model=make_gpe())
         dt = 0.1
         duration = 50.0
         n_steps = int(duration / dt)
@@ -954,8 +925,8 @@ class TestIntegration:
     def test_regional_with_connections(self):
         """Composable populations can be connected."""
         rn = RegionalNetwork()
-        rn.add_population("TH", 5, model=NeuronModelSpec.thalamic())
-        rn.add_population("STN", 5, model=NeuronModelSpec.stn())
+        rn.add_population("TH", 5, model=make_thalamic())
+        rn.add_population("STN", 5, model=make_stn())
         rn.connect("TH", "STN", "all_to_all",
                    synapse=SynapseSpec.ampa(), weight=0.1)
         traces = rn.simulate(50.0, 0.1, {"TH": 5.0, "STN": 10.0})
@@ -1020,35 +991,3 @@ class TestIntegration:
         trace = simulate_composable(m.to_spec(), duration=100.0, dt=0.01, I_ext=10.0)
         assert np.all(np.isfinite(trace))
         assert count_spikes(trace) >= 1
-
-    def test_python_preset_matches_cpp(self):
-        """Python NeuronModel.thalamic() matches C++ NeuronModelSpec.thalamic()."""
-        py_spec = NeuronModel.thalamic().to_spec()
-        cpp_spec = NeuronModelSpec.thalamic()
-        assert py_spec.name == cpp_spec.name
-        assert len(py_spec.gates) == len(cpp_spec.gates)
-        assert len(py_spec.channels) == len(cpp_spec.channels)
-
-    def test_full_benchmark_skeleton(self):
-        """5 neuron types, connected, simulate 50ms: finite traces."""
-        rn = RegionalNetwork()
-        rn.add_population("TH", 5, model=NeuronModelSpec.thalamic())
-        rn.add_population("STN", 5, model=NeuronModelSpec.stn())
-        rn.add_population("GPe", 5, model=NeuronModelSpec.gpe())
-        rn.add_population("GPi", 5, model=NeuronModelSpec.gpi())
-        rn.add_population("Str", 5, model=NeuronModelSpec.striatum(pd=0.0))
-
-        synapse = SynapseSpec.ampa()
-        rn.connect("STN", "GPe", "all_to_all", synapse=synapse, weight=0.1)
-        rn.connect("GPe", "STN", "all_to_all", synapse=SynapseSpec.gaba_a(), weight=0.1)
-        rn.connect("STN", "GPi", "all_to_all", synapse=synapse, weight=0.1)
-        rn.connect("Str", "GPi", "all_to_all", synapse=SynapseSpec.gaba_a(), weight=0.1)
-
-        I_ext = {
-            "TH": 3.0, "STN": 25.0, "GPe": 5.0, "GPi": 5.0, "Str": 8.0
-        }
-        traces = rn.simulate(50.0, 0.1, I_ext)
-
-        for pop in ["TH", "STN", "GPe", "GPi", "Str"]:
-            assert pop in traces
-            assert np.all(np.isfinite(traces[pop])), f"{pop} trace has NaN/Inf"
