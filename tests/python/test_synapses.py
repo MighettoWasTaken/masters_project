@@ -66,9 +66,9 @@ DELAY_COR_STN = 5.9    # ms
 DELAY_TH_COR  = 5.0    # ms
 
 # Pre-built SynapseSpec constants
-EXC = SynapseSpec.exponential(E_SYN_EXC, TAU)
-EXC_ALPHA = SynapseSpec.alpha(E_SYN_EXC, TAU)
-EXC_DEXP = SynapseSpec.double_exponential(E_SYN_EXC, TAU_RISE, TAU_DECAY)
+EXC = SynapseSpec.exponential(TAU, E_syn=E_SYN_EXC)
+EXC_ALPHA = SynapseSpec.alpha_function(TAU, E_syn=E_SYN_EXC)
+EXC_DEXP = SynapseSpec.double_exponential(TAU_RISE, TAU_DECAY, E_syn=E_SYN_EXC)
 
 
 # =============================================================================
@@ -157,9 +157,9 @@ class TestSynapseKinetics:
         ctrl_mean = get_mean_voltage(ctrl)
 
         for label, spec in [
-            ("exponential", SynapseSpec.exponential(E_SYN_EXC, TAU)),
-            ("alpha",       SynapseSpec.alpha(E_SYN_EXC, TAU)),
-            ("double_exp",  SynapseSpec.double_exponential(E_SYN_EXC, TAU_RISE, TAU_DECAY)),
+            ("exponential", SynapseSpec.exponential(TAU, E_syn=E_SYN_EXC)),
+            ("alpha",       SynapseSpec.alpha_function(TAU, E_syn=E_SYN_EXC)),
+            ("double_exp",  SynapseSpec.double_exponential(TAU_RISE, TAU_DECAY, E_syn=E_SYN_EXC)),
         ]:
             rn = _two_pop_rn(spec)
             _, post = _run2(rn, 300.0, 0.01)
@@ -173,9 +173,9 @@ class TestSynapseKinetics:
         ctrl_mean = get_mean_voltage(ctrl)
 
         for label, spec in [
-            ("exponential", SynapseSpec.exponential(E_SYN_INH, 5.0)),
-            ("alpha",       SynapseSpec.alpha(E_SYN_INH, 5.0)),
-            ("double_exp",  SynapseSpec.double_exponential(E_SYN_INH, 0.4, 5.0)),
+            ("exponential", SynapseSpec.exponential(5.0, E_syn=E_SYN_INH)),
+            ("alpha",       SynapseSpec.alpha_function(5.0, E_syn=E_SYN_INH)),
+            ("double_exp",  SynapseSpec.double_exponential(0.4, 5.0, E_syn=E_SYN_INH)),
         ]:
             rn = _two_pop_rn(spec)
             _, post = _run2(rn, 300.0, 0.01, I_pre=15.0, I_post=10.0)
@@ -224,7 +224,7 @@ class TestNetworkIntegration:
 
     def test_nmda_like_slow_synapse(self):
         """Double-exp with NMDA-like parameters (slow rise/decay) should work."""
-        rn = _two_pop_rn(SynapseSpec.double_exponential(E_SYN_EXC, 2.0, 67.0))
+        rn = _two_pop_rn(SynapseSpec.double_exponential(2.0, 67.0, E_syn=E_SYN_EXC))
         _, post = _run2(rn, 500.0, 0.01)
 
         assert not np.any(np.isnan(post)), "No NaN with NMDA-like parameters"
@@ -244,7 +244,7 @@ class TestEdgeCases:
         rn.add_population("E", 2, model=NeuronModelSpec.hh_default())
         with pytest.raises(Exception):
             rn.connect("E", "E", lambda ns, nd: [(0, 1)], weight=0.5,
-                       synapse=SynapseSpec.double_exponential(0.0, 5.0, 2.0))
+                       synapse=SynapseSpec.double_exponential(5.0, 2.0))
 
     def test_connect_invalid_population_raises(self):
         """Connecting to a non-existent population should raise."""
@@ -280,9 +280,9 @@ class TestEdgeCases:
         _, ctrl = _run2(ctrl_rn, 100.0, 0.01)
 
         for spec in [
-            SynapseSpec.exponential(E_SYN_EXC, TAU),
-            SynapseSpec.alpha(E_SYN_EXC, TAU),
-            SynapseSpec.double_exponential(E_SYN_EXC, TAU_RISE, TAU_DECAY),
+            SynapseSpec.exponential(TAU, E_syn=E_SYN_EXC),
+            SynapseSpec.alpha_function(TAU, E_syn=E_SYN_EXC),
+            SynapseSpec.double_exponential(TAU_RISE, TAU_DECAY, E_syn=E_SYN_EXC),
         ]:
             rn = _two_pop_rn(spec, weight=0.0)
             _, post = _run2(rn, 100.0, 0.01)
@@ -421,7 +421,7 @@ class TestSynapticDelayBehavior:
 
     def test_inhibitory_with_delay(self):
         """Delay should also work with inhibitory synapses."""
-        inh = SynapseSpec.exponential(E_SYN_INH, 5.0)
+        inh = SynapseSpec.exponential(5.0, E_syn=E_SYN_INH)
 
         rn = _two_pop_rn(inh, delay=4.0)
         _, post_inh = _run2(rn, 200.0, 0.01, I_pre=15.0, I_post=10.0)
@@ -493,10 +493,10 @@ class TestSynapticDelayChains:
         rn.add_population("STN", 1, model=NeuronModelSpec.hh_default())
         rn.add_population("GPe", 1, model=NeuronModelSpec.hh_default())
         rn.connect("Cor", "STN", "all_to_all", weight=WEIGHT_STRONG,
-                   synapse=SynapseSpec.double_exponential(E_SYN_EXC, 0.5, 2.49),
+                   synapse=SynapseSpec.double_exponential(0.5, 2.49, E_syn=E_SYN_EXC),
                    delay=DELAY_COR_STN)
         rn.connect("STN", "GPe", "all_to_all", weight=WEIGHT_STRONG,
-                   synapse=SynapseSpec.double_exponential(E_SYN_EXC, 0.4, 2.5),
+                   synapse=SynapseSpec.double_exponential(0.4, 2.5, E_syn=E_SYN_EXC),
                    delay=DELAY_STN_GPE)
 
         result = rn.simulate(200.0, 0.01, {"Cor": 15.0, "STN": 0.0, "GPe": 0.0})

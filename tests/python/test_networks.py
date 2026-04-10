@@ -111,8 +111,8 @@ WEIGHT_MODERATE = 2.0
 WEIGHT_STRONG = 5.0
 WEIGHT_VERY_STRONG = 10.0
 
-EXC = SynapseSpec.exponential(E_syn=E_SYN_EXCITATORY, tau=TAU_EXCITATORY)
-INH = SynapseSpec.exponential(E_syn=E_SYN_INHIBITORY, tau=TAU_INHIBITORY)
+EXC = SynapseSpec.exponential(TAU_EXCITATORY, E_syn=E_SYN_EXCITATORY)
+INH = SynapseSpec.exponential(TAU_INHIBITORY, E_syn=E_SYN_INHIBITORY)
 
 
 # =============================================================================
@@ -730,12 +730,12 @@ class TestQuantitativeVerification:
 
         rn_exc = _hh_rn(2)
         rn_exc.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_STRONG,
-                       synapse=SynapseSpec.exponential(E_syn=0.0, tau=TAU_EXCITATORY))
+                       synapse=SynapseSpec.exponential(TAU_EXCITATORY, E_syn=0.0))
         result_exc = rn_exc.simulate(duration, dt, {"E": I_ext})
 
         rn_inh = _hh_rn(2)
         rn_inh.connect("E", "E", lambda ns, nd: [(0, 1)], weight=WEIGHT_STRONG,
-                       synapse=SynapseSpec.exponential(E_syn=-80.0, tau=TAU_INHIBITORY))
+                       synapse=SynapseSpec.exponential(TAU_INHIBITORY, E_syn=-80.0))
         result_inh = rn_inh.simulate(duration, dt, {"E": I_ext})
 
         rn_ctrl = _hh_rn(2)

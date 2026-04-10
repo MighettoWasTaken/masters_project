@@ -54,7 +54,7 @@ class RecordingConfig:
 
     def __init__(self,
                  metrics=("V",),
-                 neurons="all",
+                 neurons: "str | dict" = "all",
                  interval: int = 1,
                  spike_threshold: float = 0.0):
         self.metrics = list(metrics)

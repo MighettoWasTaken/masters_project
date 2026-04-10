@@ -89,6 +89,11 @@ void ComposablePool::step(double dt) {
     const size_t ng = model_.gates.size();
     const size_t nc = model_.channels.size();
 
+    // fast_exp wins at N>=50 (SIMD amortisation); below that threshold the
+    // polynomial loop overhead exceeds the gain from avoiding std::exp.
+    const bool use_fast = fast_math_ && N_ >= 50;
+    Eigen::ArrayXd* fexp = use_fast ? &tmp_exp_r_ : nullptr;
+
     // =========================================================================
     // 1. Update gates
     // =========================================================================
@@ -104,7 +109,13 @@ void ComposablePool::step(double dt) {
                 Eigen::ArrayXd x_inf = hodgkin_huxley::boltzmann_vec(dep, gs.inf);
                 Eigen::ArrayXd tau_x = hodgkin_huxley::compute_tau_vec(V_, gs.tau, tmp_);
                 tau_x = tau_x.max(1e-10);
-                X = x_inf + (X - x_inf) * (-dt * gs.scale / tau_x).exp();
+                if (use_fast) {
+                    tmp_ = -dt * gs.scale / tau_x;
+                    fast_exp(tmp_, tmp_);
+                    X = x_inf + (X - x_inf) * tmp_;
+                } else {
+                    X = x_inf + (X - x_inf) * (-dt * gs.scale / tau_x).exp();
+                }
                 break;
             }
 
@@ -113,7 +124,13 @@ void ComposablePool::step(double dt) {
                 Eigen::ArrayXd beta  = hodgkin_huxley::compute_rate_vec(V_, gs.beta,  tmp2_);
                 Eigen::ArrayXd rate  = (alpha + beta).max(1e-10);
                 Eigen::ArrayXd x_inf = alpha / rate;
-                X = x_inf + (X - x_inf) * (-dt * rate).exp();
+                if (use_fast) {
+                    tmp_ = -dt * rate;
+                    fast_exp(tmp_, tmp_);
+                    X = x_inf + (X - x_inf) * tmp_;
+                } else {
+                    X = x_inf + (X - x_inf) * (-dt * rate).exp();
+                }
                 break;
             }
 
@@ -128,6 +145,42 @@ void ComposablePool::step(double dt) {
                 int src = gs.derived_source_gate;
                 if (src >= 0 && src < static_cast<int>(ng)) {
                     X = gs.derived_a * (gs.derived_b + gs.derived_c * gate_states_[src]);
+                }
+                break;
+            }
+
+            case GateSpec::UpdateForm::CUSTOM_EXPR: {
+                Eigen::ArrayXd dep = (gs.dependency == GateSpec::Dependency::CALCIUM)
+                    ? Eigen::ArrayXd(Ca_) : Eigen::ArrayXd(V_);
+                if (!gs.dxdt_vm.empty()) {
+                    // Arbitrary ODE: dx/dt = F(x, V) — forward Euler
+                    auto dxdt = hodgkin_huxley::vm_eval_vec_2arg(gs.dxdt_vm, dep, X, fexp);
+                    X += dt * gs.scale * dxdt;
+                } else if (!gs.inf_vm.empty() && !gs.tau_vm.empty()) {
+                    auto x_inf = hodgkin_huxley::vm_eval_vec(gs.inf_vm, dep, fexp);
+                    auto tau_x = hodgkin_huxley::vm_eval_vec(gs.tau_vm, V_, fexp).max(1e-10);
+                    if (use_fast) {
+                        tmp_ = -dt * gs.scale / tau_x;
+                        fast_exp(tmp_, tmp_);
+                        X = x_inf + (X - x_inf) * tmp_;
+                    } else {
+                        X = x_inf + (X - x_inf) * (-dt * gs.scale / tau_x).exp();
+                    }
+                } else if (!gs.alpha_vm.empty() && !gs.beta_vm.empty()) {
+                    auto alpha = hodgkin_huxley::vm_eval_vec(gs.alpha_vm, V_, fexp);
+                    auto beta  = hodgkin_huxley::vm_eval_vec(gs.beta_vm,  V_, fexp);
+                    auto rate  = (alpha + beta).max(1e-10);
+                    auto x_inf = alpha / rate;
+                    if (use_fast) {
+                        tmp_ = -dt * rate;
+                        fast_exp(tmp_, tmp_);
+                        X = x_inf + (X - x_inf) * tmp_;
+                    } else {
+                        X = x_inf + (X - x_inf) * (-dt * rate).exp();
+                    }
+                } else if (!gs.inf_vm.empty()) {
+                    // Only inf_vm (no tau_vm) — treat as INSTANT: gate = x_inf every step
+                    X = hodgkin_huxley::vm_eval_vec(gs.inf_vm, dep, fexp);
                 }
                 break;
             }
@@ -146,13 +199,19 @@ void ComposablePool::step(double dt) {
         const auto& ch = model_.channels[ci];
 
         // Gate product
-        Eigen::ArrayXd gate_prod = Eigen::ArrayXd::Ones(N_);
-        for (const auto& gp : ch.gates) {
-            int idx = gp.first;
-            int power = gp.second;
-            if (idx >= 0 && idx < static_cast<int>(ng)) {
-                for (int p = 0; p < power; ++p) {
-                    gate_prod *= gate_states_[idx];
+        Eigen::ArrayXd gate_prod;
+        if (!ch.gate_product_vm.empty()) {
+            gate_prod = hodgkin_huxley::vm_eval_gate_product_vec(
+                ch.gate_product_vm, V_, gate_states_, fexp);
+        } else {
+            gate_prod = Eigen::ArrayXd::Ones(N_);
+            for (const auto& gp : ch.gates) {
+                int idx = gp.first;
+                int power = gp.second;
+                if (idx >= 0 && idx < static_cast<int>(ng)) {
+                    for (int p = 0; p < power; ++p) {
+                        gate_prod *= gate_states_[idx];
+                    }
                 }
             }
         }
@@ -184,13 +243,19 @@ void ComposablePool::step(double dt) {
             if (ch_idx < 0 || ch_idx >= static_cast<int>(nc)) continue;
             const auto& ch = model_.channels[ch_idx];
 
-            Eigen::ArrayXd gp = Eigen::ArrayXd::Ones(N_);
-            for (const auto& gate_pair : ch.gates) {
-                int idx = gate_pair.first;
-                int power = gate_pair.second;
-                if (idx >= 0 && idx < static_cast<int>(ng)) {
-                    for (int p = 0; p < power; ++p) {
-                        gp *= gate_states_[idx];
+            Eigen::ArrayXd gp;
+            if (!ch.gate_product_vm.empty()) {
+                gp = hodgkin_huxley::vm_eval_gate_product_vec(
+                    ch.gate_product_vm, V_, gate_states_, fexp);
+            } else {
+                gp = Eigen::ArrayXd::Ones(N_);
+                for (const auto& gate_pair : ch.gates) {
+                    int idx = gate_pair.first;
+                    int power = gate_pair.second;
+                    if (idx >= 0 && idx < static_cast<int>(ng)) {
+                        for (int p = 0; p < power; ++p) {
+                            gp *= gate_states_[idx];
+                        }
                     }
                 }
             }

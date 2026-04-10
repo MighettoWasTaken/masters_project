@@ -113,7 +113,7 @@ class TestHHDrivesIZInNetwork:
 
     def test_exponential_synapse_drives_iz(self):
         """HH→IZ via exponential synapse: IZ must fire."""
-        pre_t, post_t = self._setup(SynapseSpec.exponential(E_syn=0.0, tau=5.0))
+        pre_t, post_t = self._setup(SynapseSpec.exponential(5.0))
         assert firing_rate_hz(pre_t, 500.0) > 10.0, "HH pre must fire"
         assert count_spikes(post_t) > 0, (
             f"IZ post silent with exp synapse weight={self.WEIGHT} "
@@ -121,7 +121,7 @@ class TestHHDrivesIZInNetwork:
 
     def test_alpha_synapse_drives_iz(self):
         """HH→IZ via alpha synapse: IZ must fire."""
-        pre_t, post_t = self._setup(SynapseSpec.alpha(0.0, 5.0))
+        pre_t, post_t = self._setup(SynapseSpec.alpha_function(5.0))
         assert firing_rate_hz(pre_t, 500.0) > 10.0, "HH pre must fire"
         assert count_spikes(post_t) > 0, (
             f"IZ post silent with alpha synapse weight={self.WEIGHT} "
@@ -129,7 +129,7 @@ class TestHHDrivesIZInNetwork:
 
     def test_double_exp_synapse_drives_iz(self):
         """HH→IZ via double-exponential synapse: IZ must fire."""
-        pre_t, post_t = self._setup(SynapseSpec.double_exponential(0.0, 0.5, 5.0))
+        pre_t, post_t = self._setup(SynapseSpec.double_exponential(0.5, 5.0))
         assert firing_rate_hz(pre_t, 500.0) > 10.0, "HH pre must fire"
         assert count_spikes(post_t) > 0, (
             f"IZ post silent with double_exp synapse weight={self.WEIGHT} "
@@ -146,7 +146,7 @@ class TestHHDrivesIZInNetwork:
         rn_syn.add_population("Drive", 1, model=NeuronModelSpec.hh_default())
         rn_syn.add_population("Post", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
         rn_syn.connect("Drive", "Post", "all_to_all", weight=self.WEIGHT,
-                       synapse=SynapseSpec.alpha(0.0, 5.0))
+                       synapse=SynapseSpec.alpha_function(5.0))
         result_syn = rn_syn.simulate(duration, dt, {"Drive": 10.0})
 
         rn_ctrl = RegionalNetwork()
@@ -187,7 +187,7 @@ class TestRegionalNetworkHHDrivesIZ:
         return drive_traces, target_traces, duration
 
     def test_alpha_synapse(self):
-        drive_t, target_t, dur = self._build_and_run(SynapseSpec.alpha(0.0, 5.0))
+        drive_t, target_t, dur = self._build_and_run(SynapseSpec.alpha_function(5.0))
         drive_rate  = np.mean([firing_rate_hz(drive_t[i],  dur) for i in range(self.N)])
         target_rate = np.mean([firing_rate_hz(target_t[i], dur) for i in range(self.N)])
         assert drive_rate > 10.0, f"Drive must fire, got {drive_rate:.1f} Hz"
@@ -197,7 +197,7 @@ class TestRegionalNetworkHHDrivesIZ:
 
     def test_double_exp_synapse(self):
         drive_t, target_t, dur = self._build_and_run(
-            SynapseSpec.double_exponential(0.0, 0.5, 5.0))
+            SynapseSpec.double_exponential(0.5, 5.0))
         drive_rate  = np.mean([firing_rate_hz(drive_t[i],  dur) for i in range(self.N)])
         target_rate = np.mean([firing_rate_hz(target_t[i], dur) for i in range(self.N)])
         assert drive_rate > 10.0, f"Drive must fire, got {drive_rate:.1f} Hz"
@@ -215,7 +215,7 @@ class TestRegionalNetworkHHDrivesIZ:
         rnet_syn.add_population("Drive",  self.N, model=NeuronModelSpec.hh_default())
         rnet_syn.add_population("Target", self.N, model=_iz_rs_spec())
         rnet_syn.connect("Drive", "Target", "all_to_all",
-                         weight=self.WEIGHT, synapse=SynapseSpec.alpha(0.0, 5.0))
+                         weight=self.WEIGHT, synapse=SynapseSpec.alpha_function(5.0))
         traces_syn = rnet_syn.simulate(duration, dt, {"Drive": 10.0})
         mean_syn = float(np.mean(np.array(traces_syn["Target"])))
 
@@ -257,7 +257,7 @@ class TestRegionalNetworkComposableDrivesIZ:
 
     def test_alpha_synapse_composable_to_iz(self):
         """Core replication: Composable→IZ alpha synapse must drive IZ."""
-        comp_t, iz_t, dur = self._build_and_run(SynapseSpec.alpha(0.0, 5.0))
+        comp_t, iz_t, dur = self._build_and_run(SynapseSpec.alpha_function(5.0))
         comp_rate = np.mean([firing_rate_hz(comp_t[i], dur) for i in range(self.N)])
         iz_rate   = np.mean([firing_rate_hz(iz_t[i],  dur) for i in range(self.N)])
         assert comp_rate > 10.0, f"Composable pre must fire >10 Hz, got {comp_rate:.1f}"
@@ -268,7 +268,7 @@ class TestRegionalNetworkComposableDrivesIZ:
 
     def test_double_exp_synapse_composable_to_iz(self):
         comp_t, iz_t, dur = self._build_and_run(
-            SynapseSpec.double_exponential(0.0, 0.5, 5.0))
+            SynapseSpec.double_exponential(0.5, 5.0))
         comp_rate = np.mean([firing_rate_hz(comp_t[i], dur) for i in range(self.N)])
         iz_rate   = np.mean([firing_rate_hz(iz_t[i],  dur) for i in range(self.N)])
         assert comp_rate > 10.0, f"Composable pre must fire >10 Hz, got {comp_rate:.1f}"
@@ -287,7 +287,7 @@ class TestRegionalNetworkComposableDrivesIZ:
         rnet_syn.add_population("Comp", self.N, model=make_gpe())
         rnet_syn.add_population("IZ",   self.N, model=_iz_rs_spec())
         rnet_syn.connect("Comp", "IZ", "one_to_one",
-                         weight=self.WEIGHT, synapse=SynapseSpec.alpha(0.0, 5.0))
+                         weight=self.WEIGHT, synapse=SynapseSpec.alpha_function(5.0))
         traces_syn = rnet_syn.simulate(duration, dt, {"Comp": 3.0})
         mean_syn = float(np.mean(np.array(traces_syn["IZ"])))
 
@@ -320,7 +320,7 @@ class TestIZDrivesIZ:
         rn.add_population("Pre", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
         rn.add_population("Post", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
         rn.connect("Pre", "Post", "all_to_all", weight=self.WEIGHT,
-                   synapse=SynapseSpec.alpha(0.0, 5.0))
+                   synapse=SynapseSpec.alpha_function(5.0))
         duration, dt = 500.0, 0.01
         result = rn.simulate(duration, dt, {"Pre": 10.0})
         pre_t, post_t = result["Pre"][0], result["Post"][0]
@@ -334,7 +334,7 @@ class TestIZDrivesIZ:
         rn.add_population("Pre", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
         rn.add_population("Post", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
         rn.connect("Pre", "Post", "all_to_all", weight=self.WEIGHT,
-                   synapse=SynapseSpec.double_exponential(0.0, 0.5, 5.0))
+                   synapse=SynapseSpec.double_exponential(0.5, 5.0))
         duration, dt = 500.0, 0.01
         result = rn.simulate(duration, dt, {"Pre": 10.0})
         pre_t, post_t = result["Pre"][0], result["Post"][0]
@@ -370,7 +370,7 @@ class TestCurrentMagnitudeAcrossTypes:
             rnet.add_population("Pre",  2, model=make_gpe())
             rnet.add_population("Post", 2, model=_iz_rs_spec())
             rnet.connect("Pre", "Post", "one_to_one",
-                         weight=w, synapse=SynapseSpec.alpha(0.0, 5.0))
+                         weight=w, synapse=SynapseSpec.alpha_function(5.0))
             traces = rnet.simulate(duration, dt, {"Pre": 3.0})
             means.append(float(np.mean(np.array(traces["Post"]))))
 
@@ -390,7 +390,7 @@ class TestCurrentMagnitudeAcrossTypes:
         rnet.add_population("Pre",  3, model=make_gpe())
         rnet.add_population("Post", 3, model=_iz_rs_spec())
         rnet.connect("Pre", "Post", "one_to_one",
-                     weight=0.2, synapse=SynapseSpec.alpha(0.0, 5.0))
+                     weight=0.2, synapse=SynapseSpec.alpha_function(5.0))
         duration, dt = 1000.0, 0.01
         traces = rnet.simulate(duration, dt, {"Pre": 3.0})
         post_traces = np.array(traces["Post"])
@@ -435,7 +435,7 @@ class TestDelayedSynapseToIZ:
         rn.add_population("Drive", 1, model=NeuronModelSpec.hh_default())
         rn.add_population("Post", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
         rn.connect("Drive", "Post", "all_to_all", weight=self.WEIGHT,
-                   synapse=SynapseSpec.alpha(0.0, 5.0), delay=5.0)
+                   synapse=SynapseSpec.alpha_function(5.0), delay=5.0)
         duration, dt = 500.0, 0.01
         result = rn.simulate(duration, dt, {"Drive": 10.0})
         pre_t, post_t = result["Drive"][0], result["Post"][0]
@@ -450,7 +450,7 @@ class TestDelayedSynapseToIZ:
         rn.add_population("Drive", 1, model=NeuronModelSpec.hh_default())
         rn.add_population("Post", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
         rn.connect("Drive", "Post", "all_to_all", weight=self.WEIGHT,
-                   synapse=SynapseSpec.double_exponential(0.0, 0.5, 5.0), delay=5.0)
+                   synapse=SynapseSpec.double_exponential(0.5, 5.0), delay=5.0)
         duration, dt = 500.0, 0.01
         result = rn.simulate(duration, dt, {"Drive": 10.0})
         pre_t, post_t = result["Drive"][0], result["Post"][0]
@@ -466,7 +466,7 @@ class TestDelayedSynapseToIZ:
         rnet.add_population("CTX_e", 3, model=_iz_rs_spec())
         rnet.connect("TH", "CTX_e", "one_to_one",
                      weight=self.WEIGHT,
-                     synapse=SynapseSpec.alpha(0.0, 5.0),
+                     synapse=SynapseSpec.alpha_function(5.0),
                      delay=5.0)
         duration, dt = 1000.0, 0.01
         traces = rnet.simulate(duration, dt, {"TH": 3.0})
@@ -510,7 +510,7 @@ class TestDelayedSynapseToIZ:
         rn.add_population("Post", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
         # Very strong weight so the post WOULD fire quickly if no delay
         rn.connect("Drive", "Post", "all_to_all", weight=5.0,
-                   synapse=SynapseSpec.alpha(0.0, 5.0), delay=delay)
+                   synapse=SynapseSpec.alpha_function(5.0), delay=delay)
 
         result = rn.simulate(duration, dt, {"Drive": np.array(I_pre)})
         pre_t  = result["Drive"][0]
@@ -537,7 +537,7 @@ class TestDelayedSynapseToIZ:
             rn.add_population("Drive", 1, model=NeuronModelSpec.hh_default())
             rn.add_population("Post", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
             rn.connect("Drive", "Post", "all_to_all", weight=self.WEIGHT,
-                       synapse=SynapseSpec.alpha(0.0, 5.0), delay=delay_ms)
+                       synapse=SynapseSpec.alpha_function(5.0), delay=delay_ms)
             result = rn.simulate(duration, dt, {"Drive": 10.0})
             post_trace = result["Post"][0]
             # Find first upward crossing of 0 mV in post trace
@@ -566,7 +566,7 @@ class TestDelayedSynapseToIZ:
         rn.add_population("Drive", 1, model=NeuronModelSpec.hh_default())
         rn.add_population("Post", 1, model=NeuronModelSpec.izhikevich(IzhikevichType.REGULAR_SPIKING))
         rn.connect("Drive", "Post", "all_to_all", weight=self.WEIGHT,
-                   synapse=SynapseSpec.alpha(0.0, 5.0), delay=delay_ms)
+                   synapse=SynapseSpec.alpha_function(5.0), delay=delay_ms)
         duration, dt = 600.0, 0.01
         result = rn.simulate(duration, dt, {"Drive": 10.0})
         pre_t, post_t = result["Drive"][0], result["Post"][0]
@@ -583,7 +583,7 @@ class TestDelayedSynapseToIZ:
         rnet.add_population("Post", 2, model=_iz_rs_spec())
         rnet.connect("Pre", "Post", "one_to_one",
                      weight=self.WEIGHT,
-                     synapse=SynapseSpec.alpha(0.0, 5.0),
+                     synapse=SynapseSpec.alpha_function(5.0),
                      delay=delay_ms)
         duration, dt = 600.0, 0.01
         traces = rnet.simulate(duration, dt, {"Pre": 3.0})
@@ -669,7 +669,7 @@ class TestSpikeStatsRecordingWithIZ:
         rnet.add_population("CTX_e", 4, model=_iz_rs_spec())
         rnet.connect("TH", "CTX_e", "one_to_one",
                      weight=self.WEIGHT,
-                     synapse=SynapseSpec.alpha(0.0, 5.0))
+                     synapse=SynapseSpec.alpha_function(5.0))
         result = rnet.simulate(self.DURATION, self.DT, {"TH": 3.0},
                                record=RecordingConfig.spike_stats())
         th_counts  = result["TH"]["spike_count"]
@@ -697,7 +697,7 @@ class TestSpikeStatsRecordingWithIZ:
         rnet.add_population("CTX_e", 4, model=_iz_rs_spec())
         rnet.connect("TH", "CTX_e", "one_to_one",
                      weight=self.WEIGHT,
-                     synapse=SynapseSpec.alpha(0.0, 5.0),
+                     synapse=SynapseSpec.alpha_function(5.0),
                      delay=5.0)
         result = rnet.simulate(self.DURATION, self.DT, {"TH": 3.0},
                                record=RecordingConfig.spike_stats())
@@ -739,9 +739,9 @@ class TestSpikeStatsRecordingWithIZ:
         rnet.add_population("CTX_e", 2, model=_iz_rs_spec())
         rnet.add_population("CTX_i", 2, model=_iz_fs_spec())
         rnet.connect("TH", "CTX_e", "one_to_one",
-                     weight=self.WEIGHT, synapse=SynapseSpec.alpha(0.0, 5.0))
+                     weight=self.WEIGHT, synapse=SynapseSpec.alpha_function(5.0))
         rnet.connect("CTX_e", "CTX_i", "one_to_one",
-                     weight=0.5, synapse=SynapseSpec.alpha(0.0, 5.0))
+                     weight=0.5, synapse=SynapseSpec.alpha_function(5.0))
         result = rnet.simulate(self.DURATION, self.DT,
                                {"TH": 3.0, "CTX_e": 0.0, "CTX_i": 0.0},
                                record=RecordingConfig.spike_stats())

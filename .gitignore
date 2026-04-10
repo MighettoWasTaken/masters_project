@@ -1,5 +1,6 @@
 # Build directories
 build/
+build_ide/
 _build/
 dist/
 *.egg-info/
@@ -20,9 +21,18 @@ pip-wheel-metadata/
 # IDE
 .idea/
 .vscode/
+.zed/
 *.swp
 *.swo
 *~
+
+# Clangd / compile commands (machine-local paths)
+.clangd
+gen_compile_commands.bat
+gen_compile_commands.ps1
+
+# Pyright (contains machine-local Python paths)
+pyrightconfig.json
 
 # CMake
 CMakeCache.txt

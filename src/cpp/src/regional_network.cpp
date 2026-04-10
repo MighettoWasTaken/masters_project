@@ -7,34 +7,6 @@
 namespace hodgkin_huxley {
 
 // =============================================================================
-// SynapseSpec factories
-// =============================================================================
-
-SynapseSpec SynapseSpec::ampa() {
-    return {Type::DOUBLE_EXPONENTIAL, 0.0, 0.0, 0.5, 2.5};
-}
-
-SynapseSpec SynapseSpec::nmda() {
-    return {Type::DOUBLE_EXPONENTIAL, 0.0, 0.0, 2.0, 67.0};
-}
-
-SynapseSpec SynapseSpec::gaba_a() {
-    return {Type::DOUBLE_EXPONENTIAL, -80.0, 0.0, 0.4, 7.7};
-}
-
-SynapseSpec SynapseSpec::exponential(double E_syn, double tau) {
-    return {Type::EXPONENTIAL, E_syn, tau, 0.0, 0.0};
-}
-
-SynapseSpec SynapseSpec::alpha(double E_syn, double tau) {
-    return {Type::ALPHA, E_syn, tau, 0.0, 0.0};
-}
-
-SynapseSpec SynapseSpec::double_exponential(double E_syn, double tau_rise, double tau_decay) {
-    return {Type::DOUBLE_EXPONENTIAL, E_syn, 0.0, tau_rise, tau_decay};
-}
-
-// =============================================================================
 // WeightDistribution
 // =============================================================================
 
@@ -187,26 +159,6 @@ void RegionalNetwork::reset() { net_.reset(); }
 Network& RegionalNetwork::network() { return net_; }
 const Network& RegionalNetwork::network() const { return net_; }
 
-// =============================================================================
-// Synapse creation from spec
-// =============================================================================
-
-void RegionalNetwork::add_synapse_from_spec(size_t pre, size_t post,
-                                            double weight, const SynapseSpec& spec,
-                                            double delay) {
-    switch (spec.type) {
-        case SynapseSpec::Type::EXPONENTIAL:
-            net_.add_synapse(pre, post, weight, spec.E_syn, spec.tau, delay);
-            break;
-        case SynapseSpec::Type::ALPHA:
-            net_.add_alpha_synapse(pre, post, weight, spec.E_syn, spec.tau, delay);
-            break;
-        case SynapseSpec::Type::DOUBLE_EXPONENTIAL:
-            net_.add_double_exp_synapse(pre, post, weight, spec.E_syn,
-                                        spec.tau_rise, spec.tau_decay, delay);
-            break;
-    }
-}
 
 // =============================================================================
 // Single connection (for Python custom patterns)
@@ -230,7 +182,7 @@ void RegionalNetwork::add_connection(const std::string& src, size_t src_local,
     }
     size_t pre = src_pop.start_idx + src_local;
     size_t post = dst_pop.start_idx + dst_local;
-    add_synapse_from_spec(pre, post, weight, synapse, delay);
+    net_.add_synapse(pre, post, weight, synapse, delay);
 }
 
 // =============================================================================
@@ -239,7 +191,7 @@ void RegionalNetwork::add_connection(const std::string& src, size_t src_local,
 
 void RegionalNetwork::add_kinetic_connection(const std::string& src, size_t i,
                                               const std::string& dst, size_t j,
-                                              double weight, const KineticSynapseSpec& spec,
+                                              double weight, const SynapseSpec& spec,
                                               double delay) {
     const auto& src_pop = population(src);
     const auto& dst_pop = population(dst);
@@ -300,7 +252,7 @@ void RegionalNetwork::generate_connections(
                     size_t pre = src.start_idx + i;
                     size_t post = dst.start_idx + j;
                     if (!allow_self && same_pop && i == j) continue;
-                    add_synapse_from_spec(pre, post, weight.sample(rng), synapse, delay);
+                    net_.add_synapse(pre, post, weight.sample(rng), synapse, delay);
                 }
             }
             break;
@@ -313,7 +265,7 @@ void RegionalNetwork::generate_connections(
                     dst.name + "': " + std::to_string(dst.count) + ")");
             }
             for (size_t k = 0; k < src.count; ++k) {
-                add_synapse_from_spec(src.start_idx + k, dst.start_idx + k,
+                net_.add_synapse(src.start_idx + k, dst.start_idx + k,
                                       weight.sample(rng), synapse, delay);
             }
             break;
@@ -328,7 +280,7 @@ void RegionalNetwork::generate_connections(
             int n = static_cast<int>(dst.count);
             for (size_t k = 0; k < src.count; ++k) {
                 int dst_k = (static_cast<int>(k) + ((shift % n) + n)) % n;
-                add_synapse_from_spec(src.start_idx + k,
+                net_.add_synapse(src.start_idx + k,
                                       dst.start_idx + static_cast<size_t>(dst_k),
                                       weight.sample(rng), synapse, delay);
             }
@@ -340,7 +292,7 @@ void RegionalNetwork::generate_connections(
                 for (size_t j = 0; j < dst.count; ++j) {
                     if (!allow_self && same_pop && i == j) continue;
                     if (coin(rng) < probability) {
-                        add_synapse_from_spec(src.start_idx + i, dst.start_idx + j,
+                        net_.add_synapse(src.start_idx + i, dst.start_idx + j,
                                               weight.sample(rng), synapse, delay);
                     }
                 }
@@ -358,7 +310,7 @@ void RegionalNetwork::generate_connections(
             std::iota(perm.begin(), perm.end(), 0);
             std::shuffle(perm.begin(), perm.end(), rng);
             for (size_t k = 0; k < src.count; ++k) {
-                add_synapse_from_spec(src.start_idx + k,
+                net_.add_synapse(src.start_idx + k,
                                       dst.start_idx + perm[k],
                                       weight.sample(rng), synapse, delay);
             }

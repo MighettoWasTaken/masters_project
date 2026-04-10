@@ -222,4 +222,249 @@ inline Eigen::ArrayXd compute_rate_vec(const Eigen::ArrayXd& V, const RateFuncPa
     return Eigen::ArrayXd::Zero(N);
 }
 
+// =============================================================================
+// Bytecode VM evaluators — interpret VmExpr programs compiled from SymPy trees
+// =============================================================================
+
+// tmp_fast_exp: when non-null, EXP opcodes use fast_exp() instead of Eigen's .exp().
+// Pass the pool's pre-allocated tmp_exp_r_ buffer; leave null for scalar / low-N cases.
+inline Eigen::ArrayXd vm_eval_vec(const VmExpr& prog, const Eigen::ArrayXd& dep,
+                                   Eigen::ArrayXd* tmp_fast_exp = nullptr) {
+    const Eigen::Index N = dep.size();
+    std::vector<Eigen::ArrayXd> stk;
+    stk.reserve(8);
+    for (const auto& ins : prog.instructions) {
+        switch (ins.op) {
+            case VmOp::PUSH_DEP:   stk.push_back(dep); break;
+            case VmOp::PUSH_CONST: stk.push_back(Eigen::ArrayXd::Constant(N, prog.constants[ins.operand])); break;
+            case VmOp::ADD: { auto b=std::move(stk.back()); stk.pop_back(); stk.back()+=b; break; }
+            case VmOp::MUL: { auto b=std::move(stk.back()); stk.pop_back(); stk.back()*=b; break; }
+            case VmOp::NEG:      stk.back() = -stk.back(); break;
+            case VmOp::RCP:      stk.back() = 1.0/stk.back(); break;
+            case VmOp::POW_INT:  stk.back() = stk.back().pow(ins.operand); break;
+            case VmOp::POW_HALF: stk.back() = stk.back().sqrt(); break;
+            case VmOp::POW_GEN:  { auto e=std::move(stk.back()); stk.pop_back(); stk.back()=stk.back().pow(e); break; }
+            case VmOp::EXP:
+                if (tmp_fast_exp) { fast_exp(stk.back(), stk.back(), *tmp_fast_exp); }
+                else              { stk.back() = stk.back().exp(); }
+                break;
+            case VmOp::LOG:      stk.back() = stk.back().log();  break;
+            case VmOp::TANH:     stk.back() = stk.back().tanh(); break;
+            case VmOp::SIN:      stk.back() = stk.back().sin();  break;
+            case VmOp::COS:      stk.back() = stk.back().cos();  break;
+            case VmOp::SQRT:     stk.back() = stk.back().sqrt(); break;
+            case VmOp::ABS:      stk.back() = stk.back().abs();  break;
+        }
+    }
+    return stk.empty() ? Eigen::ArrayXd::Zero(N) : stk.back();
+}
+
+inline double vm_eval_scalar(const VmExpr& prog, double dep) {
+    std::vector<double> stk;
+    stk.reserve(8);
+    for (const auto& ins : prog.instructions) {
+        switch (ins.op) {
+            case VmOp::PUSH_DEP:   stk.push_back(dep); break;
+            case VmOp::PUSH_CONST: stk.push_back(prog.constants[ins.operand]); break;
+            case VmOp::ADD: { double b=stk.back(); stk.pop_back(); stk.back()+=b; break; }
+            case VmOp::MUL: { double b=stk.back(); stk.pop_back(); stk.back()*=b; break; }
+            case VmOp::NEG:      stk.back()=-stk.back(); break;
+            case VmOp::RCP:      stk.back()=1.0/stk.back(); break;
+            case VmOp::POW_INT:  stk.back()=std::pow(stk.back(),ins.operand); break;
+            case VmOp::POW_HALF: stk.back()=std::sqrt(stk.back()); break;
+            case VmOp::POW_GEN:  { double e=stk.back(); stk.pop_back(); stk.back()=std::pow(stk.back(),e); break; }
+            case VmOp::EXP:      stk.back()=std::exp(stk.back());  break;
+            case VmOp::LOG:      stk.back()=std::log(stk.back());  break;
+            case VmOp::TANH:     stk.back()=std::tanh(stk.back()); break;
+            case VmOp::SIN:      stk.back()=std::sin(stk.back());  break;
+            case VmOp::COS:      stk.back()=std::cos(stk.back());  break;
+            case VmOp::SQRT:     stk.back()=std::sqrt(stk.back()); break;
+            case VmOp::ABS:      stk.back()=std::abs(stk.back());  break;
+        }
+    }
+    return stk.empty() ? 0.0 : stk.back();
+}
+
+// =============================================================================
+// 2-argument VM evaluator — vectorized version of vm_eval_scalar_2arg.
+// dep  = V (or Ca) array; x_arr = current gate state array (pushed by PUSH_S).
+// Used for arbitrary gate ODEs: dx/dt = F(x, V).
+// =============================================================================
+
+inline Eigen::ArrayXd vm_eval_vec_2arg(const VmExpr& prog,
+                                        const Eigen::ArrayXd& dep,
+                                        const Eigen::ArrayXd& x_arr,
+                                        Eigen::ArrayXd* tmp_fast_exp = nullptr) {
+    const Eigen::Index N = dep.size();
+    std::vector<Eigen::ArrayXd> stk;
+    stk.reserve(8);
+    for (const auto& ins : prog.instructions) {
+        switch (ins.op) {
+            case VmOp::PUSH_DEP:   stk.push_back(dep);   break;
+            case VmOp::PUSH_CONST: stk.push_back(Eigen::ArrayXd::Constant(N, prog.constants[ins.operand])); break;
+            case VmOp::PUSH_S:     stk.push_back(x_arr); break;
+            case VmOp::ADD: { auto b=std::move(stk.back()); stk.pop_back(); stk.back()+=b; break; }
+            case VmOp::MUL: { auto b=std::move(stk.back()); stk.pop_back(); stk.back()*=b; break; }
+            case VmOp::NEG:      stk.back() = -stk.back(); break;
+            case VmOp::RCP:      stk.back() = 1.0/stk.back(); break;
+            case VmOp::POW_INT:  stk.back() = stk.back().pow(ins.operand); break;
+            case VmOp::POW_HALF: stk.back() = stk.back().sqrt(); break;
+            case VmOp::POW_GEN:  { auto e=std::move(stk.back()); stk.pop_back(); stk.back()=stk.back().pow(e); break; }
+            case VmOp::EXP:
+                if (tmp_fast_exp) { fast_exp(stk.back(), stk.back(), *tmp_fast_exp); }
+                else              { stk.back() = stk.back().exp(); }
+                break;
+            case VmOp::LOG:      stk.back() = stk.back().log();  break;
+            case VmOp::TANH:     stk.back() = stk.back().tanh(); break;
+            case VmOp::SIN:      stk.back() = stk.back().sin();  break;
+            case VmOp::COS:      stk.back() = stk.back().cos();  break;
+            case VmOp::SQRT:     stk.back() = stk.back().sqrt(); break;
+            case VmOp::ABS:      stk.back() = stk.back().abs();  break;
+            default: break;  // PUSH_GATE not applicable here
+        }
+    }
+    return stk.empty() ? Eigen::ArrayXd::Zero(N) : stk.back();
+}
+
+// =============================================================================
+// Gate-product VM evaluators — like vm_eval_* but handle PUSH_GATE opcode
+// which pushes a gate state array (pool path) or scalar (single-neuron path).
+// =============================================================================
+
+inline Eigen::ArrayXd vm_eval_gate_product_vec(
+    const VmExpr& prog,
+    const Eigen::ArrayXd& V,
+    const std::vector<Eigen::ArrayXd>& gate_states,
+    Eigen::ArrayXd* tmp_fast_exp = nullptr)
+{
+    const Eigen::Index N = V.size();
+    std::vector<Eigen::ArrayXd> stk;
+    stk.reserve(8);
+    for (const auto& ins : prog.instructions) {
+        switch (ins.op) {
+            case VmOp::PUSH_DEP:   stk.push_back(V); break;
+            case VmOp::PUSH_CONST: stk.push_back(Eigen::ArrayXd::Constant(N, prog.constants[ins.operand])); break;
+            case VmOp::PUSH_GATE:  stk.push_back(gate_states[ins.operand]); break;
+            case VmOp::ADD: { auto b=std::move(stk.back()); stk.pop_back(); stk.back()+=b; break; }
+            case VmOp::MUL: { auto b=std::move(stk.back()); stk.pop_back(); stk.back()*=b; break; }
+            case VmOp::NEG:      stk.back() = -stk.back(); break;
+            case VmOp::RCP:      stk.back() = 1.0/stk.back(); break;
+            case VmOp::POW_INT:  stk.back() = stk.back().pow(ins.operand); break;
+            case VmOp::POW_HALF: stk.back() = stk.back().sqrt(); break;
+            case VmOp::POW_GEN:  { auto e=std::move(stk.back()); stk.pop_back(); stk.back()=stk.back().pow(e); break; }
+            case VmOp::EXP:
+                if (tmp_fast_exp) { fast_exp(stk.back(), stk.back(), *tmp_fast_exp); }
+                else              { stk.back() = stk.back().exp(); }
+                break;
+            case VmOp::LOG:      stk.back() = stk.back().log();  break;
+            case VmOp::TANH:     stk.back() = stk.back().tanh(); break;
+            case VmOp::SIN:      stk.back() = stk.back().sin();  break;
+            case VmOp::COS:      stk.back() = stk.back().cos();  break;
+            case VmOp::SQRT:     stk.back() = stk.back().sqrt(); break;
+            case VmOp::ABS:      stk.back() = stk.back().abs();  break;
+        }
+    }
+    return stk.empty() ? Eigen::ArrayXd::Ones(N) : stk.back();
+}
+
+inline double vm_eval_gate_product_scalar(
+    const VmExpr& prog,
+    double V,
+    const std::vector<double>& gate_states)
+{
+    std::vector<double> stk;
+    stk.reserve(8);
+    for (const auto& ins : prog.instructions) {
+        switch (ins.op) {
+            case VmOp::PUSH_DEP:   stk.push_back(V); break;
+            case VmOp::PUSH_CONST: stk.push_back(prog.constants[ins.operand]); break;
+            case VmOp::PUSH_GATE:  stk.push_back(gate_states[ins.operand]); break;
+            case VmOp::ADD: { double b=stk.back(); stk.pop_back(); stk.back()+=b; break; }
+            case VmOp::MUL: { double b=stk.back(); stk.pop_back(); stk.back()*=b; break; }
+            case VmOp::NEG:      stk.back()=-stk.back(); break;
+            case VmOp::RCP:      stk.back()=1.0/stk.back(); break;
+            case VmOp::POW_INT:  stk.back()=std::pow(stk.back(),ins.operand); break;
+            case VmOp::POW_HALF: stk.back()=std::sqrt(stk.back()); break;
+            case VmOp::POW_GEN:  { double e=stk.back(); stk.pop_back(); stk.back()=std::pow(stk.back(),e); break; }
+            case VmOp::EXP:      stk.back()=std::exp(stk.back());  break;
+            case VmOp::LOG:      stk.back()=std::log(stk.back());  break;
+            case VmOp::TANH:     stk.back()=std::tanh(stk.back()); break;
+            case VmOp::SIN:      stk.back()=std::sin(stk.back());  break;
+            case VmOp::COS:      stk.back()=std::cos(stk.back());  break;
+            case VmOp::SQRT:     stk.back()=std::sqrt(stk.back()); break;
+            case VmOp::ABS:      stk.back()=std::abs(stk.back());  break;
+        }
+    }
+    return stk.empty() ? 1.0 : stk.back();
+}
+
+// =============================================================================
+// Kinetic-synapse VM evaluator — like vm_eval_scalar but handles PUSH_S.
+// dep  = V_pre  (for dS_dt expressions)  or  V_post  (for current expressions)
+// S    = current value of the synapse gating variable
+// =============================================================================
+
+inline double vm_eval_scalar_2arg(const VmExpr& prog, double dep, double S) {
+    std::vector<double> stk;
+    stk.reserve(8);
+    for (const auto& ins : prog.instructions) {
+        switch (ins.op) {
+            case VmOp::PUSH_DEP:   stk.push_back(dep); break;
+            case VmOp::PUSH_CONST: stk.push_back(prog.constants[ins.operand]); break;
+            case VmOp::PUSH_S:     stk.push_back(S);   break;
+            case VmOp::ADD: { double b=stk.back(); stk.pop_back(); stk.back()+=b; break; }
+            case VmOp::MUL: { double b=stk.back(); stk.pop_back(); stk.back()*=b; break; }
+            case VmOp::NEG:      stk.back()=-stk.back(); break;
+            case VmOp::RCP:      stk.back()=1.0/stk.back(); break;
+            case VmOp::POW_INT:  stk.back()=std::pow(stk.back(),ins.operand); break;
+            case VmOp::POW_HALF: stk.back()=std::sqrt(stk.back()); break;
+            case VmOp::POW_GEN:  { double e=stk.back(); stk.pop_back(); stk.back()=std::pow(stk.back(),e); break; }
+            case VmOp::EXP:      stk.back()=std::exp(stk.back());  break;
+            case VmOp::LOG:      stk.back()=std::log(stk.back());  break;
+            case VmOp::TANH:     stk.back()=std::tanh(stk.back()); break;
+            case VmOp::SIN:      stk.back()=std::sin(stk.back());  break;
+            case VmOp::COS:      stk.back()=std::cos(stk.back());  break;
+            case VmOp::SQRT:     stk.back()=std::sqrt(stk.back()); break;
+            case VmOp::ABS:      stk.back()=std::abs(stk.back());  break;
+            default: break;  // PUSH_GATE not applicable here
+        }
+    }
+    return stk.empty() ? 0.0 : stk.back();
+}
+
+// =============================================================================
+// 3-argument VM evaluator — like vm_eval_scalar_2arg but also handles PUSH_A.
+// dep  = V_pre (or V_post for current); S = primary gating var; A = auxiliary.
+// Used for 2-variable novel synapse ODEs and current expressions.
+// =============================================================================
+
+inline double vm_eval_scalar_3arg(const VmExpr& prog, double dep, double S, double A) {
+    std::vector<double> stk;
+    stk.reserve(8);
+    for (const auto& ins : prog.instructions) {
+        switch (ins.op) {
+            case VmOp::PUSH_DEP:   stk.push_back(dep); break;
+            case VmOp::PUSH_CONST: stk.push_back(prog.constants[ins.operand]); break;
+            case VmOp::PUSH_S:     stk.push_back(S);   break;
+            case VmOp::PUSH_A:     stk.push_back(A);   break;
+            case VmOp::ADD: { double b=stk.back(); stk.pop_back(); stk.back()+=b; break; }
+            case VmOp::MUL: { double b=stk.back(); stk.pop_back(); stk.back()*=b; break; }
+            case VmOp::NEG:      stk.back()=-stk.back(); break;
+            case VmOp::RCP:      stk.back()=1.0/stk.back(); break;
+            case VmOp::POW_INT:  stk.back()=std::pow(stk.back(),ins.operand); break;
+            case VmOp::POW_HALF: stk.back()=std::sqrt(stk.back()); break;
+            case VmOp::POW_GEN:  { double e=stk.back(); stk.pop_back(); stk.back()=std::pow(stk.back(),e); break; }
+            case VmOp::EXP:      stk.back()=std::exp(stk.back());  break;
+            case VmOp::LOG:      stk.back()=std::log(stk.back());  break;
+            case VmOp::TANH:     stk.back()=std::tanh(stk.back()); break;
+            case VmOp::SIN:      stk.back()=std::sin(stk.back());  break;
+            case VmOp::COS:      stk.back()=std::cos(stk.back());  break;
+            case VmOp::SQRT:     stk.back()=std::sqrt(stk.back()); break;
+            case VmOp::ABS:      stk.back()=std::abs(stk.back());  break;
+            default: break;  // PUSH_GATE not applicable here
+        }
+    }
+    return stk.empty() ? 0.0 : stk.back();
+}
+
 } // namespace hodgkin_huxley

@@ -3,7 +3,7 @@
 #include "hodgkin_huxley/neuron_base.hpp"
 #include "hodgkin_huxley/neuron.hpp"
 #include "hodgkin_huxley/izhikevich.hpp"
-#include "hodgkin_huxley/synapse.hpp"
+#include "hodgkin_huxley/synapse_base.hpp"
 #include "hodgkin_huxley/hh_pool.hpp"
 #include "hodgkin_huxley/iz_pool.hpp"
 #include "hodgkin_huxley/composable_neuron.hpp"
@@ -47,14 +47,12 @@ struct StimPlan {
 };
 
 /**
- * @brief Network of neurons with polymorphic neuron support
+ * @brief Network of neurons connected by synapses.
  *
- * Allows simulation of interconnected neurons (HH, Izhikevich, or mixed)
- * with synaptic connections.
- *
- * Synapse data is stored in Structure-of-Arrays (SoA) layout for
- * cache-friendly inner loops. The polymorphic synapse objects are kept
- * only for API access (synapse() getter).
+ * All synapse update logic is centralised in update_synapses_grouped().
+ * Synapse state is stored in SynArrays (Structure-of-Arrays) for cache-
+ * friendly inner loops.  SynapseBase objects provide a read-only view for
+ * API access; they are always in sync (no lazy copy needed).
  */
 class Network {
 public:
@@ -87,48 +85,44 @@ public:
     Network(Network&&) = default;
     Network& operator=(Network&&) = default;
 
-    /**
-     * @brief Create network with N HH neurons (backward compatible)
-     */
     explicit Network(size_t num_neurons);
-
-    /**
-     * @brief Create network with N neurons of specified type
-     */
     Network(size_t num_neurons, NeuronType type);
 
+    // -------------------------------------------------------------------------
     // Add neurons
-    size_t add_neuron();  // Add default HH neuron
+    // -------------------------------------------------------------------------
+    size_t add_neuron();
     size_t add_neuron(const HHNeuron::Parameters& params);
     size_t add_neuron(NeuronType type);
     size_t add_neuron(const IzhikevichNeuron::Parameters& params);
     size_t add_neuron(const NeuronModelSpec& spec);
 
-    /**
-     * @brief Add a neuron with explicit type specification
-     */
     size_t add_hh_neuron();
     size_t add_hh_neuron(const HHNeuron::Parameters& params);
     size_t add_izhikevich_neuron(IzhikevichNeuron::Type type = IzhikevichNeuron::Type::REGULAR_SPIKING);
     size_t add_izhikevich_neuron(const IzhikevichNeuron::Parameters& params);
 
-    // Add kinetic synapse
-    size_t add_kinetic_synapse(size_t pre, size_t post, double weight,
-                               const KineticSynapseSpec& spec, double delay = 0.0);
+    // -------------------------------------------------------------------------
+    // Add synapses — unified interface
+    // -------------------------------------------------------------------------
 
-    // Add synaptic connections
+    /// Primary method: add a synapse described by a SynapseSpec.
+    size_t add_synapse(size_t pre, size_t post, double weight,
+                       const SynapseSpec& spec, double delay = 0.0);
+
+    // Backward-compatible convenience wrappers — delegate to add_synapse()
     void add_synapse(size_t pre_idx, size_t post_idx, double weight,
-                     double E_syn = 0.0, double tau = 2.0,
-                     double delay = 0.0);
+                     double E_syn = 0.0, double tau = 2.0, double delay = 0.0);
     void add_alpha_synapse(size_t pre_idx, size_t post_idx, double weight,
-                           double E_syn = 0.0, double tau = 2.0,
-                           double delay = 0.0);
+                           double E_syn = 0.0, double tau = 2.0, double delay = 0.0);
     void add_double_exp_synapse(size_t pre_idx, size_t post_idx, double weight,
                                 double E_syn = 0.0,
                                 double tau_rise = 0.4, double tau_decay = 2.5,
                                 double delay = 0.0);
+    size_t add_kinetic_synapse(size_t pre, size_t post, double weight,
+                               const SynapseSpec& spec, double delay = 0.0);
 
-    // Receptor-type convenience methods (double-exponential with preset kinetics)
+    // Receptor-type convenience methods
     void add_ampa_synapse(size_t pre_idx, size_t post_idx, double weight,
                           double delay = 0.0);
     void add_nmda_synapse(size_t pre_idx, size_t post_idx, double weight,
@@ -138,78 +132,41 @@ public:
     void add_receptor_synapse(size_t pre_idx, size_t post_idx, double weight,
                               ReceptorType receptor, double delay = 0.0);
 
+    // -------------------------------------------------------------------------
     // Getters
-    [[nodiscard]] size_t num_neurons() const { return neurons_.size(); }
+    // -------------------------------------------------------------------------
+    [[nodiscard]] size_t num_neurons()  const { return neurons_.size(); }
     [[nodiscard]] size_t num_synapses() const { return synapses_.size(); }
 
-    // Kinetic synapse state accessor (for testing / inspection)
     [[nodiscard]] double get_kin_S(size_t synapse_idx) const;
     [[nodiscard]] double get_kin_g(size_t synapse_idx) const;
 
-    /**
-     * @brief Get neuron by index (polymorphic access)
-     */
     [[nodiscard]] const NeuronBase& neuron(size_t idx) const { return *neurons_[idx]; }
-    [[nodiscard]] NeuronBase& neuron(size_t idx) { return *neurons_[idx]; }
-
-    /**
-     * @brief Get neuron as HH (throws if wrong type)
-     */
-    [[nodiscard]] const HHNeuron& hh_neuron(size_t idx) const;
-    [[nodiscard]] HHNeuron& hh_neuron(size_t idx);
-
-    /**
-     * @brief Get neuron as Izhikevich (throws if wrong type)
-     */
+    [[nodiscard]] NeuronBase&       neuron(size_t idx)       { return *neurons_[idx]; }
+    [[nodiscard]] const HHNeuron&   hh_neuron(size_t idx) const;
+    [[nodiscard]] HHNeuron&         hh_neuron(size_t idx);
     [[nodiscard]] const IzhikevichNeuron& iz_neuron(size_t idx) const;
-    [[nodiscard]] IzhikevichNeuron& iz_neuron(size_t idx);
-
-    /**
-     * @brief Get neuron type name
-     */
+    [[nodiscard]] IzhikevichNeuron&       iz_neuron(size_t idx);
     [[nodiscard]] std::string neuron_type(size_t idx) const { return neurons_[idx]->type_name(); }
 
-    /**
-     * @brief Get synapse by index (lazy-syncs conductance from SoA)
-     */
     [[nodiscard]] const SynapseBase& synapse(size_t idx) const;
 
-    // Fast math toggle (affects exp() in HH pool — ~8 digits vs full precision)
     void set_fast_math(bool enabled) { fast_math_ = enabled; }
     [[nodiscard]] bool fast_math() const { return fast_math_; }
 
-    // Get all membrane potentials
     [[nodiscard]] std::vector<double> get_potentials() const;
 
-    // Reset all neurons
     void reset();
-
-    // Step the entire network
     void step(double dt, const std::vector<double>& I_ext);
 
-    // Simulate network, returns matrix of voltage traces (neurons x time)
     std::vector<std::vector<double>> simulate(
-        double duration,
-        double dt,
-        const std::vector<std::vector<double>>& I_ext
-    );
+        double duration, double dt,
+        const std::vector<std::vector<double>>& I_ext);
 
-    // Max number of gate variables across all composable neurons
     size_t max_gate_count() const;
-
-    // Flat synapse pre/post index vectors
     std::vector<size_t> get_synapse_pre_indices()  const;
     std::vector<size_t> get_synapse_post_indices() const;
 
-    // Fill caller-allocated numpy buffers during simulation.
-    // Any buffer pointer may be nullptr to skip that metric.
-    // Buffer shapes (all C-contiguous, pre-allocated by Python):
-    //   V_buf:       (n_neurons, n_rec)
-    //   gate_buf:    (n_neurons, max_gates, n_rec)
-    //   calcium_buf: (n_neurons, n_rec)
-    //   u_buf:       (n_neurons, n_rec) — Izhikevich recovery variable; 0 for non-Iz neurons
-    //   g_syn_buf:   (n_synapses, n_rec)
-    //   I_syn_buf:   (n_neurons, n_rec)
     void simulate_into_buffers(
         double duration, double dt,
         const std::vector<std::vector<double>>& I_ext,
@@ -219,15 +176,12 @@ public:
         double* u_buf,
         double* g_syn_buf,
         double* I_syn_buf,
-        double* spike_event_buf,  // (n_neurons, n_rec): synapse-detected spike counts per interval
+        double* spike_event_buf,
         size_t  interval,
         size_t  n_rec,
         double  spike_threshold = 0.0
     );
 
-    // Like simulate_into_buffers() but reads external current from compact
-    // descriptors rather than a dense (n_neurons × n_steps) matrix.
-    // Eliminates the large I_ext allocation for scalar/pulse/DBS-only inputs.
     void simulate_with_descriptors(
         double duration, double dt,
         const StimPlan& stim,
@@ -245,106 +199,86 @@ public:
 
 private:
     std::vector<std::unique_ptr<NeuronBase>> neurons_;
-    std::vector<std::unique_ptr<SynapseBase>> synapses_;  // API access only
+    std::vector<SynapseBase> synapses_;   // lightweight views — always in sync
 
     // =========================================================================
-    // Structure-of-Arrays (SoA) synapse data for cache-friendly inner loops.
-    // Eliminates pointer chasing and enables SIMD auto-vectorization.
+    // Structure-of-Arrays synapse data (all types unified)
     // =========================================================================
-    enum class SynType : uint8_t { SYN_EXP = 0, SYN_ALPHA = 1, SYN_DEXP = 2, SYN_KINETIC = 3 };
-
     struct SynArrays {
-        // Common fields (all synapse types)
-        std::vector<size_t> pre;
-        std::vector<size_t> post;
-        std::vector<double> weight;
-        std::vector<double> E_syn;
-        std::vector<double> g;          // mutable conductance
-
-        std::vector<SynType> type;
-
-        // Spike detection
+        // Common
+        std::vector<size_t> pre, post;
+        std::vector<double> weight, E_syn, g;
         std::vector<double> V_pre_prev;
-
-        // Delay
         std::vector<double> delay;
         std::vector<std::vector<bool>> spike_buf;
         std::vector<size_t> buf_head;
-        std::vector<bool> delay_init;
+        std::vector<bool>   delay_init;
 
-        // Exponential-specific
-        std::vector<double> exp_tau;
-        std::vector<double> exp_decay;  // cached exp(-dt/tau)
+        // Unified state (all types)
+        std::vector<double> S;           // primary gating / conductance variable
+        std::vector<double> A;           // auxiliary variable (0 if unused)
+        std::vector<double> delta_S;     // on-spike additive increment for S
+        std::vector<double> delta_A;     // on-spike additive increment for A
+        std::vector<double> tau_S;       // S time constant (EXP_DECAY, DOUBLE_EXP)
+        std::vector<double> tau_A;       // A time constant (ALPHA_FUNC, DOUBLE_EXP)
+        std::vector<double> inv_tau_A;   // 1/tau_A cached (ALPHA_FUNC Euler)
+        std::vector<double> norm;        // DOUBLE_EXP peak normalization
+        std::vector<double> decay_S;     // cached exp(-dt/tau_S)
+        std::vector<double> decay_A;     // cached exp(-dt/tau_A)
 
-        // Alpha-specific
-        std::vector<double> alpha_x;
-        std::vector<double> alpha_inv_tau;
-
-        // Double-exponential-specific
-        std::vector<double> dexp_g_rise;
-        std::vector<double> dexp_g_decay;
-        std::vector<double> dexp_tau_rise;
-        std::vector<double> dexp_tau_decay;
-        std::vector<double> dexp_rise_decay;  // cached exp(-dt/tau_rise)
-        std::vector<double> dexp_fall_decay;  // cached exp(-dt/tau_decay)
-        std::vector<double> dexp_norm;
-
-        // Kinetic-specific
-        std::vector<double> kin_S;           // gating variable (0 for non-kinetic)
-        std::vector<size_t> kin_spec_idx;    // index into Network::kinetic_specs_
+        std::vector<size_t> spec_idx;    // index into Network::synapse_specs_
 
         double cached_dt = -1.0;
         size_t size() const { return pre.size(); }
 
-        // Push default values for all type-specific fields
-        void push_type_defaults() {
-            exp_tau.push_back(0.0);
-            exp_decay.push_back(0.0);
-            alpha_x.push_back(0.0);
-            alpha_inv_tau.push_back(0.0);
-            dexp_g_rise.push_back(0.0);
-            dexp_g_decay.push_back(0.0);
-            dexp_tau_rise.push_back(0.0);
-            dexp_tau_decay.push_back(0.0);
-            dexp_rise_decay.push_back(0.0);
-            dexp_fall_decay.push_back(0.0);
-            dexp_norm.push_back(0.0);
-            kin_S.push_back(0.0);
-            kin_spec_idx.push_back(0);
+        void push_defaults() {
+            S.push_back(0.0);
+            A.push_back(0.0);
+            delta_S.push_back(0.0);
+            delta_A.push_back(0.0);
+            tau_S.push_back(0.0);
+            tau_A.push_back(0.0);
+            inv_tau_A.push_back(0.0);
+            norm.push_back(1.0);
+            decay_S.push_back(0.0);
+            decay_A.push_back(0.0);
+            spec_idx.push_back(0);
         }
     } sa_;
 
+public:
+    // -------------------------------------------------------------------------
+    // SoA accessor for SynapseBase view (called from SynapseBase member fns)
+    // -------------------------------------------------------------------------
+    [[nodiscard]] const SynArrays& syn_arrays() const { return sa_; }
+    [[nodiscard]] const SynapseSpec& synapse_spec(size_t spec_idx) const {
+        return synapse_specs_[spec_idx];
+    }
+
+private:
     // Pre-allocated working buffers
     std::vector<double> I_syn_buffer_;
     std::vector<double> V_cache_;
 
-    // Type-separated synapse index lists for branch-free inner loops
+    // UpdateForm-based synapse groups for branch-free inner loops
     struct SynapseGroups {
-        std::vector<size_t> exp;
-        std::vector<size_t> alpha;
-        std::vector<size_t> dexp;
-        std::vector<size_t> kinetic;
+        std::vector<size_t> exp_decay;      // EXP_DECAY
+        std::vector<size_t> alpha_func;     // ALPHA_FUNC
+        std::vector<size_t> double_exp;     // DOUBLE_EXP
+        std::vector<size_t> voltage_gated;  // TANH_GATE, BOLTZMANN_GATE, ALPHA_BETA, CUSTOM_EXPR
     } syn_groups_;
-    std::vector<uint8_t> spike_detected_;  // per-synapse spike flag buffer
+    std::vector<uint8_t> spike_detected_;
 
-    // Kinetic synapse specs (deduped by name)
-    std::vector<KineticSynapseSpec> kinetic_specs_;
+    // Synapse specs (deduped by name)
+    std::vector<SynapseSpec> synapse_specs_;
 
-    // Use fast polynomial exp approximation (~8 digits) vs Eigen's built-in
     bool fast_math_ = true;
-
-    // Spike threshold for pre-synaptic spike detection.
-    // Set by simulate_into_buffers() before the hot loop; default 0.0 (classic HH peak).
     double spike_threshold_ = 0.0;
 
-    // Lazy sync: SoA is source of truth during simulation
     mutable bool soa_dirty_ = false;
     bool soa_sorted_ = false;
-
     bool groups_built_ = false;
 
-    // Batched neuron pools — owned across simulate() calls for task20 continuable sims.
-    // pools_dirty_ = true forces rebuild from API neuron state on next simulate().
     PoolManager pool_mgr_;
     bool pools_dirty_ = true;
 
@@ -354,7 +288,6 @@ private:
     void update_synapses_grouped(double dt);
     void update_decay_factors(double dt);
     void build_synapse_groups();
-    void sync_soa_to_objects() const;
     void sort_synapses_by_pre();
 };
 

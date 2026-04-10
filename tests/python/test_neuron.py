@@ -246,7 +246,7 @@ class TestNetwork:
         rn.add_population("pre", 1)
         rn.add_population("post", 1)
         rn.connect("pre", "post", "all_to_all", weight=0.5,
-                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0))
         assert rn.num_synapses == 1
 
     def test_get_potentials(self):
@@ -296,7 +296,7 @@ class TestNetwork:
         rn.add_population("pre", 1)
         rn.add_population("post", 1)
         rn.connect("pre", "post", "all_to_all", weight=2.0,
-                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0))
 
         result = rn.simulate(200.0, 0.01, {"pre": 15.0, "post": 0.0})
         assert np.max(result["pre"][0]) > 0.0  # pre neuron spikes
@@ -310,7 +310,7 @@ class TestNetworkEdgeCases:
         rn = RegionalNetwork()
         rn.add_population("E", 1)
         rn.connect("E", "E", lambda ns, nd: [(0, 0)], weight=0.1,
-                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0))
         assert rn.num_synapses == 1
 
     def test_multiple_synapses_same_pair(self):
@@ -319,9 +319,9 @@ class TestNetworkEdgeCases:
         rn.add_population("pre", 1)
         rn.add_population("post", 1)
         rn.connect("pre", "post", "all_to_all", weight=0.5,
-                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0))
         rn.connect("pre", "post", "all_to_all", weight=0.3,
-                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0))
         assert rn.num_synapses == 2
 
     def test_bidirectional_synapses(self):
@@ -330,9 +330,9 @@ class TestNetworkEdgeCases:
         rn.add_population("A", 1)
         rn.add_population("B", 1)
         rn.connect("A", "B", "all_to_all", weight=0.5,
-                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0))
         rn.connect("B", "A", "all_to_all", weight=0.5,
-                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0))
         assert rn.num_synapses == 2
 
     def test_inhibitory_synapse(self):
@@ -341,7 +341,7 @@ class TestNetworkEdgeCases:
         rn.add_population("pre", 1)
         rn.add_population("post", 1)
         rn.connect("pre", "post", "all_to_all", weight=1.0,
-                   synapse=SynapseSpec.exponential(E_syn=-80.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0, E_syn=-80.0))
 
         result = rn.simulate(100.0, 0.01, {"pre": 15.0, "post": 10.0})
         assert not np.any(np.isnan(result["pre"]))
@@ -354,7 +354,7 @@ class TestNetworkEdgeCases:
         rn.connect("chain", "chain",
                    lambda ns, nd: [(i, i + 1) for i in range(99)],
                    weight=0.1,
-                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0))
         assert rn.num_neurons == 100
         assert rn.num_synapses == 99
 
@@ -364,7 +364,7 @@ class TestNetworkEdgeCases:
         rn.add_population("E", 2)
         with pytest.raises(Exception):
             rn.connect("E", "F", "all_to_all", weight=0.5,
-                       synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                       synapse=SynapseSpec.exponential(2.0))
 
 
 class TestParameters:

@@ -16,28 +16,28 @@ import numpy as np
 import pytest
 
 from hodgkin_huxley import (
-    # Composable structs
+    GateRef,
+    GateSpec,
+    ChannelSpec,
+    CalciumSpec,
+    NeuronModelSpec,
+    IzhikevichType,
+    NeuronModel,
+    Boltzmann,
+    Tau,
+    RateFunc,
+    RegionalNetwork,
+    SynapseSpec,
+    RecordingConfig,
+)
+from hodgkin_huxley._core import (
     BoltzmannParams,
     TauParams,
     TauForm,
     RateFuncParams,
     RateFuncForm,
-    GateSpec,
     GateUpdateForm,
     GateDependency,
-    ChannelSpec,
-    CalciumSpec,
-    NeuronModelSpec,
-    IzhikevichType,
-    # Python helpers
-    NeuronModel,
-    Boltzmann,
-    Tau,
-    RateFunc,
-    # Network types
-    RegionalNetwork,
-    SynapseSpec,
-    RecordingConfig,
 )
 from neuron_specs import make_thalamic, make_stn, make_gpe, make_gpi, make_striatum
 
@@ -950,12 +950,14 @@ class TestIntegration:
     def test_python_builder_add_channel(self):
         """NeuronModel.add_channel() produces correct ChannelSpec."""
         m = NeuronModel("test")
-        m.add_gate("m", update_form="instant", inf=Boltzmann(-37.0, 7.0))
-        idx = m.add_channel("Na", g=120.0, E_rev=50.0, gates=[(0, 3)])
+        m_ref = m.add_gate("m", update_form="instant", inf=Boltzmann(-37.0, 7.0))
+        idx = m.add_channel("Na", g=120.0, E_rev=50.0, gating=m_ref**3)
         spec = m.to_spec()
         assert spec.channels[0].g == pytest.approx(120.0)
         assert spec.channels[0].E_rev == pytest.approx(50.0)
+        # simple power expression → fast path: gates list, no VM bytecode
         assert spec.channels[0].gates == [(0, 3)]
+        assert spec.channels[0].gate_product_vm.empty()
 
     def test_python_builder_add_leak(self):
         """NeuronModel.add_leak() adds a channel with no gates."""
@@ -979,15 +981,111 @@ class TestIntegration:
     def test_python_builder_simulates(self):
         """Builder-constructed model simulates without crash."""
         m = NeuronModel("custom", C_m=1.0, V_init=-65.0)
-        m.add_gate("m", update_form="instant",
-                   inf=Boltzmann(-37.0, 7.0))
-        m.add_gate("h", update_form="inf_tau",
-                   inf=Boltzmann(-41.0, -4.0),
-                   tau=Tau.constant(1.0),
-                   initial_value=0.6)
-        m.add_channel("Na", g=120.0, E_rev=50.0, gates=[(0, 3), (1, 1)])
+        m_ref = m.add_gate("m", update_form="instant",
+                            inf=Boltzmann(-37.0, 7.0))
+        h_ref = m.add_gate("h", update_form="inf_tau",
+                            inf=Boltzmann(-41.0, -4.0),
+                            tau=Tau.constant(1.0),
+                            initial_value=0.6)
+        m.add_channel("Na", g=120.0, E_rev=50.0, gating=m_ref**3 * h_ref)
         m.add_leak(g=0.3, E_rev=-54.3)
 
         trace = simulate_composable(m.to_spec(), duration=100.0, dt=0.01, I_ext=10.0)
         assert np.all(np.isfinite(trace))
         assert count_spikes(trace) >= 1
+
+
+# =============================================================================
+# SymPy gating= expression tests
+# =============================================================================
+
+
+class TestSymPyGating:
+    """Tests for NeuronModel.add_channel(gating=...) SymPy expression API."""
+
+    def _make_model(self, use_gating: bool) -> "NeuronModelSpec":
+        """Build identical HH-like spec via gating= expr or legacy gates=[] list."""
+        m = NeuronModel("hh", C_m=1.0, V_init=-65.0)
+        m_ref = m.add_gate("m", inf=Boltzmann(-40, 9), tau=Tau.constant(1.0))
+        h_ref = m.add_gate("h", inf=Boltzmann(-65, -7), tau=Tau.constant(3.0))
+        if use_gating:
+            m.add_channel("Na", g=120.0, E_rev=50.0, gating=m_ref**3 * h_ref)
+        else:
+            m.add_channel("Na", g=120.0, E_rev=50.0,
+                          gates=[(int(m_ref), 3), (int(h_ref), 1)])
+        m.add_leak(g=0.3, E_rev=-54.3)
+        return m.to_spec()
+
+    def test_gate_ref_acts_as_int(self):
+        m = NeuronModel("x")
+        ref = m.add_gate("m", inf=Boltzmann(-40, 9), tau=Tau.constant(1.0))
+        assert isinstance(ref, GateRef)
+        assert int(ref) == 0
+        assert ref.__index__() == 0
+
+    def test_gate_ref_pow_returns_sympy(self):
+        import sympy
+        m = NeuronModel("x")
+        ref = m.add_gate("m", inf=Boltzmann(-40, 9), tau=Tau.constant(1.0))
+        expr = ref**3
+        assert isinstance(expr, sympy.Expr)
+
+    def test_gate_product_vm_set_on_channel(self):
+        # m**3 * h is a pure integer-power product → fast path (gates list, no VM)
+        spec = self._make_model(use_gating=True)
+        na_ch = spec.channels[0]
+        assert na_ch.gate_product_vm.empty()
+        assert len(na_ch.gates) == 2
+
+    def test_legacy_path_gate_product_vm_empty(self):
+        spec = self._make_model(use_gating=False)
+        na_ch = spec.channels[0]
+        assert na_ch.gate_product_vm.empty()
+
+    def test_vm_path_used_for_complex_expression(self):
+        """A non-power-product expression (scaled gate) routes to the VM path."""
+        import sympy
+        m = NeuronModel("x", C_m=1.0, V_init=-65.0)
+        m_ref = m.add_gate("m", inf=Boltzmann(-40, 9), tau=Tau.constant(1.0))
+        # sympy.Float(0.9) * m_ref is not a pure gate product → must use VM
+        m.add_channel("Na", g=120.0, E_rev=50.0, gating=sympy.Float(0.9) * m_ref**3)
+        spec = m.to_spec()
+        assert not spec.channels[0].gate_product_vm.empty()
+        assert spec.channels[0].gates == []
+
+    def test_sympy_gating_matches_power_list(self):
+        """gating=m_ref**3 * h_ref produces identical voltage trace to gates=[(0,3),(1,1)]."""
+        rn_sym = RegionalNetwork()
+        rn_sym.add_population("pop", 4, model=self._make_model(True))
+
+        rn_list = RegionalNetwork()
+        rn_list.add_population("pop", 4, model=self._make_model(False))
+
+        kw = dict(duration=20.0, dt=0.1, I_ext={"pop": 5.0})
+        t_sym = rn_sym.simulate(**kw)["pop"]
+        t_list = rn_list.simulate(**kw)["pop"]
+        np.testing.assert_allclose(t_sym, t_list, atol=1e-10)
+
+    def test_single_gate_no_power(self):
+        """Channel with gating=n_ref (power=1) matches gates=[(0,1)]."""
+        def make(use_gating):
+            m = NeuronModel("kdr", C_m=1.0, V_init=-65.0)
+            n_ref = m.add_gate("n", inf=Boltzmann(-55, 12), tau=Tau.constant(5.0))
+            if use_gating:
+                m.add_channel("K", g=36.0, E_rev=-77.0, gating=n_ref)
+            else:
+                m.add_channel("K", g=36.0, E_rev=-77.0, gates=[(int(n_ref), 1)])
+            m.add_leak(g=0.3, E_rev=-54.3)
+            return m.to_spec()
+
+        rn_sym = RegionalNetwork()
+        rn_sym.add_population("p", 2, model=make(True))
+        rn_list = RegionalNetwork()
+        rn_list.add_population("p", 2, model=make(False))
+
+        kw = dict(duration=10.0, dt=0.1, I_ext={"p": 5.0})
+        np.testing.assert_allclose(
+            rn_sym.simulate(**kw)["p"],
+            rn_list.simulate(**kw)["p"],
+            atol=1e-10,
+        )

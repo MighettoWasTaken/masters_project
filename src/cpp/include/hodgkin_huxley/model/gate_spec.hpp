@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -34,8 +35,41 @@ struct RateFuncParams {
     double A = 0.0, B = 0.0, C = 1.0;
 };
 
+// =============================================================================
+// Bytecode VM types — defined before GateSpec so GateSpec can embed them
+// =============================================================================
+
+enum class VmOp : uint8_t {
+    PUSH_DEP=0, PUSH_CONST=1,          // stack inputs
+    ADD=2, MUL=3, NEG=4, RCP=5,        // arithmetic (RCP = 1/x)
+    POW_INT=6, POW_HALF=7, POW_GEN=8,  // powers
+    EXP=9, LOG=10, TANH=11,            // transcendental
+    SIN=12, COS=13, SQRT=14, ABS=15,   // more functions
+    PUSH_GATE=16,                           // push gate_states_[operand] onto stack
+    PUSH_S=17,                              // push kinetic synapse gating variable S
+    PUSH_A=18,                              // push auxiliary synapse state variable A
+};
+
+struct VmInstruction {
+    VmOp    op      = VmOp::PUSH_CONST;
+    int32_t operand = 0;  // const index (PUSH_CONST) or integer exponent (POW_INT)
+};
+
+struct VmExpr {
+    std::vector<VmInstruction> instructions;
+    std::vector<double>        constants;
+    bool empty() const { return instructions.empty(); }
+    void add_instruction(VmOp op, int32_t operand = 0) {
+        instructions.push_back({op, operand});
+    }
+    int32_t add_constant(double val) {
+        constants.push_back(val);
+        return static_cast<int32_t>(constants.size() - 1);
+    }
+};
+
 struct GateSpec {
-    enum class UpdateForm { INF_TAU, ALPHA_BETA, INSTANT, DERIVED };
+    enum class UpdateForm { INF_TAU=0, ALPHA_BETA=1, INSTANT=2, DERIVED=3, CUSTOM_EXPR=4 };
     enum class Dependency { VOLTAGE, CALCIUM };
 
     std::string name;
@@ -57,6 +91,15 @@ struct GateSpec {
     double derived_a = 1.0;
     double derived_b = 0.0;
     double derived_c = 1.0;
+
+    // For CUSTOM_EXPR form: bytecode programs executed by the pre-compiled C++ stack VM.
+    // inf_vm / tau_vm: INF_TAU-style update  (x -> x_inf + (x - x_inf)*exp(-dt*scale/tau))
+    // alpha_vm / beta_vm: ALPHA_BETA-style   (alpha/(alpha+beta) steady state)
+    // dxdt_vm: arbitrary ODE  dx/dt = F(x, V)  — integrated with Euler
+    //   PUSH_DEP pushes V (or Ca for calcium-dependent gates)
+    //   PUSH_S   pushes the current gate state x
+    VmExpr inf_vm, tau_vm, alpha_vm, beta_vm;
+    VmExpr dxdt_vm;
 };
 
 struct CalciumSpec {

@@ -66,6 +66,19 @@ void ComposableNeuron::reset_gates_to_steady_state() {
             }
             case GateSpec::UpdateForm::DERIVED:
                 break;  // handled in second pass
+            case GateSpec::UpdateForm::CUSTOM_EXPR: {
+                double dep = (gs.dependency == GateSpec::Dependency::CALCIUM) ? Ca_ : V_;
+                if (!gs.inf_vm.empty()) {
+                    double v = hodgkin_huxley::vm_eval_scalar(gs.inf_vm, dep);
+                    gate_states_[i] = std::max(0.0, std::min(1.0, v));
+                } else if (!gs.alpha_vm.empty() && !gs.beta_vm.empty()) {
+                    double a = hodgkin_huxley::vm_eval_scalar(gs.alpha_vm, V_);
+                    double b = hodgkin_huxley::vm_eval_scalar(gs.beta_vm, V_);
+                    if (a+b > 1e-10) gate_states_[i] = std::max(0.0, std::min(1.0, a/(a+b)));
+                }
+                // dxdt_vm: steady state is undefined for arbitrary ODEs — leave initial_value
+                break;
+            }
         }
     }
 
@@ -138,6 +151,29 @@ void ComposableNeuron::update_gates(double dt) {
                 }
                 break;
             }
+
+            case GateSpec::UpdateForm::CUSTOM_EXPR: {
+                double dep = (gs.dependency == GateSpec::Dependency::CALCIUM) ? Ca_ : V_;
+                if (!gs.dxdt_vm.empty()) {
+                    // Arbitrary ODE: dx/dt = F(x, V) — forward Euler
+                    double dxdt = hodgkin_huxley::vm_eval_scalar_2arg(gs.dxdt_vm, dep, gate_states_[i]);
+                    gate_states_[i] += dt * gs.scale * dxdt;
+                } else if (!gs.inf_vm.empty() && !gs.tau_vm.empty()) {
+                    double x_inf = hodgkin_huxley::vm_eval_scalar(gs.inf_vm, dep);
+                    double tau_x = std::max(1e-10, hodgkin_huxley::vm_eval_scalar(gs.tau_vm, V_));
+                    gate_states_[i] = x_inf + (gate_states_[i]-x_inf)*std::exp(-dt*gs.scale/tau_x);
+                } else if (!gs.alpha_vm.empty() && !gs.beta_vm.empty()) {
+                    double a = hodgkin_huxley::vm_eval_scalar(gs.alpha_vm, V_);
+                    double b = hodgkin_huxley::vm_eval_scalar(gs.beta_vm,  V_);
+                    double rate = std::max(1e-10, a+b);
+                    gate_states_[i] = a/rate + (gate_states_[i]-a/rate)*std::exp(-dt*rate);
+                } else if (!gs.inf_vm.empty()) {
+                    // Only inf_vm (no tau_vm) — treat as INSTANT: gate = x_inf every step
+                    double x_inf = hodgkin_huxley::vm_eval_scalar(gs.inf_vm, dep);
+                    gate_states_[i] = std::max(0.0, std::min(1.0, x_inf));
+                }
+                break;
+            }
         }
 
         // Clamp gate values to [0, 1]
@@ -149,14 +185,20 @@ double ComposableNeuron::compute_channel_current() const {
     double I_total = 0.0;
 
     for (const auto& ch : spec_.channels) {
-        double gate_product = 1.0;
-        for (const auto& gp : ch.gates) {
-            int idx = gp.first;
-            int power = gp.second;
-            if (idx >= 0 && idx < static_cast<int>(gate_states_.size())) {
-                double val = gate_states_[idx];
-                for (int p = 0; p < power; ++p) {
-                    gate_product *= val;
+        double gate_product;
+        if (!ch.gate_product_vm.empty()) {
+            gate_product = hodgkin_huxley::vm_eval_gate_product_scalar(
+                ch.gate_product_vm, V_, gate_states_);
+        } else {
+            gate_product = 1.0;
+            for (const auto& gp : ch.gates) {
+                int idx = gp.first;
+                int power = gp.second;
+                if (idx >= 0 && idx < static_cast<int>(gate_states_.size())) {
+                    double val = gate_states_[idx];
+                    for (int p = 0; p < power; ++p) {
+                        gate_product *= val;
+                    }
                 }
             }
         }
@@ -186,14 +228,20 @@ void ComposableNeuron::update_calcium(double dt) {
     for (int ch_idx : spec_.calcium.source_channels) {
         if (ch_idx < 0 || ch_idx >= static_cast<int>(spec_.channels.size())) continue;
         const auto& ch = spec_.channels[ch_idx];
-        double gate_product = 1.0;
-        for (const auto& gp : ch.gates) {
-            int idx = gp.first;
-            int power = gp.second;
-            if (idx >= 0 && idx < static_cast<int>(gate_states_.size())) {
-                double val = gate_states_[idx];
-                for (int p = 0; p < power; ++p) {
-                    gate_product *= val;
+        double gate_product;
+        if (!ch.gate_product_vm.empty()) {
+            gate_product = hodgkin_huxley::vm_eval_gate_product_scalar(
+                ch.gate_product_vm, V_, gate_states_);
+        } else {
+            gate_product = 1.0;
+            for (const auto& gp : ch.gates) {
+                int idx = gp.first;
+                int power = gp.second;
+                if (idx >= 0 && idx < static_cast<int>(gate_states_.size())) {
+                    double val = gate_states_[idx];
+                    for (int p = 0; p < power; ++p) {
+                        gate_product *= val;
+                    }
                 }
             }
         }

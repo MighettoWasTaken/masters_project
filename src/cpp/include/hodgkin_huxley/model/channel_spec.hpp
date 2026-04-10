@@ -15,6 +15,7 @@ struct ChannelSpec {
     std::vector<std::pair<int, int>> gates;  // (gate_index, power)
     bool is_ahp = false;
     double ahp_k1 = 0.0;
+    VmExpr gate_product_vm;  // if non-empty, replaces gates[] integer-power product
 };
 
 } // namespace hodgkin_huxley

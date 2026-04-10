@@ -18,6 +18,7 @@ using namespace hodgkin_huxley;
 
 PYBIND11_MAKE_OPAQUE(std::vector<GateSpec>);
 PYBIND11_MAKE_OPAQUE(std::vector<ChannelSpec>);
+PYBIND11_MAKE_OPAQUE(std::vector<VmInstruction>);
 
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Neural simulation library - C++ backend";
@@ -184,15 +185,6 @@ PYBIND11_MODULE(_core, m) {
                    " delay=" + std::to_string(s.delay()) + ">";
         });
 
-    py::class_<ExponentialSynapse, SynapseBase>(m, "ExponentialSynapse")
-        .def_property_readonly("tau", &ExponentialSynapse::tau, "Decay time constant (ms)");
-
-    py::class_<AlphaSynapse, SynapseBase>(m, "AlphaSynapse")
-        .def_property_readonly("tau", &AlphaSynapse::tau, "Time to peak (ms)");
-
-    py::class_<DoubleExponentialSynapse, SynapseBase>(m, "DoubleExponentialSynapse")
-        .def_property_readonly("tau_rise", &DoubleExponentialSynapse::tau_rise, "Rise time constant (ms)")
-        .def_property_readonly("tau_decay", &DoubleExponentialSynapse::tau_decay, "Decay time constant (ms)");
 
     // =========================================================================
     // Network
@@ -245,8 +237,17 @@ PYBIND11_MODULE(_core, m) {
              "Add a composable neuron from a model spec, returns index",
              py::arg("spec"))
 
-        // Synapses
-        .def("add_synapse", &Network::add_synapse,
+        // Synapses — primary method (unified SynapseSpec)
+        .def("add_synapse",
+             py::overload_cast<size_t, size_t, double, const SynapseSpec&, double>(
+                 &Network::add_synapse),
+             "Add a synapse from a unified SynapseSpec, returns index",
+             py::arg("pre"), py::arg("post"), py::arg("weight"),
+             py::arg("spec"), py::arg("delay") = 0.0)
+        // Legacy wrappers (backward compat)
+        .def("add_synapse",
+             py::overload_cast<size_t, size_t, double, double, double, double>(
+                 &Network::add_synapse),
              "Add an exponential synapse between neurons",
              py::arg("pre_idx"), py::arg("post_idx"), py::arg("weight"),
              py::arg("E_syn") = 0.0, py::arg("tau") = 2.0,
@@ -448,38 +449,77 @@ PYBIND11_MODULE(_core, m) {
         .export_values();
 
     // =========================================================================
-    // SynapseSpec
+    // SynapseSpec — unified synapse model specification
     // =========================================================================
+    py::enum_<SynapseSpec::UpdateForm>(m, "SynapseUpdateForm")
+        .value("EXP_DECAY",       SynapseSpec::UpdateForm::EXP_DECAY)
+        .value("ALPHA_FUNC",      SynapseSpec::UpdateForm::ALPHA_FUNC)
+        .value("DOUBLE_EXP",      SynapseSpec::UpdateForm::DOUBLE_EXP)
+        .value("TANH_GATE",       SynapseSpec::UpdateForm::TANH_GATE)
+        .value("BOLTZMANN_GATE",  SynapseSpec::UpdateForm::BOLTZMANN_GATE)
+        .value("ALPHA_BETA",      SynapseSpec::UpdateForm::ALPHA_BETA)
+        .value("CUSTOM_EXPR",     SynapseSpec::UpdateForm::CUSTOM_EXPR)
+        .export_values();
+
+    py::enum_<SynapseSpec::CurrentForm>(m, "SynapseCurrentForm")
+        .value("LINEAR",      SynapseSpec::CurrentForm::LINEAR)
+        .value("MG_BLOCK",    SynapseSpec::CurrentForm::MG_BLOCK)
+        .value("CUSTOM_EXPR", SynapseSpec::CurrentForm::CUSTOM_EXPR)
+        .export_values();
+
     py::class_<SynapseSpec>(m, "SynapseSpec")
-        .def_readwrite("type", &SynapseSpec::type)
-        .def_readwrite("E_syn", &SynapseSpec::E_syn)
-        .def_readwrite("tau", &SynapseSpec::tau)
-        .def_readwrite("tau_rise", &SynapseSpec::tau_rise)
-        .def_readwrite("tau_decay", &SynapseSpec::tau_decay)
-        .def_static("ampa", &SynapseSpec::ampa)
-        .def_static("nmda", &SynapseSpec::nmda)
-        .def_static("gaba_a", &SynapseSpec::gaba_a)
-        .def_static("exponential", &SynapseSpec::exponential,
-                     py::arg("E_syn"), py::arg("tau"))
-        .def_static("alpha", &SynapseSpec::alpha,
-                     py::arg("E_syn"), py::arg("tau"))
+        .def(py::init<>())
+        .def_readwrite("name",         &SynapseSpec::name)
+        .def_readwrite("update_form",  &SynapseSpec::update_form)
+        .def_readwrite("current_form", &SynapseSpec::current_form)
+        .def_readwrite("g",            &SynapseSpec::g)
+        .def_readwrite("E_syn",        &SynapseSpec::E_syn)
+        .def_readwrite("power",        &SynapseSpec::power)
+        .def_readwrite("S_init",       &SynapseSpec::S_init)
+        .def_readwrite("A_init",       &SynapseSpec::A_init)
+        .def_readwrite("delta_S",      &SynapseSpec::delta_S)
+        .def_readwrite("delta_A",      &SynapseSpec::delta_A)
+        .def_readwrite("tau_S",        &SynapseSpec::tau_S)
+        .def_readwrite("tau_A",        &SynapseSpec::tau_A)
+        .def_readwrite("norm_factor",  &SynapseSpec::norm_factor)
+        .def_readwrite("tanh_amp",     &SynapseSpec::tanh_amp)
+        .def_readwrite("tanh_vh",      &SynapseSpec::tanh_vh)
+        .def_readwrite("tanh_k",       &SynapseSpec::tanh_k)
+        .def_readwrite("tau_decay",    &SynapseSpec::tau_decay)
+        .def_readwrite("s_inf",        &SynapseSpec::s_inf)
+        .def_readwrite("tau",          &SynapseSpec::tau)
+        .def_readwrite("alpha",        &SynapseSpec::alpha)
+        .def_readwrite("beta",         &SynapseSpec::beta)
+        .def_readwrite("mg_conc",      &SynapseSpec::mg_conc)
+        .def_readwrite("mg_scale",     &SynapseSpec::mg_scale)
+        .def_readwrite("mg_denom",     &SynapseSpec::mg_denom)
+        .def_readwrite("dS_dt_vm",     &SynapseSpec::dS_dt_vm)
+        .def_readwrite("dA_dt_vm",     &SynapseSpec::dA_dt_vm)
+        .def_readwrite("current_vm",   &SynapseSpec::current_vm)
+        // Spike-driven presets
+        .def_static("exponential",      &SynapseSpec::exponential,
+                     py::arg("tau_S"), py::arg("g") = 1.0, py::arg("E_syn") = 0.0)
+        .def_static("alpha_function",   &SynapseSpec::alpha_function,
+                     py::arg("tau"), py::arg("g") = 1.0, py::arg("E_syn") = 0.0)
         .def_static("double_exponential", &SynapseSpec::double_exponential,
-                     py::arg("E_syn"), py::arg("tau_rise"), py::arg("tau_decay"))
+                     py::arg("tau_rise"), py::arg("tau_decay"),
+                     py::arg("g") = 1.0, py::arg("E_syn") = 0.0)
+        // Voltage-gated kinetic presets
+        .def_static("gaba_kinetic", &SynapseSpec::gaba_kinetic)
+        .def_static("nmda_kinetic", &SynapseSpec::nmda_kinetic)
+        .def_static("gaba_b",       &SynapseSpec::gaba_b)
+        // Receptor presets
+        .def_static("ampa",  &SynapseSpec::ampa)
+        .def_static("nmda",  &SynapseSpec::nmda)
+        .def_static("gaba_a",&SynapseSpec::gaba_a)
         .def("__repr__", [](const SynapseSpec& s) {
-            std::string type_str;
-            switch (s.type) {
-                case SynapseSpec::Type::EXPONENTIAL: type_str = "EXP"; break;
-                case SynapseSpec::Type::ALPHA: type_str = "ALPHA"; break;
-                case SynapseSpec::Type::DOUBLE_EXPONENTIAL: type_str = "DEXP"; break;
-            }
-            return "<SynapseSpec " + type_str + " E=" + std::to_string(s.E_syn) + ">";
+            return "<SynapseSpec '" + s.name + "'>";
         });
 
-    py::enum_<SynapseSpec::Type>(m, "SynapseSpecType")
-        .value("EXPONENTIAL", SynapseSpec::Type::EXPONENTIAL)
-        .value("ALPHA", SynapseSpec::Type::ALPHA)
-        .value("DOUBLE_EXPONENTIAL", SynapseSpec::Type::DOUBLE_EXPONENTIAL)
-        .export_values();
+    // Backward-compat aliases
+    m.attr("KineticSynapseSpec") = m.attr("SynapseSpec");
+    m.attr("KineticUpdateForm")  = m.attr("SynapseUpdateForm");
+    m.attr("KineticCurrentForm") = m.attr("SynapseCurrentForm");
 
     // =========================================================================
     // WeightDistribution
@@ -642,6 +682,39 @@ PYBIND11_MODULE(_core, m) {
     // Opaque vector bindings — must come before any class that uses these vectors
     py::bind_vector<std::vector<GateSpec>>(m, "GateSpecVector");
     py::bind_vector<std::vector<ChannelSpec>>(m, "ChannelSpecVector");
+    py::bind_vector<std::vector<VmInstruction>>(m, "VmInstructionVector");
+
+    // VM bytecode types
+    py::enum_<VmOp>(m, "VmOp")
+        .value("PUSH_DEP",   VmOp::PUSH_DEP)
+        .value("PUSH_CONST", VmOp::PUSH_CONST)
+        .value("ADD",  VmOp::ADD)  .value("MUL",  VmOp::MUL)
+        .value("NEG",  VmOp::NEG)  .value("RCP",  VmOp::RCP)
+        .value("POW_INT",  VmOp::POW_INT)
+        .value("POW_HALF", VmOp::POW_HALF)
+        .value("POW_GEN",  VmOp::POW_GEN)
+        .value("EXP",  VmOp::EXP)  .value("LOG",  VmOp::LOG)
+        .value("TANH", VmOp::TANH) .value("SIN",  VmOp::SIN)
+        .value("COS",  VmOp::COS)  .value("SQRT", VmOp::SQRT)
+        .value("ABS",  VmOp::ABS)
+        .value("PUSH_GATE", VmOp::PUSH_GATE)
+        .value("PUSH_S",    VmOp::PUSH_S)
+        .value("PUSH_A",    VmOp::PUSH_A)
+        .export_values();
+
+    py::class_<VmInstruction>(m, "VmInstruction")
+        .def(py::init<>())
+        .def_readwrite("op",      &VmInstruction::op)
+        .def_readwrite("operand", &VmInstruction::operand);
+
+    py::class_<VmExpr>(m, "VmExpr")
+        .def(py::init<>())
+        .def_readwrite("instructions", &VmExpr::instructions)
+        .def_readwrite("constants",    &VmExpr::constants)
+        .def("empty",           &VmExpr::empty)
+        .def("add_instruction", &VmExpr::add_instruction,
+             py::arg("op"), py::arg("operand") = 0)
+        .def("add_constant",    &VmExpr::add_constant);
 
     // GateSpec
     py::enum_<GateSpec::UpdateForm>(m, "GateUpdateForm")
@@ -649,6 +722,7 @@ PYBIND11_MODULE(_core, m) {
         .value("ALPHA_BETA", GateSpec::UpdateForm::ALPHA_BETA)
         .value("INSTANT", GateSpec::UpdateForm::INSTANT)
         .value("DERIVED", GateSpec::UpdateForm::DERIVED)
+        .value("CUSTOM_EXPR", GateSpec::UpdateForm::CUSTOM_EXPR)
         .export_values();
 
     py::enum_<GateSpec::Dependency>(m, "GateDependency")
@@ -671,6 +745,11 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("derived_a", &GateSpec::derived_a)
         .def_readwrite("derived_b", &GateSpec::derived_b)
         .def_readwrite("derived_c", &GateSpec::derived_c)
+        .def_readwrite("inf_vm",    &GateSpec::inf_vm)
+        .def_readwrite("tau_vm",   &GateSpec::tau_vm)
+        .def_readwrite("alpha_vm", &GateSpec::alpha_vm)
+        .def_readwrite("beta_vm",  &GateSpec::beta_vm)
+        .def_readwrite("dxdt_vm",  &GateSpec::dxdt_vm)
         .def("__repr__", [](const GateSpec& g) {
             return "<GateSpec '" + g.name + "'>";
         });
@@ -685,6 +764,7 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("gates", &ChannelSpec::gates)
         .def_readwrite("is_ahp", &ChannelSpec::is_ahp)
         .def_readwrite("ahp_k1", &ChannelSpec::ahp_k1)
+        .def_readwrite("gate_product_vm", &ChannelSpec::gate_product_vm)
         .def("__repr__", [](const ChannelSpec& c) {
             return "<ChannelSpec '" + c.name + "' g=" + std::to_string(c.g) + ">";
         });
@@ -751,54 +831,9 @@ PYBIND11_MODULE(_core, m) {
                    " V=" + std::to_string(n.membrane_potential()) + " mV>";
         });
 
-    // =========================================================================
-    // KineticSynapseSpec
-    // =========================================================================
-
-    py::enum_<KineticSynapseSpec::UpdateForm>(m, "KineticUpdateForm")
-        .value("ALPHA_BETA",     KineticSynapseSpec::UpdateForm::ALPHA_BETA)
-        .value("TANH_GATE",      KineticSynapseSpec::UpdateForm::TANH_GATE)
-        .value("BOLTZMANN_GATE", KineticSynapseSpec::UpdateForm::BOLTZMANN_GATE)
-        .export_values();
-
-    py::enum_<KineticSynapseSpec::CurrentForm>(m, "KineticCurrentForm")
-        .value("LINEAR",   KineticSynapseSpec::CurrentForm::LINEAR)
-        .value("MG_BLOCK", KineticSynapseSpec::CurrentForm::MG_BLOCK)
-        .export_values();
-
-    py::class_<KineticSynapseSpec>(m, "KineticSynapseSpec")
-        .def(py::init<>())
-        .def_readwrite("name",         &KineticSynapseSpec::name)
-        .def_readwrite("update_form",  &KineticSynapseSpec::update_form)
-        .def_readwrite("alpha",        &KineticSynapseSpec::alpha)
-        .def_readwrite("beta",         &KineticSynapseSpec::beta)
-        .def_readwrite("tanh_amp",     &KineticSynapseSpec::tanh_amp)
-        .def_readwrite("tanh_vh",      &KineticSynapseSpec::tanh_vh)
-        .def_readwrite("tanh_k",       &KineticSynapseSpec::tanh_k)
-        .def_readwrite("tau_decay",    &KineticSynapseSpec::tau_decay)
-        .def_readwrite("s_inf",        &KineticSynapseSpec::s_inf)
-        .def_readwrite("tau",          &KineticSynapseSpec::tau)
-        .def_readwrite("current_form", &KineticSynapseSpec::current_form)
-        .def_readwrite("g",            &KineticSynapseSpec::g)
-        .def_readwrite("E_syn",        &KineticSynapseSpec::E_syn)
-        .def_readwrite("power",        &KineticSynapseSpec::power)
-        .def_readwrite("mg_conc",      &KineticSynapseSpec::mg_conc)
-        .def_readwrite("mg_scale",     &KineticSynapseSpec::mg_scale)
-        .def_readwrite("mg_denom",     &KineticSynapseSpec::mg_denom)
-        .def_readwrite("S_init",       &KineticSynapseSpec::S_init)
-        .def_static("gaba_kinetic", &KineticSynapseSpec::gaba_kinetic)
-        .def_static("nmda_kinetic", &KineticSynapseSpec::nmda_kinetic)
-        .def_static("gaba_b",       &KineticSynapseSpec::gaba_b)
-        .def("__repr__", [](const KineticSynapseSpec& s) {
-            return "<KineticSynapseSpec '" + s.name + "'>";
-        });
-
-    // Network.add_kinetic_synapse (added after KineticSynapseSpec is registered)
+    // Network.add_kinetic_synapse (now delegates to add_synapse)
     netCls.def("add_kinetic_synapse",
-        [](Network& net, size_t pre, size_t post, double weight,
-           const KineticSynapseSpec& spec, double delay) {
-            return net.add_kinetic_synapse(pre, post, weight, spec, delay);
-        },
+        &Network::add_kinetic_synapse,
         py::arg("pre"), py::arg("post"), py::arg("weight"),
         py::arg("spec"), py::arg("delay") = 0.0);
 

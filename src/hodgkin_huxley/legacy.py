@@ -11,6 +11,10 @@ Preferred migration:
       → use ``NeuronModelSpec.izhikevich(IzhikevichType.<variant>)``
   - ``SynapseBase`` / ``ExponentialSynapse`` / ``AlphaSynapse``
     / ``DoubleExponentialSynapse`` → use ``SynapseSpec`` factories
+  - ``BoltzmannParams`` / ``TauParams`` / ``TauForm`` / ``RateFuncParams``
+    / ``RateFuncForm`` → use ``Boltzmann`` / ``Tau.*`` / ``RateFunc.*`` helpers
+  - ``GateUpdateForm`` / ``GateDependency`` / ``KineticUpdateForm``
+    / ``KineticCurrentForm`` → use ``GateSpec`` / ``KineticSynapseModel``
 """
 
 import warnings
@@ -28,11 +32,26 @@ from ._core import (
     IzhikevichParameters as _IzhikevichParameters,
     IzhikevichState as _IzhikevichState,
     SynapseBase as _SynapseBase,
-    ExponentialSynapse as _ExponentialSynapse,
-    AlphaSynapse as _AlphaSynapse,
-    DoubleExponentialSynapse as _DoubleExponentialSynapse,
+    SynapseSpec as _SynapseSpec,
     _NetworkNeuronType as _NetworkNeuronType,
+    # Equation struct types (task13)
+    BoltzmannParams as _BoltzmannParams,
+    TauParams as _TauParams,
+    TauForm as _TauForm,
+    RateFuncParams as _RateFuncParams,
+    RateFuncForm as _RateFuncForm,
+    GateUpdateForm as _GateUpdateForm,
+    GateDependency as _GateDependency,
+    KineticUpdateForm as _KineticUpdateForm,
+    KineticCurrentForm as _KineticCurrentForm,
 )
+
+# ExponentialSynapse / AlphaSynapse / DoubleExponentialSynapse were removed in
+# the unified synapse rewrite (task 12). Provide factory shims so legacy access
+# still works (returns a SynapseSpec) and emits the deprecation warning.
+_ExponentialSynapse = _SynapseSpec.exponential
+_AlphaSynapse = _SynapseSpec.alpha_function
+_DoubleExponentialSynapse = _SynapseSpec.double_exponential
 
 _DEPRECATION_MESSAGES: dict[str, str] = {
     "Network": (
@@ -80,6 +99,43 @@ _DEPRECATION_MESSAGES: dict[str, str] = {
         "hodgkin_huxley.DoubleExponentialSynapse is deprecated. "
         "Use SynapseSpec.ampa() / SynapseSpec.nmda() / SynapseSpec.gaba_a() instead."
     ),
+    # Equation struct types (task13)
+    "BoltzmannParams": (
+        "hodgkin_huxley.BoltzmannParams is deprecated. "
+        "Use hodgkin_huxley.Boltzmann(v_half, k) instead."
+    ),
+    "TauParams": (
+        "hodgkin_huxley.TauParams is deprecated. "
+        "Use hodgkin_huxley.Tau.constant() / Tau.boltzmann() etc. instead."
+    ),
+    "TauForm": (
+        "hodgkin_huxley.TauForm is deprecated. "
+        "Use hodgkin_huxley.Tau.*() helpers instead."
+    ),
+    "RateFuncParams": (
+        "hodgkin_huxley.RateFuncParams is deprecated. "
+        "Use hodgkin_huxley.RateFunc.*() helpers instead."
+    ),
+    "RateFuncForm": (
+        "hodgkin_huxley.RateFuncForm is deprecated. "
+        "Use hodgkin_huxley.RateFunc.*() helpers instead."
+    ),
+    "GateUpdateForm": (
+        "hodgkin_huxley.GateUpdateForm is deprecated. "
+        "Use hodgkin_huxley.GateSpec(update_form=...) instead."
+    ),
+    "GateDependency": (
+        "hodgkin_huxley.GateDependency is deprecated. "
+        "Use hodgkin_huxley.GateSpec(dependency=...) instead."
+    ),
+    "KineticUpdateForm": (
+        "hodgkin_huxley.KineticUpdateForm is deprecated. "
+        "Use hodgkin_huxley.KineticSynapseModel builder instead."
+    ),
+    "KineticCurrentForm": (
+        "hodgkin_huxley.KineticCurrentForm is deprecated. "
+        "Use hodgkin_huxley.KineticSynapseModel builder instead."
+    ),
 }
 
 _LEGACY_OBJECTS: dict[str, object] = {
@@ -92,6 +148,16 @@ _LEGACY_OBJECTS: dict[str, object] = {
     "ExponentialSynapse": _ExponentialSynapse,
     "AlphaSynapse": _AlphaSynapse,
     "DoubleExponentialSynapse": _DoubleExponentialSynapse,
+    # Equation struct types (task13)
+    "BoltzmannParams": _BoltzmannParams,
+    "TauParams": _TauParams,
+    "TauForm": _TauForm,
+    "RateFuncParams": _RateFuncParams,
+    "RateFuncForm": _RateFuncForm,
+    "GateUpdateForm": _GateUpdateForm,
+    "GateDependency": _GateDependency,
+    "KineticUpdateForm": _KineticUpdateForm,
+    "KineticCurrentForm": _KineticCurrentForm,
 }
 
 __all__ = list(_DEPRECATION_MESSAGES.keys())
@@ -102,11 +168,14 @@ def __getattr__(name: str) -> object:
         raise AttributeError(f"module 'hodgkin_huxley.legacy' has no attribute {name!r}")
     warnings.warn(_DEPRECATION_MESSAGES[name], DeprecationWarning, stacklevel=2)
     if name in ("Network", "HHNeuron", "IzhikevichNeuron"):
-        # Lazily grab wrapper classes from the main package to avoid circular import
-        import hodgkin_huxley as _hh
+        from hodgkin_huxley._wrappers import (
+            _HHNeuronWrapper,
+            _IzhikevichNeuronWrapper,
+            _NetworkWrapper,
+        )
         return {
-            "Network": _hh._NetworkWrapper,
-            "HHNeuron": _hh._HHNeuronWrapper,
-            "IzhikevichNeuron": _hh._IzhikevichNeuronWrapper,
+            "Network": _NetworkWrapper,
+            "HHNeuron": _HHNeuronWrapper,
+            "IzhikevichNeuron": _IzhikevichNeuronWrapper,
         }[name]
     return _LEGACY_OBJECTS[name]

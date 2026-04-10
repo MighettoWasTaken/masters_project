@@ -99,7 +99,7 @@ def mtspectrumpt(spike_times_list: list,
         if Nsp > 0:
             # Taper values at spike times (linear interpolation)
             data_proj = _interp1d(t, tap.T, axis=0, kind='linear',
-                                  fill_value='extrapolate')(spikes)  # (Nsp, K)
+                                  fill_value='extrapolate')(spikes)  # type: ignore[call-arg]  # (Nsp, K)
             # Phase at spike times relative to t[0]
             exponential = np.exp(-1j * np.outer(w, spikes - t[0]))  # (nfreq, Nsp)
             # J = tapered NUFFT − mean-rate bias (Chronux eq.)

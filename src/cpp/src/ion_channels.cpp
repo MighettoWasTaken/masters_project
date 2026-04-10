@@ -8,60 +8,7 @@ namespace hodgkin_huxley {
 // removed. Python equivalents live in tests/python/neuron_specs.py and
 // benchmarks/ctxbgth_model.py.
 
-// =============================================================================
-// KineticSynapseSpec presets
-// =============================================================================
-
-KineticSynapseSpec KineticSynapseSpec::gaba_kinetic() {
-    KineticSynapseSpec s;
-    s.name = "GABA_kinetic";
-    s.update_form = UpdateForm::TANH_GATE;
-    s.tanh_amp = 2.0;
-    s.tanh_vh = 0.0;
-    s.tanh_k = 4.0;
-    s.tau_decay = 13.0;
-    s.current_form = CurrentForm::LINEAR;
-    s.g = 0.1;
-    s.E_syn = -80.0;
-    s.power = 1;
-    s.S_init = 0.0;
-    return s;
-}
-
-KineticSynapseSpec KineticSynapseSpec::nmda_kinetic() {
-    KineticSynapseSpec s;
-    s.name = "NMDA_kinetic";
-    s.update_form = UpdateForm::BOLTZMANN_GATE;
-    s.s_inf.v_half = -20.0;
-    s.s_inf.k = 16.0;
-    s.tau.form = TauParams::Form::CONSTANT;
-    s.tau.params[0] = 80.0;  // ms — NMDA slow gating
-    s.current_form = CurrentForm::MG_BLOCK;
-    s.g = 0.1;
-    s.E_syn = 0.0;
-    s.power = 1;
-    s.mg_conc = 1.0;
-    s.mg_scale = 0.062;
-    s.mg_denom = 3.57;
-    s.S_init = 0.0;
-    return s;
-}
-
-KineticSynapseSpec KineticSynapseSpec::gaba_b() {
-    KineticSynapseSpec s;
-    s.name = "GABA_B";
-    s.update_form = UpdateForm::BOLTZMANN_GATE;
-    s.s_inf.v_half = -60.0;
-    s.s_inf.k = -8.0;   // negative k → inverted sigmoid (decreases with V)
-    s.tau.form = TauParams::Form::CONSTANT;
-    s.tau.params[0] = 200.0;  // ms — very slow GABA-B
-    s.current_form = CurrentForm::LINEAR;
-    s.g = 0.1;
-    s.E_syn = -95.0;
-    s.power = 4;         // GABA-B has cooperative gating
-    s.S_init = 0.0;
-    return s;
-}
+// SynapseSpec static factory implementations moved to synapse_spec.cpp.
 
 void NeuronModelSpec::validate() const {
     const int n_gates    = static_cast<int>(gates.size());

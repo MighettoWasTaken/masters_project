@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import warnings
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 
 class NoiseInjector:
@@ -73,7 +73,7 @@ class NoiseInjector:
         alignment when the simulation is run at a different dt.
     """
 
-    def __init__(self, noise: "array_like", dt: float):
+    def __init__(self, noise: ArrayLike, dt: float):
         arr = np.asarray(noise, dtype=np.float64)
 
         if arr.ndim == 1:
@@ -171,7 +171,7 @@ class NoiseInjector:
     @classmethod
     def from_array(
         cls,
-        noise: "array_like",
+        noise: ArrayLike,
         dt: float,
     ) -> "NoiseInjector":
         """

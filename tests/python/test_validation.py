@@ -14,8 +14,10 @@ And that valid specs do not raise.
 import pytest
 
 from hodgkin_huxley import (
-    NeuronModelSpec, GateSpec, GateUpdateForm, ChannelSpec,
-    BoltzmannParams, TauParams, TauForm,
+    NeuronModelSpec, GateSpec, ChannelSpec,
+)
+from hodgkin_huxley._core import (
+    GateUpdateForm, BoltzmannParams, TauParams, TauForm,
 )
 import hodgkin_huxley._core as _core
 from neuron_specs import make_thalamic, make_stn, make_gpe, make_gpi

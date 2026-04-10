@@ -22,7 +22,7 @@ from hodgkin_huxley import (
     ConnectivityPattern,
     NeuronModelSpec,
     SynapseSpec,
-    SynapseSpecType,
+    SynapseUpdateForm,
     WeightDistribution,
     WeightDistType,
     IzhikevichType,
@@ -317,43 +317,43 @@ class TestCustomPatterns:
 class TestSynapseSpec:
     def test_ampa_preset(self):
         s = SynapseSpec.ampa()
-        assert s.type == SynapseSpecType.DOUBLE_EXPONENTIAL
+        assert s.update_form == SynapseUpdateForm.DOUBLE_EXP
         assert s.E_syn == 0.0
-        assert s.tau_rise == 0.5
-        assert s.tau_decay == 2.5
+        assert s.tau_A == 0.5    # tau_rise
+        assert s.tau_S == 2.5   # tau_decay
 
     def test_nmda_preset(self):
         s = SynapseSpec.nmda()
-        assert s.type == SynapseSpecType.DOUBLE_EXPONENTIAL
+        assert s.update_form == SynapseUpdateForm.DOUBLE_EXP
         assert s.E_syn == 0.0
-        assert s.tau_rise == 2.0
-        assert s.tau_decay == 67.0
+        assert s.tau_A == 2.0   # tau_rise
+        assert s.tau_S == 67.0  # tau_decay
 
     def test_gaba_a_preset(self):
         s = SynapseSpec.gaba_a()
-        assert s.type == SynapseSpecType.DOUBLE_EXPONENTIAL
+        assert s.update_form == SynapseUpdateForm.DOUBLE_EXP
         assert s.E_syn == -80.0
-        assert s.tau_rise == 0.4
-        assert s.tau_decay == 7.7
+        assert s.tau_A == 0.4   # tau_rise
+        assert s.tau_S == 7.7   # tau_decay
 
     def test_custom_exponential(self):
-        s = SynapseSpec.exponential(E_syn=-70.0, tau=5.0)
-        assert s.type == SynapseSpecType.EXPONENTIAL
+        s = SynapseSpec.exponential(5.0, E_syn=-70.0)
+        assert s.update_form == SynapseUpdateForm.EXP_DECAY
         assert s.E_syn == -70.0
-        assert s.tau == 5.0
+        assert s.tau_S == 5.0
 
     def test_custom_alpha(self):
-        s = SynapseSpec.alpha(E_syn=0.0, tau=3.0)
-        assert s.type == SynapseSpecType.ALPHA
+        s = SynapseSpec.alpha_function(3.0, E_syn=0.0)
+        assert s.update_form == SynapseUpdateForm.ALPHA_FUNC
         assert s.E_syn == 0.0
-        assert s.tau == 3.0
+        assert s.tau_S == 3.0
 
     def test_custom_double_exp(self):
-        s = SynapseSpec.double_exponential(E_syn=-85.0, tau_rise=1.0, tau_decay=10.0)
-        assert s.type == SynapseSpecType.DOUBLE_EXPONENTIAL
+        s = SynapseSpec.double_exponential(1.0, 10.0, E_syn=-85.0)
+        assert s.update_form == SynapseUpdateForm.DOUBLE_EXP
         assert s.E_syn == -85.0
-        assert s.tau_rise == 1.0
-        assert s.tau_decay == 10.0
+        assert s.tau_A == 1.0   # tau_rise
+        assert s.tau_S == 10.0  # tau_decay
 
 
 # =============================================================================
@@ -642,10 +642,9 @@ class TestIntegration:
         rn.connect("GPe", "GPe", "random_sparse", weight=0.25, delay=1.0,
                    synapse=SynapseSpec.gaba_a(), probability=0.3, seed=42)
         rn.connect("GPi", "TH", "one_to_one", weight=0.112, delay=5.0,
-                   synapse=SynapseSpec.alpha(E_syn=-85.0, tau=5.0))
+                   synapse=SynapseSpec.alpha_function(5.0, E_syn=-85.0))
         rn.connect("CtxE", "STN", "random_permutation", weight=0.003, delay=5.9,
-                   synapse=SynapseSpec.double_exponential(E_syn=0.0, tau_rise=2.0,
-                                                          tau_decay=90.0),
+                   synapse=SynapseSpec.double_exponential(2.0, 90.0),
                    seed=42)
         rn.connect("CtxE", "StrD1", "one_to_one", weight=0.1, delay=3.0,
                    synapse=SynapseSpec.ampa())
@@ -679,12 +678,11 @@ class TestIntegration:
         rn.add_population("C", 5, neuron_type="HH")
 
         rn.connect("A", "B", "one_to_one", weight=0.3,
-                   synapse=SynapseSpec.exponential(E_syn=0.0, tau=2.0))
+                   synapse=SynapseSpec.exponential(2.0))
         rn.connect("B", "C", "one_to_one", weight=0.3,
-                   synapse=SynapseSpec.alpha(E_syn=0.0, tau=3.0))
+                   synapse=SynapseSpec.alpha_function(3.0))
         rn.connect("A", "C", "one_to_one", weight=0.1,
-                   synapse=SynapseSpec.double_exponential(
-                       E_syn=0.0, tau_rise=0.5, tau_decay=5.0))
+                   synapse=SynapseSpec.double_exponential(0.5, 5.0))
 
         traces = rn.simulate(50.0, 0.01, {"A": 15.0})
 
@@ -890,7 +888,7 @@ class TestSynapticMath:
             rn.add_population("pre", 5, neuron_type="HH")
             rn.add_population("post", 1, neuron_type="HH")
             rn.connect("pre", "post", "all_to_all", weight=0.5,
-                       synapse=SynapseSpec.exponential(E_syn=e_syn, tau=2.0))
+                       synapse=SynapseSpec.exponential(2.0, E_syn=e_syn))
             # Drive pre to fire, give post a moderate current
             traces = rn.simulate(200.0, 0.01, {"pre": 15.0, "post": 8.0})
             results[label] = count_spikes(traces["post"][0])
@@ -931,8 +929,8 @@ class TestSynapticMath:
         """Alpha synapse has a smooth rise-then-fall. Verify post-synaptic
         response is delayed relative to exponential (which rises instantly)."""
         results = {}
-        for label, syn in [("exp", SynapseSpec.exponential(E_syn=0.0, tau=5.0)),
-                           ("alpha", SynapseSpec.alpha(E_syn=0.0, tau=5.0))]:
+        for label, syn in [("exp", SynapseSpec.exponential(5.0)),
+                           ("alpha", SynapseSpec.alpha_function(5.0))]:
             rn = RegionalNetwork()
             rn.add_population("pre", 1, neuron_type="HH")
             rn.add_population("post", 1, neuron_type="HH")

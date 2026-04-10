@@ -26,25 +26,8 @@ enum class ConnectivityPattern {
     RANDOM_PERMUTATION
 };
 
-// --- Synapse configuration ---
-struct SynapseSpec {
-    enum class Type { EXPONENTIAL, ALPHA, DOUBLE_EXPONENTIAL };
-    Type type;
-    double E_syn;
-    double tau;        // exponential, alpha
-    double tau_rise;   // double_exp only
-    double tau_decay;  // double_exp only
-
-    // Preset receptor factories
-    static SynapseSpec ampa();
-    static SynapseSpec nmda();
-    static SynapseSpec gaba_a();
-
-    // Custom factories
-    static SynapseSpec exponential(double E_syn, double tau);
-    static SynapseSpec alpha(double E_syn, double tau);
-    static SynapseSpec double_exponential(double E_syn, double tau_rise, double tau_decay);
-};
+// SynapseSpec is the unified synapse model specification from model/synapse_spec.hpp
+// (included transitively via network.hpp → ion_channels.hpp).
 
 // --- Weight distribution ---
 enum class WeightDistType { CONSTANT, UNIFORM, NORMAL };
@@ -101,7 +84,7 @@ public:
     // Add a kinetic synapse between two populations using local indices
     void add_kinetic_connection(const std::string& src, size_t i,
                                 const std::string& dst, size_t j,
-                                double weight, const KineticSynapseSpec& spec,
+                                double weight, const SynapseSpec& spec,
                                 double delay = 0.0);
 
     // Heterogeneous initial conditions
@@ -132,8 +115,6 @@ private:
     std::map<std::string, size_t> pop_index_;
 
     void validate_population(const std::string& name) const;
-    void add_synapse_from_spec(size_t pre, size_t post, double weight,
-                               const SynapseSpec& spec, double delay);
     void generate_connections(const Population& src, const Population& dst,
                               ConnectivityPattern pattern,
                               const SynapseSpec& synapse,

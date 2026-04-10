@@ -29,20 +29,22 @@ import hodgkin_huxley as hh
 from hodgkin_huxley import (
     RegionalNetwork,
     KineticSynapseSpec,
-    KineticUpdateForm,
-    KineticCurrentForm,
     KineticSynapseModel,
     NeuronModelSpec,
     SynapseSpec,
     RecordingConfig,
     WeightDistribution,
     ConnectivityPattern,
+    IzhikevichType,
+)
+from hodgkin_huxley._core import (
+    KineticUpdateForm,
+    KineticCurrentForm,
     TauParams,
     TauForm,
     BoltzmannParams,
     RateFuncParams,
     RateFuncForm,
-    IzhikevichType,
 )
 from neuron_specs import make_thalamic, make_stn, make_gpe, make_gpi, make_striatum
 
@@ -626,7 +628,7 @@ def test_kinetic_plus_exponential():
     rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5,
                                spec=KineticSynapseSpec.gaba_kinetic())
     rn.connect("N1", "post", "all_to_all", weight=0.5,
-                synapse=SynapseSpec.exponential(0.0, 2.0))
+                synapse=SynapseSpec.exponential(2.0))
     result = rn.simulate(200.0, DT, {"N0": 10.0, "N1": 10.0, "post": 0.0})
     traces = np.vstack([result["N0"], result["N1"], result["post"]])
     assert _all_finite(traces)
@@ -641,7 +643,7 @@ def test_kinetic_plus_alpha():
     rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5,
                                spec=KineticSynapseSpec.gaba_kinetic())
     rn.connect("N1", "post", "all_to_all", weight=0.5,
-                synapse=SynapseSpec.alpha(0.0, 2.0))
+                synapse=SynapseSpec.alpha_function(2.0))
     result = rn.simulate(200.0, DT, {"N0": 10.0, "N1": 10.0, "post": 0.0})
     traces = np.vstack([result["N0"], result["N1"], result["post"]])
     assert _all_finite(traces)
@@ -656,7 +658,7 @@ def test_kinetic_plus_double_exp():
     rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5,
                                spec=KineticSynapseSpec.gaba_kinetic())
     rn.connect("N1", "post", "all_to_all", weight=0.5,
-                synapse=SynapseSpec.double_exponential(0.0, 0.4, 2.5))
+                synapse=SynapseSpec.double_exponential(0.4, 2.5))
     result = rn.simulate(200.0, DT, {"N0": 10.0, "N1": 10.0, "post": 0.0})
     traces = np.vstack([result["N0"], result["N1"], result["post"]])
     assert _all_finite(traces)
@@ -672,11 +674,11 @@ def test_all_synapse_types_together():
     rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.2,
                                spec=KineticSynapseSpec.gaba_kinetic())
     rn.connect("N1", "post", "all_to_all", weight=0.2,
-                synapse=SynapseSpec.exponential(0.0, 2.0))
+                synapse=SynapseSpec.exponential(2.0))
     rn.connect("N2", "post", "all_to_all", weight=0.2,
-                synapse=SynapseSpec.alpha(0.0, 2.0))
+                synapse=SynapseSpec.alpha_function(2.0))
     rn.connect("N3", "post", "all_to_all", weight=0.2,
-                synapse=SynapseSpec.double_exponential(0.0, 0.5, 3.0))
+                synapse=SynapseSpec.double_exponential(0.5, 3.0))
 
     I_dict = {"N0": 10.0, "N1": 10.0, "N2": 10.0, "N3": 10.0, "post": 0.0}
     result = rn.simulate(200.0, DT, I_dict)
@@ -696,10 +698,10 @@ def test_kinetic_before_and_after_regular_synapses():
         if kin_first:
             rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5, spec=spec)
             rn.connect("N1", "post", "all_to_all", weight=0.5,
-                        synapse=SynapseSpec.exponential(0.0, 2.0))
+                        synapse=SynapseSpec.exponential(2.0))
         else:
             rn.connect("N1", "post", "all_to_all", weight=0.5,
-                        synapse=SynapseSpec.exponential(0.0, 2.0))
+                        synapse=SynapseSpec.exponential(2.0))
             rn.add_kinetic_connection("N0", 0, "post", 0, weight=0.5, spec=spec)
         return rn
 

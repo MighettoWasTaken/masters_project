@@ -49,9 +49,9 @@ def make_thalamic(V_init: float = -65.0) -> NeuronModelSpec:
                           derived_source_gate=h_t,
                           derived_a=0.75, derived_b=1.0, derived_c=-1.0)
 
-    model.add_channel("Na",   g=3.0,  E_rev=50.0,  gates=[(m_na, 3), (h_na, 1)])
-    model.add_channel("K",    g=5.0,  E_rev=-90.0, gates=[(n_k, 4)])
-    model.add_channel("T",    g=5.0,  E_rev=0.0,   gates=[(m_t, 2), (h_t, 1)])
+    model.add_channel("Na",   g=3.0,  E_rev=50.0,  gating=m_na**3 * h_na)
+    model.add_channel("K",    g=5.0,  E_rev=-90.0, gating=n_k**4)
+    model.add_channel("T",    g=5.0,  E_rev=0.0,   gating=m_t**2 * h_t)
     model.add_channel("Leak", g=0.05, E_rev=-70.0)
 
     return model.to_spec()
@@ -99,14 +99,14 @@ def make_stn() -> NeuronModelSpec:
                          inf=Boltzmann(0.17, 0.08),
                          tau=Tau.constant(2.0))
 
-    model.add_channel("Na",    g=49.0,  E_rev= 60.0, gates=[(m, 3), (h, 1)])
-    model.add_channel("K",     g=57.0,  E_rev=-90.0, gates=[(n, 4)])
-    model.add_channel("A",     g= 5.0,  E_rev=-90.0, gates=[(a, 2), (b, 1)])
+    model.add_channel("Na",    g=49.0,  E_rev= 60.0, gating=m**3 * h)
+    model.add_channel("K",     g=57.0,  E_rev=-90.0, gating=n**4)
+    model.add_channel("A",     g= 5.0,  E_rev=-90.0, gating=a**2 * b)
     cal = model.add_channel("CaL",  g= 0.5,  E_rev=  0.0,
-                             use_calcium_nernst=True, gates=[(c, 2), (d1, 1), (d2, 1)])
+                             use_calcium_nernst=True, gating=c**2 * d1 * d2)
     t   = model.add_channel("T",    g= 5.0,  E_rev=  0.0,
-                             use_calcium_nernst=True, gates=[(p, 2), (q, 1)])
-    model.add_channel("AHP_K", g= 1.0,  E_rev=-90.0, gates=[(r, 2)])
+                             use_calcium_nernst=True, gating=p**2 * q)
+    model.add_channel("AHP_K", g= 1.0,  E_rev=-90.0, gating=r**2)
     model.add_channel("Leak",  g=0.35,  E_rev=-60.0)
 
     model.set_calcium(epsilon=5.182e-6, K_Ca=386.0, Ca_init=0.005,
@@ -137,10 +137,10 @@ def make_gpe() -> NeuronModelSpec:
     s = model.add_gate("s_CaL", update_form="instant", initial_value=0.0,
                         inf=Boltzmann(-35.0,   2.0))
 
-    model.add_channel("Na",   g=120.0, E_rev= 55.0, gates=[(m, 3), (h, 1)])
-    model.add_channel("K",    g= 30.0, E_rev=-80.0, gates=[(n, 4)])
-    t_ch = model.add_channel("T",   g=  0.5, E_rev=120.0, gates=[(a, 3), (r, 1)])
-    cal  = model.add_channel("CaL", g= 0.15, E_rev=120.0, gates=[(s, 2)])
+    model.add_channel("Na",   g=120.0, E_rev= 55.0, gating=m**3 * h)
+    model.add_channel("K",    g= 30.0, E_rev=-80.0, gating=n**4)
+    t_ch = model.add_channel("T",   g=  0.5, E_rev=120.0, gating=a**3 * r)
+    cal  = model.add_channel("CaL", g= 0.15, E_rev=120.0, gating=s**2)
     model.add_channel("AHP",  g= 10.0, E_rev=-80.0, is_ahp=True, ahp_k1=10.0)
     model.add_channel("Leak", g=  0.1, E_rev=-65.0)
 
@@ -177,9 +177,9 @@ def make_striatum(pd: float = 0.0) -> NeuronModelSpec:
                         inf=Boltzmann(-30.0, 9.0),
                         tau=Tau.scaled_exp(1000.0, -35.0, 20.0))
 
-    model.add_channel("Na",   g=100.0,          E_rev= 50.0, gates=[(m, 3), (h, 1)])
-    model.add_channel("K",    g= 80.0,          E_rev=-100.0, gates=[(n, 4)])
-    model.add_channel("M",    g=1.2 - 0.8 * pd, E_rev=-100.0, gates=[(p, 1)])
+    model.add_channel("Na",   g=100.0,          E_rev= 50.0, gating=m**3 * h)
+    model.add_channel("K",    g= 80.0,          E_rev=-100.0, gating=n**4)
+    model.add_channel("M",    g=1.2 - 0.8 * pd, E_rev=-100.0, gating=p)
     model.add_channel("Leak", g=  0.1,          E_rev= -67.0)
 
     return model.to_spec()
