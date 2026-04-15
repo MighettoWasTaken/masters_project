@@ -4,7 +4,10 @@ hodgkin_huxley._network — RegionalNetwork and supporting helpers.
 
 from __future__ import annotations
 
-from typing import overload
+from typing import TYPE_CHECKING, overload
+
+if TYPE_CHECKING:
+    from .._equations import SynapseModel
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -266,7 +269,7 @@ class RegionalNetwork:
         pattern,
         weight: float | tuple[float, float] | WeightDistribution = 0.0,
         delay: float = 0.0,
-        synapse: "SynapseSpec | None" = None,
+        synapse: SynapseSpec | SynapseModel | None = None,
         shift: int = 1,
         probability: float = 0.1,
         allow_self: bool = False,
@@ -379,7 +382,7 @@ class RegionalNetwork:
         dst: str,
         dst_local: int,
         weight: float,
-        synapse: "SynapseSpec | None" = None,
+        synapse: SynapseSpec | SynapseModel | None = None,
         delay: float = 0.0,
     ) -> None:
         """Add a single synapse between two populations using local indices."""
@@ -409,7 +412,7 @@ class RegionalNetwork:
         src: str,
         dst: str,
         matrix,
-        synapse: "SynapseSpec | None" = None,
+        synapse: SynapseSpec | SynapseModel | None = None,
         delay: float = 0.0,
         weight_scale: float = 1.0,
     ) -> None:
@@ -438,6 +441,9 @@ class RegionalNetwork:
             synapse.  Useful for unit conversions or gain tuning without
             modifying the matrix.
         """
+        from .._equations import SynapseModel as _SynapseModel
+        if isinstance(synapse, _SynapseModel):
+            synapse = synapse.to_spec()
         synapse = synapse or SynapseSpec.ampa()
         src_size = self._rnet.population_size(src)
         dst_size = self._rnet.population_size(dst)
