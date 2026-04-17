@@ -100,6 +100,10 @@ public:
     size_t population_start(const std::string& name) const;
     size_t num_populations() const;
 
+    // Update the NeuronModelSpec for a named population and rebuild pools.
+    // Called by Python add_intracellular() after appending an IntracellularSpec.
+    void update_population_spec(const std::string& name, const NeuronModelSpec& spec);
+
     // Delegation
     size_t num_neurons() const;
     size_t num_synapses() const;
@@ -113,6 +117,7 @@ private:
     Network net_;
     std::vector<Population> populations_;
     std::map<std::string, size_t> pop_index_;
+    std::map<std::string, NeuronModelSpec> pop_specs_;  // per-population stored spec (task14)
 
     void validate_population(const std::string& name) const;
     void generate_connections(const Population& src, const Population& dst,

@@ -93,7 +93,7 @@ _DEPRECATION_MESSAGES: dict[str, str] = {
     ),
     "AlphaSynapse": (
         "hodgkin_huxley.AlphaSynapse is deprecated. "
-        "Use SynapseSpec.alpha() instead."
+        "Use SynapseSpec.alpha_function() instead."
     ),
     "DoubleExponentialSynapse": (
         "hodgkin_huxley.DoubleExponentialSynapse is deprecated. "

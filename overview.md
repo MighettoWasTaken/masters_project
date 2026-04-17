@@ -36,8 +36,8 @@ This project builds a fast, generalized Python framework for complex brain netwo
 - **pybind11 bindings** (`src/python/bindings.cpp`): zero-copy numpy interface, GIL-released hot loop
 - **C++ core** (`src/cpp/`):
   - Neuron models: Hodgkin-Huxley, Izhikevich (5 presets), Composable (arbitrary channel/gate combinations)
-  - Ion channels: parameterized Boltzmann gates, 6 tau forms, alpha-beta kinetics, calcium dynamics (Nernst)
-  - Synapse models: Exponential, Alpha, Double-Exponential (AMPA/NMDA/GABA-A presets), Kinetic
+  - Ion channels: parameterized Boltzmann gates, 6 tau forms, alpha-beta kinetics; generalized intracellular dynamics (`IntracellularDynamics` + `Modulation` — calcium, dopamine, cAMP, or any user-defined substance via SymPy ODE)
+  - Synapse models: unified `SynapseSpec` covering 7 forms — EXP_DECAY, ALPHA_FUNC, DOUBLE_EXP, TANH_GATE, BOLTZMANN_GATE, ALPHA_BETA, CUSTOM_EXPR; AMPA/NMDA/GABA-A receptor presets; arbitrary kinetics via SymPy/VM
   - Network: `RegionalNetwork` (population-level API), `Network` (internal, SoA synapses, Eigen pools)
   - Stimulators: `PulseStimulator`, `DBSStimulator`, `StimPlan` compact descriptor
   - Analysis: multitaper spectral analysis (Chronux mtspectrumpt), beta-band power, recording configs
@@ -92,10 +92,10 @@ See `docs/roadmap.md` for the full multi-phase plan. Summary:
 | Phase | Focus | Tasks |
 |-------|-------|-------|
 | 1 (Complete) | Core framework + benchmark | task1–11 |
-| 2 (Current) | API clarity, extended biology | task12, 16, 17 |
-| 3 | Plasticity | task13 |
-| 4 | Performance scaling | task14, 15 |
-| 5 | Ecosystem / docs | task18 |
+| 2 (Complete) | API cleanup, equation system, intracellular | task12 (done), task13 (done), task14 (done) |
+| 3 (Next) | Plasticity | task15 |
+| 4 | Performance scaling | task16, task17, task19 |
+| 5 | Ecosystem / docs | task18, task20 |
 
 ## References
 

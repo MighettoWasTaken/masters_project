@@ -111,78 +111,188 @@ If the model requires a gate update form not in `GateSpec::UpdateForm` or a tau 
 
 ## 3. Adding a New Synapse Type
 
-### Step 1: Extend `SynType` and `SynArrays` in `network.hpp`
+### Python-only path (no C++ required — preferred for most cases)
 
-```cpp
-// In Network's private SynType enum:
-enum class SynType : uint8_t { SYN_EXP = 0, SYN_ALPHA = 1, SYN_DEXP = 2, SYN_KINETIC = 3, SYN_MYTYPE = 4 };
+Arbitrary kinetics can be expressed as SymPy expressions and compiled to the `CUSTOM_EXPR` VM path with no C++ changes:
 
-// In SynArrays, add type-specific state fields:
-std::vector<double> mytype_param1;
-std::vector<double> mytype_state1;
+```python
+import sympy as sp
+import hodgkin_huxley as hh
 
-// In SynArrays::push_type_defaults():
-mytype_param1.push_back(0.0);
-mytype_state1.push_back(0.0);
+# One-variable custom ODE
+dS_dt = sp.Float(2.0) * (1 + sp.tanh(hh.V_pre / 4)) * (1 - hh.S) - hh.S / 13.0
+syn = hh.SynapseModel("my_gaba", dS_dt=dS_dt, g=0.1, E_syn=-80.0)
+
+# Two-variable custom ODE (uses A as auxiliary state)
+dS_dt2 = (hh.A - hh.S) / 5.0
+dA_dt2 = -hh.A / 5.0
+syn2 = hh.SynapseModel("my_alpha", dS_dt=dS_dt2, dA_dt=dA_dt2,
+                        spike_A=1.0, g=0.1, E_syn=0.0)
+
+net.connect("pre", "post", "all_to_all", synapse=syn, weight=0.5)
 ```
 
-### Step 2: Add construction method in `network.hpp` / `network.cpp`
+`SynapseModel.to_spec()` pattern-matches against known ODE forms (EXP_DECAY, ALPHA_FUNC, DOUBLE_EXP) and selects the fast C++ path automatically. Only expressions that fail matching fall through to the VM.
+
+### C++ path (only for new dedicated update forms requiring novel exact-integration)
+
+### Step 1: Add an `UpdateForm` variant to `model/synapse_spec.hpp`
 
 ```cpp
-// In Network:
-size_t add_my_synapse(size_t pre, size_t post, double weight,
-                      double E_syn, double param1, double delay = 0.0);
+enum class UpdateForm {
+    EXP_DECAY, ALPHA_FUNC, DOUBLE_EXP,
+    TANH_GATE, BOLTZMANN_GATE, ALPHA_BETA,
+    CUSTOM_EXPR,
+    MY_FORM,   // ← add here
+};
+```
 
-// In network.cpp:
-size_t Network::add_my_synapse(...) {
-    // Push common fields
-    sa_.pre.push_back(pre); sa_.post.push_back(post);
-    sa_.weight.push_back(weight); sa_.E_syn.push_back(E_syn);
-    sa_.g.push_back(0.0); sa_.type.push_back(SynType::SYN_MYTYPE);
-    // Push type defaults (fills all other type-specific fields with 0)
-    sa_.push_type_defaults();
-    // Override this type's fields
-    sa_.mytype_param1.back() = param1;
-    // ... delay setup ...
-    groups_built_ = false;  // invalidate
-    // Create polymorphic object (for API access)
-    synapses_.push_back(std::make_unique<MySynapse>(...));
-    return synapses_.size() - 1;
+### Step 2: Add a static factory to `SynapseSpec` in `synapse_spec.cpp`
+
+```cpp
+// Declaration in synapse_spec.hpp:
+static SynapseSpec my_form(double tau, double g, double E_syn);
+
+// Implementation in synapse_spec.cpp:
+SynapseSpec SynapseSpec::my_form(double tau, double g, double E_syn) {
+    SynapseSpec s;
+    s.name = "my_form";
+    s.update_form = UpdateForm::MY_FORM;
+    s.tau_S = tau;   // reuse existing unified fields where possible
+    s.g = g;
+    s.E_syn = E_syn;
+    return s;
 }
 ```
 
-### Step 3: Add to `build_synapse_groups()` and `update_synapses_grouped()`
+Use the existing unified `SynArrays` fields (`S`, `A`, `delta_S`, `tau_S`, `tau_A`, `decay_S`, `decay_A`, `norm`) wherever possible. Add new SoA fields only if the existing set genuinely cannot express the form.
+
+### Step 3: Add to `SynapseGroups` and update loops in `network.hpp` / `network.cpp`
 
 ```cpp
+// In SynapseGroups (network.hpp):
+std::vector<size_t> my_form;
+
 // In build_synapse_groups():
-case SynType::SYN_MYTYPE: syn_groups_.mytype.push_back(i); break;
+case UpdateForm::MY_FORM: syn_groups_.my_form.push_back(i); break;
 
-// In update_synapses_grouped(), add a new type-specific loop:
-for (size_t i : syn_groups_.mytype) {
-    // update sa_.g[i] and sa_.mytype_state1[i]
-    // This loop must be branch-free within the loop body
+// In update_synapses_grouped() — branch-free inner loop:
+for (size_t i : syn_groups_.my_form) {
+    // exact update using sa_.S[i], sa_.tau_S[i], etc.
+    // no branching within the loop body
 }
 ```
 
-### Step 4: Bind in bindings.cpp
+### Step 4: Bind the new `UpdateForm` value in `bindings.cpp`
 
 ```cpp
-network_class
-    .def("add_my_synapse", &Network::add_my_synapse,
-         py::arg("pre"), py::arg("post"), py::arg("weight"),
-         py::arg("E_syn"), py::arg("param1"), py::arg("delay") = 0.0);
+py::enum_<SynapseSpec::UpdateForm>(m, "SynapseUpdateForm")
+    // ... existing values ...
+    .value("MY_FORM", SynapseSpec::UpdateForm::MY_FORM, "My custom form.");
 ```
 
-### Step 5: Add to SynapseSpec if population-level use is needed
+### Step 5: Add a `SynapseModel` named constructor in `_equations/__init__.py`
 
-Add a static factory to `SynapseSpec` in `regional_network.hpp`:
-```cpp
-static SynapseSpec my_type(double E_syn, double param1);
+```python
+@classmethod
+def my_form(cls, name: str = "my_form", *, tau: float, g: float = 0.1,
+            E_syn: float = 0.0) -> "SynapseModel":
+    obj = cls.__new__(cls)
+    s = _SynapseSpec()
+    s.name = name
+    s.update_form = _SynapseUpdateForm.MY_FORM
+    s.tau_S = tau
+    s.g = g
+    s.E_syn = E_syn
+    obj._name = name
+    obj._spec = s
+    return obj
+```
+
+### Step 6: Test
+
+Add tests in `tests/python/test_synapses.py` at three levels:
+1. Factory creates spec with correct fields
+2. Synapse transmits a spike correctly inside a `RegionalNetwork` simulation
+3. Conductance decays at the expected rate
+
+---
+
+## 4. Adding Intracellular Dynamics
+
+### Python-only path (no C++ required — always use this)
+
+Intracellular substances are expressed via `IntracellularDynamics` and `Modulation` builders using SymPy expressions. No C++ changes are needed.
+
+```python
+import sympy as sp
+import hodgkin_huxley as hh
+
+Ca = hh.Ca
+I_source = hh.I_source
+
+# Standard calcium ODE — pattern-matched to DRIVEN_DECAY_NERNST (no VM overhead)
+ca_dyn = hh.IntracellularDynamics(
+    "Ca",
+    ode=sp.Float(5.182e-6) * (-I_source - sp.Float(386.0) * Ca),
+    source_channels=["Ca_L"],
+    nernst=(hh.R * hh.T / (2 * hh.F)) * sp.log(sp.Float(2000.0) / Ca),
+    initial=5e-5,
+)
+net.add_intracellular(ca_dyn, populations=["STN"])
+
+# Dopamine with channel-g modulation
+Da = hh.Da
+da_dyn = hh.IntracellularDynamics(
+    "DA",
+    ode=-sp.Float(0.1) * Da,           # DECAY form
+    initial=0.0,
+    modulations=[
+        hh.Modulation.channel_g("K_AHP", sp.Float(1.0) / (sp.Float(1.0) + Da)),
+    ],
+)
+net.add_intracellular(da_dyn, populations=["STN"])
+```
+
+### Pattern matching
+
+`IntracellularDynamics.to_spec()` attempts pattern matching before VM compilation:
+
+| ODE expression | Form selected | Cost |
+|---|---|---|
+| `-k*X` | `DECAY` | zero VM |
+| `ε*(-I_source - k*X)` | `DRIVEN_DECAY` | zero VM |
+| As above + standard Nernst `(RT/zF)*log(X_o/X)` | `DRIVEN_DECAY_NERNST` | zero VM |
+| Anything else | `CUSTOM_EXPR` (VM bytecode) | small VM eval |
+
+### Modulation targets
+
+| Target | Classmethod | Effect |
+|---|---|---|
+| `CHANNEL_G` | `Modulation.channel_g(name, expr)` | `g_eff = g * expr(X)` |
+| `CHANNEL_EREV` | `Modulation.channel_erev(name, expr)` | `E_rev = expr(X)` |
+| `GATE_INF_SHIFT` | `Modulation.gate_inf_shift(name, scale)` | `x_inf(V + scale*X)` |
+| `GATE_INF_SCALE` | `Modulation.gate_inf_scale(name, expr)` | `x_inf *= expr(X)` |
+| `GATE_TAU_SCALE` | `Modulation.gate_tau_scale(name, expr)` | `tau *= expr(X)` |
+| `GATE_INF_EXPR` | `Modulation.gate_inf_expr(name, expr)` | `x_inf = expr(V, X)` |
+| `SYNAPSE_G` | `Modulation.synapse_g(expr)` | `I_syn *= expr(X)` per postsynaptic neuron |
+
+### Tests
+
+Add tests in `tests/python/test_intracellular.py`:
+```python
+def test_ca_decay_rate():
+    """DECAY form: exponential decay constant should match k_decay within 1%."""
+    ...
+
+def test_modulation_channel_g():
+    """CHANNEL_G mod: two identical networks, one with mod vs manual g scaling."""
+    ...
 ```
 
 ---
 
-## 4. IO Conventions
+## 5. IO Conventions
 
 ### 4.1 Arrays Crossing the Python/C++ Boundary
 
@@ -240,14 +350,14 @@ The Python `simulate()` method converts these to either a `_StimPlan` (for scala
 
 ---
 
-## 5. Naming Conventions
+## 6. Naming Conventions
 
 | Item | Convention | Example |
 |------|-----------|---------|
 | C++ classes | PascalCase | `ComposablePool`, `SynArrays` |
 | C++ methods/fields | snake_case | `step_rk4()`, `exp_decay_` |
 | C++ private members | trailing underscore | `n_`, `fast_math_`, `V_cache_` |
-| C++ enums | UPPER_SNAKE | `SynType::SYN_EXP`, `GateDependency::VOLTAGE` |
+| C++ enums | UPPER_SNAKE | `SynapseSpec::UpdateForm::EXP_DECAY`, `GateDependency::VOLTAGE` |
 | C++ spec structs | PascalCase + Spec/Params | `TauParams`, `NeuronModelSpec` |
 | Python-exposed names | snake_case (match C++) | `add_population()`, `num_neurons()` |
 | Python spec types | PascalCase | `SynapseSpec`, `WeightDistribution` |
@@ -256,7 +366,7 @@ The Python `simulate()` method converts these to either a `_StimPlan` (for scala
 
 ---
 
-## 6. Testing Conventions
+## 7. Testing Conventions
 
 ### File Organization
 
@@ -300,7 +410,7 @@ pytest tests/python/ -k "hh"           # tests matching pattern
 
 ---
 
-## 7. Python Binding Conventions
+## 8. Python Binding Conventions
 
 ### Binding a New Class
 
@@ -349,7 +459,7 @@ py::enum_<MyEnum>(m, "MyEnumName")
 
 ---
 
-## 8. Documentation Conventions
+## 9. Documentation Conventions
 
 ### C++ Docstrings (for pybind11)
 
@@ -384,7 +494,7 @@ Completed tasks move to `completed/`. Failed or abandoned tasks move to `failed/
 
 ---
 
-## 9. Build System Conventions
+## 10. Build System Conventions
 
 ### Adding a New Source File
 
@@ -422,7 +532,7 @@ target_link_libraries(hodgkin_huxley_core PUBLIC Eigen3::Eigen)
 
 ---
 
-## 10. Common Pitfalls
+## 11. Common Pitfalls
 
 ### Eigen Lazy Evaluation (CRITICAL)
 
@@ -441,7 +551,7 @@ After adding or removing synapses, `groups_built_` must be set to `false` so `bu
 
 ### Cached Decay Factors
 
-`exp_decay[]` and `dexp_rise_decay[]` / `dexp_fall_decay[]` are cached values of `exp(-dt/tau)`. They are recomputed in `update_decay_factors(dt)` only when `dt` changes. If a synapse's tau parameter is modified after simulation has started, call `sa_.cached_dt = -1.0` to force recomputation on the next step.
+`decay_S[]` and `decay_A[]` are cached values of `exp(-dt/tau_S)` and `exp(-dt/tau_A)`. They are recomputed in `update_decay_factors(dt)` only when `dt` changes. If a synapse's tau parameter is modified after simulation has started, set `sa_.cached_dt = -1.0` to force recomputation on the next step.
 
 ### Thread Safety
 

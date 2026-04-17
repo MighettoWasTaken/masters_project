@@ -55,6 +55,26 @@ I_source = symbols("I_source")
 g_sym = symbols("g")
 E_syn_sym = symbols("E_syn")
 
+# Pre-defined intracellular substance symbols (task14)
+DA   = symbols("DA")      # dopamine
+cAMP = symbols("cAMP")    # cyclic AMP
+IP3  = symbols("IP3")     # inositol trisphosphate
+NO   = symbols("NO")      # nitric oxide
+X_ic = symbols("X_ic")   # generic intracellular substance
+
+# Cache for substance() helper — avoids duplicate Symbol objects
+_substance_cache: dict[str, Symbol] = {
+    "DA": DA, "cAMP": cAMP, "IP3": IP3, "NO": NO, "X_ic": X_ic,
+    "Ca": Ca,
+}
+
+
+def substance(name: str) -> Symbol:
+    """Return a SymPy Symbol representing a named intracellular substance."""
+    if name not in _substance_cache:
+        _substance_cache[name] = symbols(name)
+    return _substance_cache[name]
+
 
 def gate(name: str) -> Symbol:
     """Return a SymPy Symbol representing a named gate variable."""
@@ -1168,11 +1188,16 @@ def _emit_vm(expr, dep_sym, vm, extra_syms=None) -> None:
     expr       : sympy expression
     dep_sym    : the primary dependent symbol → PUSH_DEP
     vm         : VmExpr being built
-    extra_syms : dict mapping additional sympy.Symbol → VmOp (e.g. {S: VmOp.PUSH_S})
+    extra_syms : dict mapping additional sympy.Symbol → VmOp or (VmOp, operand) tuple
+                 e.g. {S: VmOp.PUSH_S} or {DA: (VmOp.PUSH_X, 1)}
     """
     from hodgkin_huxley._core import VmOp
     if extra_syms and isinstance(expr, sympy.Symbol) and expr in extra_syms:
-        vm.add_instruction(extra_syms[expr])
+        val = extra_syms[expr]
+        if isinstance(val, tuple):
+            vm.add_instruction(val[0], val[1])
+        else:
+            vm.add_instruction(val)
         return
     if expr == dep_sym:
         vm.add_instruction(VmOp.PUSH_DEP)

@@ -299,6 +299,7 @@ void Network::ensure_buffers() {
     if (I_syn_buffer_.size() != n) {
         I_syn_buffer_.resize(n, 0.0);
         V_cache_.resize(n, 0.0);
+        synapse_g_scale_.assign(n, 1.0);
     }
 }
 
@@ -375,8 +376,13 @@ void Network::compute_synaptic_currents() {
     const double* V = V_cache_.data();
     double* I_syn = I_syn_buffer_.data();
 
-    for (size_t i = 0; i < S; ++i) {
-        I_syn[post[i]] += g[i] * (E_syn[i] - V[post[i]]);
+    if (!synapse_g_scale_.empty() && pool_mgr_.has_synapse_g_mods()) {
+        const double* gscale = synapse_g_scale_.data();
+        for (size_t i = 0; i < S; ++i)
+            I_syn[post[i]] += g[i] * gscale[post[i]] * (E_syn[i] - V[post[i]]);
+    } else {
+        for (size_t i = 0; i < S; ++i)
+            I_syn[post[i]] += g[i] * (E_syn[i] - V[post[i]]);
     }
 }
 
@@ -770,8 +776,14 @@ void Network::simulate_into_buffers(
         const size_t* post = sa_.post.data();
         const double* V = V_cache_.data();
         double* I_buf = I_syn_buffer_.data();
-        for (size_t i = 0; i < S; ++i)
-            I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
+        if (pool_mgr_.has_synapse_g_mods()) {
+            const double* gscale = synapse_g_scale_.data();
+            for (size_t i = 0; i < S; ++i)
+                I_buf[post[i]] += g[i] * gscale[post[i]] * (E_syn_data[i] - V[post[i]]);
+        } else {
+            for (size_t i = 0; i < S; ++i)
+                I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
+        }
 
         if (I_syn_buf && t % interval == 0) {
             size_t tr = t / interval;
@@ -781,6 +793,10 @@ void Network::simulate_into_buffers(
 
         pool_mgr_.gather_all_currents(I_syn_buffer_.data());
         pool_mgr_.step_all(dt);
+        if (pool_mgr_.has_synapse_g_mods()) {
+            std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
+            pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
+        }
         pool_mgr_.scatter_all_voltages(V_cache_.data());
 
         update_synapses_grouped(dt);
@@ -899,8 +915,14 @@ void Network::simulate_with_descriptors(
         const size_t* post = sa_.post.data();
         const double* V = V_cache_.data();
         double* I_buf = I_syn_buffer_.data();
-        for (size_t i = 0; i < S; ++i)
-            I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
+        if (pool_mgr_.has_synapse_g_mods()) {
+            const double* gscale = synapse_g_scale_.data();
+            for (size_t i = 0; i < S; ++i)
+                I_buf[post[i]] += g[i] * gscale[post[i]] * (E_syn_data[i] - V[post[i]]);
+        } else {
+            for (size_t i = 0; i < S; ++i)
+                I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
+        }
 
         if (I_syn_buf && t % interval == 0) {
             size_t tr = t / interval;
@@ -910,6 +932,10 @@ void Network::simulate_with_descriptors(
 
         pool_mgr_.gather_all_currents(I_syn_buffer_.data());
         pool_mgr_.step_all(dt);
+        if (pool_mgr_.has_synapse_g_mods()) {
+            std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
+            pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
+        }
         pool_mgr_.scatter_all_voltages(V_cache_.data());
 
         update_synapses_grouped(dt);

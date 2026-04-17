@@ -154,6 +154,9 @@ public:
     void set_fast_math(bool enabled) { fast_math_ = enabled; }
     [[nodiscard]] bool fast_math() const { return fast_math_; }
 
+    // Called by RegionalNetwork::update_population_spec() after modifying a pop's spec
+    void mark_pools_dirty() { pools_dirty_ = true; }
+
     [[nodiscard]] std::vector<double> get_potentials() const;
 
     void reset();
@@ -259,6 +262,7 @@ private:
     // Pre-allocated working buffers
     std::vector<double> I_syn_buffer_;
     std::vector<double> V_cache_;
+    std::vector<double> synapse_g_scale_;  // per-neuron synapse conductance multiplier (task14)
 
     // UpdateForm-based synapse groups for branch-free inner loops
     struct SynapseGroups {

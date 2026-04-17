@@ -53,13 +53,17 @@ void NeuronModelSpec::validate() const {
                       << "' CONSTANT tau=" << g.tau.params[0] << " is <= 0\n";
     }
 
-    // Calcium source channel checks
-    for (int ch_idx : calcium.source_channels) {
-        if (ch_idx < 0 || ch_idx >= n_channels)
-            throw std::invalid_argument(
-                "NeuronModelSpec '" + name + "': calcium.source_channels contains index "
-                + std::to_string(ch_idx) + " but spec has only "
-                + std::to_string(n_channels) + " channel(s)");
+    // Intracellular source channel checks
+    for (int si = 0; si < static_cast<int>(intracellular.size()); ++si) {
+        const auto& ic = intracellular[si];
+        for (int ch_idx : ic.source_channels) {
+            if (ch_idx < 0 || ch_idx >= n_channels)
+                throw std::invalid_argument(
+                    "NeuronModelSpec '" + name + "': intracellular[" + std::to_string(si)
+                    + "] ('" + ic.name + "') source_channels contains index "
+                    + std::to_string(ch_idx) + " but spec has only "
+                    + std::to_string(n_channels) + " channel(s)");
+        }
     }
 }
 

@@ -19,6 +19,8 @@ using namespace hodgkin_huxley;
 PYBIND11_MAKE_OPAQUE(std::vector<GateSpec>);
 PYBIND11_MAKE_OPAQUE(std::vector<ChannelSpec>);
 PYBIND11_MAKE_OPAQUE(std::vector<VmInstruction>);
+PYBIND11_MAKE_OPAQUE(std::vector<IntracellularSpec>);
+PYBIND11_MAKE_OPAQUE(std::vector<IntracellularModulation>);
 
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Neural simulation library - C++ backend";
@@ -606,6 +608,11 @@ PYBIND11_MODULE(_core, m) {
              py::arg("name"), py::arg("mean"), py::arg("std_dev"),
              py::arg("seed") = 0, py::arg("reset_gates") = false)
 
+        // Intracellular dynamics (task14)
+        .def("update_population_spec", &RegionalNetwork::update_population_spec,
+             "Push an updated NeuronModelSpec (e.g., with new intracellular) back to C++",
+             py::arg("name"), py::arg("spec"))
+
         // Population queries
         .def("population_names", &RegionalNetwork::population_names)
         .def("population_size", &RegionalNetwork::population_size, py::arg("name"))
@@ -683,6 +690,8 @@ PYBIND11_MODULE(_core, m) {
     py::bind_vector<std::vector<GateSpec>>(m, "GateSpecVector");
     py::bind_vector<std::vector<ChannelSpec>>(m, "ChannelSpecVector");
     py::bind_vector<std::vector<VmInstruction>>(m, "VmInstructionVector");
+    py::bind_vector<std::vector<IntracellularSpec>>(m, "IntracellularSpecVector");
+    py::bind_vector<std::vector<IntracellularModulation>>(m, "IntracellularModulationVector");
 
     // VM bytecode types
     py::enum_<VmOp>(m, "VmOp")
@@ -700,6 +709,7 @@ PYBIND11_MODULE(_core, m) {
         .value("PUSH_GATE", VmOp::PUSH_GATE)
         .value("PUSH_S",    VmOp::PUSH_S)
         .value("PUSH_A",    VmOp::PUSH_A)
+        .value("PUSH_X",    VmOp::PUSH_X)  // push X_[operand] substance concentration
         .export_values();
 
     py::class_<VmInstruction>(m, "VmInstruction")
@@ -726,8 +736,9 @@ PYBIND11_MODULE(_core, m) {
         .export_values();
 
     py::enum_<GateSpec::Dependency>(m, "GateDependency")
-        .value("VOLTAGE", GateSpec::Dependency::VOLTAGE)
-        .value("CALCIUM", GateSpec::Dependency::CALCIUM)
+        .value("VOLTAGE",        GateSpec::Dependency::VOLTAGE)
+        .value("INTRACELLULAR",  GateSpec::Dependency::INTRACELLULAR)
+        .value("CALCIUM",        GateSpec::Dependency::INTRACELLULAR)  // deprecated alias
         .export_values();
 
     py::class_<GateSpec>(m, "GateSpec")
@@ -735,6 +746,7 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("name", &GateSpec::name)
         .def_readwrite("update_form", &GateSpec::update_form)
         .def_readwrite("dependency", &GateSpec::dependency)
+        .def_readwrite("intracellular_idx", &GateSpec::intracellular_idx)
         .def_readwrite("scale", &GateSpec::scale)
         .def_readwrite("initial_value", &GateSpec::initial_value)
         .def_readwrite("inf", &GateSpec::inf)
@@ -760,7 +772,14 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("name", &ChannelSpec::name)
         .def_readwrite("g", &ChannelSpec::g)
         .def_readwrite("E_rev", &ChannelSpec::E_rev)
-        .def_readwrite("use_calcium_nernst", &ChannelSpec::use_calcium_nernst)
+        .def_readwrite("nernst_substance_idx", &ChannelSpec::nernst_substance_idx,
+                       "Index into NeuronModelSpec.intracellular for Nernst reversal (-1=none)")
+        .def_readwrite("ahp_substance_idx", &ChannelSpec::ahp_substance_idx,
+                       "Index into NeuronModelSpec.intracellular for AHP drive substance")
+        // Deprecated backward-compat property: use_calcium_nernst → nernst_substance_idx=0
+        .def_property("use_calcium_nernst",
+            [](const ChannelSpec& c) { return c.nernst_substance_idx == 0; },
+            [](ChannelSpec& c, bool v) { c.nernst_substance_idx = v ? 0 : -1; })
         .def_readwrite("gates", &ChannelSpec::gates)
         .def_readwrite("is_ahp", &ChannelSpec::is_ahp)
         .def_readwrite("ahp_k1", &ChannelSpec::ahp_k1)
@@ -787,6 +806,57 @@ PYBIND11_MODULE(_core, m) {
             return "<CalciumSpec enabled=" + std::string(c.enabled ? "true" : "false") + ">";
         });
 
+    // IntracellularModulation
+    py::enum_<IntracellularModulation::Target>(m, "IntracellularModulationTarget")
+        .value("CHANNEL_G",      IntracellularModulation::Target::CHANNEL_G)
+        .value("CHANNEL_EREV",   IntracellularModulation::Target::CHANNEL_EREV)
+        .value("GATE_INF_SHIFT", IntracellularModulation::Target::GATE_INF_SHIFT)
+        .value("GATE_INF_SCALE", IntracellularModulation::Target::GATE_INF_SCALE)
+        .value("GATE_TAU_SCALE", IntracellularModulation::Target::GATE_TAU_SCALE)
+        .value("GATE_INF_EXPR",  IntracellularModulation::Target::GATE_INF_EXPR)
+        .value("SYNAPSE_G",      IntracellularModulation::Target::SYNAPSE_G)
+        .export_values();
+
+    py::class_<IntracellularModulation>(m, "IntracellularModulation")
+        .def(py::init<>())
+        .def_readwrite("target",       &IntracellularModulation::target)
+        .def_readwrite("target_idx",   &IntracellularModulation::target_idx)
+        .def_readwrite("substance_idx",&IntracellularModulation::substance_idx)
+        .def_readwrite("mod_vm",       &IntracellularModulation::mod_vm)
+        .def_readwrite("shift_scale",  &IntracellularModulation::shift_scale)
+        .def("__repr__", [](const IntracellularModulation& m) {
+            return "<IntracellularModulation>";
+        });
+
+    // IntracellularSpec
+    py::enum_<IntracellularSpec::UpdateForm>(m, "IntracellularUpdateForm")
+        .value("DECAY",                IntracellularSpec::UpdateForm::DECAY)
+        .value("DRIVEN_DECAY",         IntracellularSpec::UpdateForm::DRIVEN_DECAY)
+        .value("DRIVEN_DECAY_NERNST",  IntracellularSpec::UpdateForm::DRIVEN_DECAY_NERNST)
+        .value("CUSTOM_EXPR",          IntracellularSpec::UpdateForm::CUSTOM_EXPR)
+        .export_values();
+
+    py::class_<IntracellularSpec>(m, "IntracellularSpec")
+        .def(py::init<>())
+        .def_readwrite("name",            &IntracellularSpec::name)
+        .def_readwrite("initial",         &IntracellularSpec::initial)
+        .def_readwrite("update_form",     &IntracellularSpec::update_form)
+        .def_readwrite("epsilon",         &IntracellularSpec::epsilon)
+        .def_readwrite("k_decay",         &IntracellularSpec::k_decay)
+        .def_readwrite("source_channels", &IntracellularSpec::source_channels)
+        .def_readwrite("nernst_enabled",  &IntracellularSpec::nernst_enabled)
+        .def_readwrite("nernst_Ca_o",     &IntracellularSpec::nernst_Ca_o)
+        .def_readwrite("nernst_z",        &IntracellularSpec::nernst_z)
+        .def_readwrite("nernst_R",        &IntracellularSpec::nernst_R)
+        .def_readwrite("nernst_F",        &IntracellularSpec::nernst_F)
+        .def_readwrite("nernst_T",        &IntracellularSpec::nernst_T)
+        .def_readwrite("nernst_vm",       &IntracellularSpec::nernst_vm)
+        .def_readwrite("ode_vm",          &IntracellularSpec::ode_vm)
+        .def_readwrite("modulations",     &IntracellularSpec::modulations)
+        .def("__repr__", [](const IntracellularSpec& s) {
+            return "<IntracellularSpec '" + s.name + "'>";
+        });
+
     // NeuronModelSpec
     py::class_<NeuronModelSpec>(m, "NeuronModelSpec")
         .def(py::init<>())
@@ -795,7 +865,35 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("V_init", &NeuronModelSpec::V_init)
         .def_readwrite("gates", &NeuronModelSpec::gates)
         .def_readwrite("channels", &NeuronModelSpec::channels)
-        .def_readwrite("calcium", &NeuronModelSpec::calcium)
+        .def_readwrite("intracellular", &NeuronModelSpec::intracellular,
+                       "List of IntracellularSpec (ordered: index 0 = calcium by convention)")
+        // Deprecated backward-compat: NeuronModelSpec.calcium ↔ intracellular[0]
+        .def_property("calcium",
+            [](const NeuronModelSpec& s) -> CalciumSpec {
+                CalciumSpec ca;
+                ca.Ca_init = 0.0;  // default when no intracellular — backward compat
+                if (!s.intracellular.empty()) {
+                    const auto& ic = s.intracellular[0];
+                    ca.enabled   = true;
+                    ca.use_nernst = ic.nernst_enabled;
+                    ca.epsilon   = ic.epsilon;
+                    ca.K_Ca      = ic.k_decay;
+                    ca.Ca_init   = ic.initial;
+                    ca.Ca_o      = ic.nernst_Ca_o;
+                    ca.z         = ic.nernst_z;
+                    ca.F         = ic.nernst_F;
+                    ca.R         = ic.nernst_R;
+                    ca.T         = ic.nernst_T;
+                }
+                return ca;
+            },
+            [](NeuronModelSpec& s, const CalciumSpec& ca) {
+                if (ca.enabled) {
+                    auto ic = ca.to_intracellular_spec();
+                    if (s.intracellular.empty()) s.intracellular.push_back(ic);
+                    else s.intracellular[0] = ic;
+                }
+            })
         .def_static("hh_default", &NeuronModelSpec::hh_default,
                     "Classic Hodgkin-Huxley squid axon model (Na, K, Leak channels)")
         .def_static("izhikevich",

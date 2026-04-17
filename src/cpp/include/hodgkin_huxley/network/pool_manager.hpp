@@ -44,11 +44,21 @@ public:
     void scatter_calcium(double* ca_buf, size_t n_rec, size_t tr) const;
     void scatter_recoveries(double* u_buf, size_t n_rec, size_t tr) const;
 
+    // --- Intracellular substance delegates (task14) ---
+    /// Scatter X_[subst_idx] for all ComposablePools into buf[net_idx * n_rec + tr]
+    void scatter_substances(size_t subst_idx, double* buf, size_t n_rec, size_t tr) const;
+    /// Reset buf[net_idx] = 1.0 then let each ComposablePool write its synapse_g_scale
+    void scatter_synapse_g_scale(double* buf) const;
+
     bool empty() const {
         return hh_pool_.empty() && iz_pool_.empty() && comp_pools_.empty();
     }
 
+    // True if any ComposablePool has a SYNAPSE_G modulation (set after build)
+    bool has_synapse_g_mods() const { return has_synapse_g_mods_; }
+
 private:
+    bool has_synapse_g_mods_ = false;
     HHPool hh_pool_;
     IzPool iz_pool_;
     std::map<std::string, ComposablePool> comp_pools_;

@@ -34,15 +34,17 @@ All foundational features required to reproduce the Hahn/Kumaravelu CTX-BG-TH Pa
 
 task12 (structural cleanup) has no dependencies and should be done first to clear the surface before any new feature work. task13 (SymPy equation system) is the highest-priority feature and unblocks everything else in phases 2–4.
 
-| Task | Title | Priority | Dependencies |
-|------|-------|----------|--------------|
-| [task12](../task12.md) | API Structural Cleanup | 2 | None — **start here** |
-| [task13](../task13.md) | Unified Equation System (SymPy) | 2 | task12 recommended first |
-| [task14](../task14.md) | Generalized Intracellular Dynamics | 2 | task13 (ODE fields use SymPy) |
+| Task | Title | Priority | Status |
+|------|-------|----------|--------|
+| [task12](../completed/task12.md) | API Structural Cleanup | 2 | **Complete** |
+| [task13](../task13.md) / [task13.5](../task13.5.md) | Unified Equation System (SymPy) + Synapse Overhaul | 2 | **Complete** |
+| [task14](../task14.md) | Generalized Intracellular Dynamics | 2 | **Complete** |
 
-task13 also includes its own API cleanup section (13.9) which retires the legacy equation types (`BoltzmannParams`, `TauParams`, form enums) to `hodgkin_huxley.legacy` once SymPy is in place.
+task13 delivered: unified `SynapseSpec` (7 UpdateForms replacing the old class hierarchy), `SynapseModel` Python builder with SymPy pattern matching, VM bytecode for `CUSTOM_EXPR` forms, JIT compilation for gate kinetics, `NeuronModel` builder, and full API cleanup — legacy equation types (`BoltzmannParams`, `TauParams`, form enums) retired to `hodgkin_huxley.legacy`. See `task13.5.md` for the detailed implementation record.
 
-**Key outcomes:** One canonical network-building workflow; one equation language (SymPy) across all model definitions; legacy equation types retired; arbitrary intracellular substances (dopamine, cAMP, etc.).
+task14 delivered: `CalciumSpec` / `Ca_` / `E_Ca_` replaced by a general `std::vector<IntracellularSpec>` system. Calcium is index 0 by convention. New Python builders — `IntracellularDynamics` (with SymPy ODE + Nernst pattern matching) and `Modulation` (7 target types: CHANNEL_G, CHANNEL_EREV, GATE_INF_SHIFT, GATE_INF_SCALE, GATE_TAU_SCALE, GATE_INF_EXPR, SYNAPSE_G). `RegionalNetwork.add_intracellular()` attaches dynamics to named populations. Hot-loop allocation-free: modulation scratch arrays pre-allocated as members; per-channel currents cached and reused; E_rev stored as pre-filled member arrays; gate modulation ops skipped entirely when no modulations are active. Legacy `CalciumSpec` API emits `DeprecationWarning` and delegates to the new system.
+
+**Key outcomes achieved:** One canonical network-building workflow; SymPy equation language across all model definitions; unified synapse architecture with branch-free SoA hot loops; arbitrary intracellular substances expressible in Python without C++ changes; benchmark restores to pre-task14 performance (1.1–1.2 s / 1000 ms at n=10).
 
 ---
 
@@ -87,7 +89,7 @@ Documentation and ML integration tooling. task18 (docs) can proceed as features 
 
 ## Architectural Principles
 
-1. **Data over code**: neuron and synapse models are described by parameter structs, not class hierarchies. This enables Eigen vectorization across neuron pools and preserves composability. Equations within those structs are expressed as SymPy expressions — compiled to Eigen-compatible C++ lambdas (CPU) or `__device__` functions (CUDA) with standard forms recognized at no JIT cost.
+1. **Data over code**: neuron and synapse models are described by parameter structs, not class hierarchies. This enables Eigen vectorization across neuron pools and preserves composability. Equations within those structs are expressed as SymPy expressions — compiled to Eigen-compatible C++ (CPU via `EigenPrinter` + JIT, or `__device__` functions for CUDA in task17) with standard forms recognized via structural pattern matching at zero compilation cost.
 
 2. **One canonical workflow**: users should reach any simulation through the same sequence — define model → build network → simulate → analyze. Internal routing (descriptor path, pool dispatch, backend selection) is invisible.
 

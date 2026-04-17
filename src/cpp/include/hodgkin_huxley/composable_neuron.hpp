@@ -19,27 +19,37 @@ public:
 
     const NeuronModelSpec& model_spec() const;
     const std::vector<double>& gate_states() const;
-    double calcium() const;
+
+    // Substance accessors (backward compat: calcium = X_[0])
+    double calcium() const { return X_.empty() ? 0.0 : X_[0]; }
+    const std::vector<double>& substances() const { return X_; }
 
     // Setters for pool sync
     void set_gate_states(const std::vector<double>& states);
-    void set_calcium(double ca);
-    void set_E_Ca(double e_ca);
+    void set_calcium(double ca)   { if (!X_.empty())        X_[0] = ca; }
+    void set_E_Ca(double e_ca)    { if (!E_nernst_.empty()) E_nernst_[0] = e_ca; }
+    void set_substances(const std::vector<double>& xs, const std::vector<double>& es);
 
-    // Reset all gate variables to their steady-state values at the current V/Ca
+    // Update spec (called by RegionalNetwork::update_population_spec)
+    void set_model(const NeuronModelSpec& spec);
+
+    // Reset all gate variables to their steady-state values at the current V/X
     void reset_gates_to_steady_state();
 
 private:
     NeuronModelSpec spec_;
     double V_;
     std::vector<double> gate_states_;
-    double Ca_;
-    double E_Ca_;
+    std::vector<double> X_;        // substance concentrations (X_[0] = calcium by convention)
+    std::vector<double> E_nernst_; // Nernst reversals, one per substance
 
     // Helpers
     void update_gates(double dt);
     double compute_channel_current() const;
-    void update_calcium(double dt);
+    void update_intracellular(double dt);
+
+    // Compute channel current for one channel (needed by update_intracellular)
+    double compute_single_channel_current(int channel_idx) const;
 };
 
 } // namespace hodgkin_huxley

@@ -201,6 +201,7 @@ class RegionalNetwork:
     def __init__(self):
         self._rnet = _RegionalNetwork()
         self._stimulators: dict = {}  # {pop_name: DBSStimulator}
+        self._pop_specs: dict = {}    # {pop_name: NeuronModelSpec} (task14)
 
     def add_population(
         self,
@@ -248,10 +249,12 @@ class RegionalNetwork:
             spec = model.to_spec() if isinstance(model, NeuronModel) else model
             specs = _build_heterogeneous_specs(spec, count, heterogeneity, seed)
             self._rnet.add_population(name, specs)
+            self._pop_specs[name] = spec
         elif model is not None:
             from .._equations import NeuronModel  # lazy — avoids import-time cycle
             spec = model.to_spec() if isinstance(model, NeuronModel) else model
             self._rnet.add_population(name, count, spec)
+            self._pop_specs[name] = spec
         elif parameters is not None:
             self._rnet.add_population(name, count, parameters)
         elif neuron_type is not None:
@@ -262,12 +265,66 @@ class RegionalNetwork:
             # Default to HH
             self._rnet.add_population(name, count, _NetworkNeuronType.HH)
 
+    def add_intracellular(
+        self,
+        dynamics,
+        populations=None,
+    ) -> None:
+        """Attach intracellular dynamics to one or more populations.
+
+        Parameters
+        ----------
+        dynamics : IntracellularDynamics
+            The dynamics object (built with IntracellularDynamics(...)).
+        populations : str | list[str] | None
+            Population name(s) to attach to.  None = all Composable populations.
+        """
+        # Resolve target population names
+        if populations is None:
+            targets = list(self._pop_specs.keys())
+        elif isinstance(populations, str):
+            targets = [populations]
+        else:
+            targets = list(populations)
+
+        for pop_name in targets:
+            if pop_name not in self._pop_specs:
+                raise ValueError(
+                    f"add_intracellular: population {pop_name!r} not found or "
+                    f"is not a Composable population (no stored spec)"
+                )
+            spec = self._pop_specs[pop_name]
+
+            # Build name → index maps for channels and gates
+            channel_names = [ch.name for ch in spec.channels]
+            gate_names = [g.name for g in spec.gates]
+
+            # Build substance_map for cross-substance references
+            substance_map = {
+                ic.name: i for i, ic in enumerate(spec.intracellular)
+            }
+
+            # Check for duplicate substance name
+            if dynamics.name in substance_map:
+                raise ValueError(
+                    f"Substance {dynamics.name!r} already exists in population {pop_name!r}"
+                )
+
+            # Compile dynamics to IntracellularSpec
+            ic_spec = dynamics.to_spec(channel_names, gate_names, substance_map)
+
+            # Append to the Python-side spec
+            spec.intracellular.append(ic_spec)
+
+            # Push updated spec back to C++
+            self._rnet.update_population_spec(pop_name, spec)
+
     def connect(
         self,
         src: str,
         dst: str,
         pattern,
-        weight: float | tuple[float, float] | WeightDistribution = 0.0,
+        weight: float | tuple[float, float] | WeightDistribution | None = None,
         delay: float = 0.0,
         synapse: SynapseSpec | SynapseModel | None = None,
         shift: int = 1,
@@ -275,6 +332,8 @@ class RegionalNetwork:
         allow_self: bool = False,
         seed: int = 0,
         kinetic_spec=None,
+        g_syn: float | None = None,
+        g_pre: float | None = None,
     ) -> None:
         """
         Connect two populations.
@@ -290,7 +349,13 @@ class RegionalNetwork:
             'shifted', 'random_sparse', 'random_permutation'.
             Or a callable: f(src_size, dst_size) -> list of (i, j) tuples.
         weight : float, tuple, or WeightDistribution
-            Synaptic weight. Float for constant, (min, max) for uniform.
+            Synaptic weight (= g_pre * g_syn). Mutually exclusive with g_syn/g_pre.
+        g_syn : float, optional
+            Peak synaptic conductance. Multiplied by g_pre to give weight.
+            Must be provided together with g_pre; mutually exclusive with weight.
+        g_pre : float, optional
+            Presynaptic scaling factor. Multiplied by g_syn to give weight.
+            Must be provided together with g_syn; mutually exclusive with weight.
         delay : float
             Axonal delay in ms.
         synapse : SynapseSpec, optional
@@ -304,6 +369,23 @@ class RegionalNetwork:
         seed : int
             RNG seed (0 = random).
         """
+        # Resolve weight from either weight or g_syn/g_pre
+        using_gsyn = g_syn is not None or g_pre is not None
+        using_weight = weight is not None
+        if using_gsyn and using_weight:
+            raise ValueError(
+                "Provide either 'weight' or 'g_syn'/'g_pre', not both."
+            )
+        if using_gsyn:
+            if g_syn is None or g_pre is None:
+                raise ValueError(
+                    "Both 'g_syn' and 'g_pre' must be provided together "
+                    "(weight = g_pre * g_syn)."
+                )
+            weight = g_pre * g_syn
+        elif not using_weight:
+            weight = 0.0
+
         wdist = _resolve_weight(weight)
 
         # Normalize SynapseModel to SynapseSpec

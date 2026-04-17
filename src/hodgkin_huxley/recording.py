@@ -162,6 +162,32 @@ class MetricsResult:
                 row += f"  {val[row_idx]:>12.4f}"
             print(row)
 
+    @property
+    def V(self):
+        return self._data.get("V")
+
+    @property
+    def calcium(self):
+        """Backward-compat alias for substances['Ca'] (intracellular[0])."""
+        return self._data.get("calcium")
+
+    @property
+    def substances(self) -> dict:
+        """Dict mapping substance name → (n_neurons, n_steps) ndarray.
+
+        Populated from the 'calcium' buffer (intracellular[0]) if recorded.
+        Multi-substance recording requires extending the C++ simulate API (future work).
+        """
+        result = {}
+        if "calcium" in self._data:
+            # Substance name is 'Ca' by default; future: derive from spec
+            result["Ca"] = self._data["calcium"]
+        # Additional substances stored under "substances_<name>" keys (future)
+        for k, v in self._data.items():
+            if k.startswith("substances_"):
+                result[k[len("substances_"):]] = v
+        return result
+
     def __repr__(self):
         keys = list(self._data.keys())
         n = len(self.neuron_indices)

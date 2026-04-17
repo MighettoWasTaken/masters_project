@@ -12,9 +12,9 @@ struct NeuronModelSpec {
     std::string name;
     double C_m = 1.0;
     double V_init = -65.0;
-    std::vector<GateSpec> gates;
-    std::vector<ChannelSpec> channels;
-    CalciumSpec calcium;
+    std::vector<GateSpec>             gates;
+    std::vector<ChannelSpec>          channels;
+    std::vector<IntracellularSpec>    intracellular;  // replaces CalciumSpec calcium
 
     // Izhikevich override — mutually exclusive with gates/channels.
     // Set by izhikevich() factory; RegionalNetwork::add_population dispatches
@@ -30,6 +30,19 @@ struct NeuronModelSpec {
 
     // Validation — throws std::invalid_argument on structural errors
     void validate() const;
+
+    // --- Convenience helpers ---
+
+    /// Returns true if any IntracellularSpec has nernst_enabled or is a driven/decay form.
+    bool has_intracellular() const { return !intracellular.empty(); }
+
+    /// Returns index of first IntracellularSpec with the given name, or -1 if not found.
+    int intracellular_index(const std::string& nm) const {
+        for (int i = 0; i < static_cast<int>(intracellular.size()); ++i) {
+            if (intracellular[i].name == nm) return i;
+        }
+        return -1;
+    }
 };
 
 } // namespace hodgkin_huxley

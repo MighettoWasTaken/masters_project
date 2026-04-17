@@ -16,6 +16,10 @@ from .._core import (
     CalciumSpec,
     ChannelSpec,
     GateDependency as _GateDependency,
+    IntracellularSpec as _IntracellularSpec,
+    IntracellularUpdateForm as _IntracellularUpdateForm,
+    IntracellularModulation as _IntracellularModulation,
+    IntracellularModulationTarget as _IcModTarget,
     GateSpec as _CoreGateSpec,
     GateUpdateForm as _GateUpdateForm,
     KineticCurrentForm as _KineticCurrentForm,   # alias for SynapseCurrentForm
@@ -33,10 +37,17 @@ from .._core import (
 )
 from .._codegen import (
     Ca,
+    DA,
+    cAMP,
+    IP3,
+    NO,
+    X_ic,
+    I_source as _I_source_sym,
     TaggedExpr,
     V,
     compile_to_vm_bytecode,
     gate,
+    substance,
     try_pattern_match,
     x as _x_sym,
 )
@@ -293,10 +304,11 @@ def GateSpec(  # noqa: N802  (intentional CapWords to match C++ type / old API)
     dep = dependency.lower()
     if dep == "auto":
         has_ca = _has_calcium_dep(inf, tau, alpha, beta)
-        g.dependency = _GateDependency.CALCIUM if has_ca else _GateDependency.VOLTAGE
+        g.dependency = _GateDependency.INTRACELLULAR if has_ca else _GateDependency.VOLTAGE
     else:
         g.dependency = (
-            _GateDependency.CALCIUM if dep == "calcium" else _GateDependency.VOLTAGE
+            _GateDependency.INTRACELLULAR if dep in ("calcium", "intracellular")
+            else _GateDependency.VOLTAGE
         )
 
     if needs_vm:
@@ -473,15 +485,16 @@ class NeuronModel:
         _dep_str = dependency.lower()
         if _dep_str == "auto":
             has_ca = _has_calcium_dep(inf, tau, alpha, beta)
-            g.dependency = _GateDependency.CALCIUM if has_ca else _GateDependency.VOLTAGE
+            g.dependency = _GateDependency.INTRACELLULAR if has_ca else _GateDependency.VOLTAGE
         else:
             g.dependency = (
-                _GateDependency.CALCIUM if _dep_str == "calcium" else _GateDependency.VOLTAGE
+                _GateDependency.INTRACELLULAR if _dep_str in ("calcium", "intracellular")
+                else _GateDependency.VOLTAGE
             )
 
         if needs_vm:
             g.update_form = _GateUpdateForm.CUSTOM_EXPR
-            _dep_sym = Ca if g.dependency == _GateDependency.CALCIUM else V
+            _dep_sym = Ca if g.dependency == _GateDependency.INTRACELLULAR else V
             if expr is not None:
                 # Arbitrary ODE: dx/dt = F(x, V).  PUSH_DEP = V (or Ca), PUSH_S = x.
                 _extra = {_x_sym: _VmOp.PUSH_S}
@@ -531,9 +544,11 @@ class NeuronModel:
         E_rev: float,
         gates: "list[tuple[int, int]] | None" = None,
         gating=None,
-        use_calcium_nernst: bool = False,
+        nernst_substance_idx: int = -1,
         is_ahp: bool = False,
         ahp_k1: float = 0.0,
+        ahp_substance_idx: int = 0,
+        use_calcium_nernst: bool = False,  # deprecated — use nernst_substance_idx=0
     ) -> int:
         """Add a channel and return its index.
 
@@ -546,15 +561,28 @@ class NeuronModel:
             :func:`compile_gate_product_vm` and stored on the channel spec.
         gates : list of (int, int), optional
             Legacy ``(gate_index, power)`` list.  Ignored when *gating* is given.
+        nernst_substance_idx : int, optional
+            Index of the intracellular substance whose Nernst reversal overrides
+            E_rev.  -1 = disabled (default).  0 = first substance (calcium by
+            convention when set via ``set_calcium()``).
+        ahp_substance_idx : int, optional
+            Index of the intracellular substance that drives the AHP current.
+            Only used when ``is_ahp=True``.  Default 0 (calcium).
+        use_calcium_nernst : bool, optional
+            Deprecated.  Equivalent to ``nernst_substance_idx=0``.
         """
+        # Resolve deprecated flag
+        if use_calcium_nernst and nernst_substance_idx < 0:
+            nernst_substance_idx = 0
         ch = ChannelSpec()
         ch.name = name
         ch.g = g
         ch.E_rev = E_rev
         ch.gates = gates or []
-        ch.use_calcium_nernst = use_calcium_nernst
+        ch.nernst_substance_idx = nernst_substance_idx
         ch.is_ahp = is_ahp
         ch.ahp_k1 = ahp_k1
+        ch.ahp_substance_idx = ahp_substance_idx
         if gating is not None:
             from .._codegen import (
                 _try_extract_gate_pairs,
@@ -586,15 +614,24 @@ class NeuronModel:
         Ca_o: float = 2000.0,
         source_channels: "list[int] | None" = None,
     ) -> None:
-        """Configure calcium dynamics."""
-        ca = self._spec.calcium
-        ca.enabled = True
-        ca.epsilon = epsilon
-        ca.K_Ca = K_Ca
-        ca.Ca_init = Ca_init
-        ca.use_nernst = use_nernst
-        ca.Ca_o = Ca_o
-        ca.source_channels = source_channels or []
+        """Configure calcium dynamics (populates intracellular[0])."""
+        ic = _IntracellularSpec()
+        ic.name = "Ca"
+        ic.initial = Ca_init
+        ic.epsilon = epsilon
+        ic.k_decay = K_Ca
+        ic.source_channels = source_channels or []
+        if use_nernst:
+            ic.update_form = _IntracellularUpdateForm.DRIVEN_DECAY_NERNST
+            ic.nernst_enabled = True
+            ic.nernst_Ca_o = Ca_o
+        else:
+            ic.update_form = _IntracellularUpdateForm.DRIVEN_DECAY
+        # Place at index 0 (calcium by convention)
+        if len(self._spec.intracellular) == 0:
+            self._spec.intracellular.append(ic)
+        else:
+            self._spec.intracellular[0] = ic
 
     def to_spec(self) -> NeuronModelSpec:
         """Build and return the NeuronModelSpec."""
@@ -1015,6 +1052,311 @@ class KineticSynapseModel:
 
     def __repr__(self) -> str:
         return f"<KineticSynapseModel '{self._spec.name}'>"
+
+
+# =============================================================================
+# IntracellularDynamics and Modulation builders (task14)
+# =============================================================================
+
+
+class Modulation:
+    """Helper to build an IntracellularModulation targeting a channel or gate.
+
+    Use the classmethod factories:
+      Modulation.channel_g("CaL", expr)
+      Modulation.gate_inf_shift("m", scale=0.5)
+      Modulation.synapse_g(expr)
+    """
+
+    def __init__(self, target: str, target_name: str,
+                 expr=None, shift_scale: float = 0.0):
+        self._target = target
+        self._target_name = target_name  # resolved to index at add_intracellular time
+        self._expr = expr
+        self._shift_scale = shift_scale
+
+    @classmethod
+    def channel_g(cls, name: str, expr) -> "Modulation":
+        return cls("CHANNEL_G", name, expr=expr)
+
+    @classmethod
+    def channel_erev(cls, name: str, expr) -> "Modulation":
+        return cls("CHANNEL_EREV", name, expr=expr)
+
+    @classmethod
+    def gate_inf_shift(cls, name: str, scale: float) -> "Modulation":
+        return cls("GATE_INF_SHIFT", name, shift_scale=scale)
+
+    @classmethod
+    def gate_inf_scale(cls, name: str, expr) -> "Modulation":
+        return cls("GATE_INF_SCALE", name, expr=expr)
+
+    @classmethod
+    def gate_tau_scale(cls, name: str, expr) -> "Modulation":
+        return cls("GATE_TAU_SCALE", name, expr=expr)
+
+    @classmethod
+    def gate_inf_expr(cls, name: str, expr) -> "Modulation":
+        return cls("GATE_INF_EXPR", name, expr=expr)
+
+    @classmethod
+    def synapse_g(cls, expr) -> "Modulation":
+        return cls("SYNAPSE_G", "", expr=expr)
+
+    def _to_spec(self, channel_names: "list[str]", gate_names: "list[str]",
+                 substance_names: "list[str]", substance_idx: int,
+                 substance_sym, dep_sym=None) -> "_IntracellularModulation":
+        """Convert to C++ IntracellularModulation. Called by IntracellularDynamics.to_spec()."""
+        import sympy as _sp
+        _VmOp = __import__("hodgkin_huxley._core", fromlist=["VmOp"]).VmOp
+
+        mod = _IntracellularModulation()
+        mod.substance_idx = substance_idx
+
+        target_map = {
+            "CHANNEL_G":      _IcModTarget.CHANNEL_G,
+            "CHANNEL_EREV":   _IcModTarget.CHANNEL_EREV,
+            "GATE_INF_SHIFT": _IcModTarget.GATE_INF_SHIFT,
+            "GATE_INF_SCALE": _IcModTarget.GATE_INF_SCALE,
+            "GATE_TAU_SCALE": _IcModTarget.GATE_TAU_SCALE,
+            "GATE_INF_EXPR":  _IcModTarget.GATE_INF_EXPR,
+            "SYNAPSE_G":      _IcModTarget.SYNAPSE_G,
+        }
+        if self._target not in target_map:
+            raise ValueError(f"Unknown modulation target: {self._target!r}")
+        mod.target = target_map[self._target]
+
+        # Resolve target name → index
+        if self._target in ("CHANNEL_G", "CHANNEL_EREV"):
+            if self._target_name not in channel_names:
+                raise ValueError(
+                    f"Modulation target channel {self._target_name!r} not in spec"
+                )
+            mod.target_idx = channel_names.index(self._target_name)
+        elif self._target.startswith("GATE_"):
+            if self._target_name not in gate_names:
+                raise ValueError(
+                    f"Modulation target gate {self._target_name!r} not in spec"
+                )
+            mod.target_idx = gate_names.index(self._target_name)
+        # SYNAPSE_G: target_idx unused
+
+        # Compile mod_vm (substance concentration is PUSH_DEP)
+        if self._target == "GATE_INF_SHIFT":
+            mod.shift_scale = self._shift_scale
+            # mod_vm left empty for scalar shift path
+        elif self._expr is not None:
+            # dep_sym is the substance's SymPy symbol — compile with PUSH_DEP = substance
+            _dsym = dep_sym if dep_sym is not None else substance_sym
+            mod.mod_vm = compile_to_vm_bytecode(self._expr, dep_sym=_dsym)
+
+        return mod
+
+    def __repr__(self) -> str:
+        return f"<Modulation {self._target} target={self._target_name!r}>"
+
+
+def _match_ode_decay(ode, X_sym):
+    """Return k if ode = -k*X (k>0), else None."""
+    import sympy as _sp
+    expr = _sp.expand(_sp.sympify(ode))
+    if expr.free_symbols - {X_sym}:
+        return None
+    # Must be linear in X with no constant term
+    c1 = expr.coeff(X_sym, 1)
+    c0 = _sp.simplify(expr - c1 * X_sym)
+    if c0 != 0:
+        return None
+    try:
+        k = float(-c1)
+    except Exception:
+        return None
+    return k if k > 0 else None
+
+
+def _match_ode_driven_decay(ode, X_sym, I_sym):
+    """Return (eps, k) if ode = eps*(-I_src - k*X), else None."""
+    import sympy as _sp
+    expr = _sp.expand(_sp.sympify(ode))
+    if expr.free_symbols - {X_sym, I_sym}:
+        return None
+    # Extract coefficients: ode = c_X*X + c_I*I + c0
+    c_X = expr.coeff(X_sym, 1)
+    c_I = expr.coeff(I_sym, 1)
+    c0 = _sp.simplify(expr - c_X * X_sym - c_I * I_sym)
+    if c0 != 0:
+        return None
+    try:
+        k_coeff = float(c_X)
+        I_coeff = float(c_I)
+    except Exception:
+        return None
+    if I_coeff == 0.0 or k_coeff == 0.0:
+        return None
+    eps = float(-I_coeff)
+    k = float(-k_coeff / eps)
+    if eps <= 0 or k <= 0:
+        return None
+    return eps, k
+
+
+class IntracellularDynamics:
+    """
+    Builder for intracellular substance dynamics.
+
+    Parameters
+    ----------
+    name : str
+        Substance name (e.g. "Ca", "DA").
+    ode : sympy.Expr
+        ODE for dX/dt.  Standard symbols: X (self concentration),
+        I_source (source channel current sum), other X_n (cross-substance).
+    source_channels : list[str] | None
+        Channel names whose currents feed I_source in the ODE.
+    nernst : sympy.Expr | None
+        Expression returning the Nernst reversal in mV given the substance X.
+        Standard: ``(R*T / (z*F)) * log(X_o / X)``.
+    initial : float
+        Initial concentration.
+    modulations : list[Modulation] | None
+        Downstream modulations driven by this substance.
+    """
+
+    def __init__(self, name: str, *, ode, source_channels=None,
+                 nernst=None, initial: float = 0.0,
+                 modulations=None):
+        self.name = name
+        self.ode = ode
+        self.source_channels = source_channels or []
+        self.nernst = nernst
+        self.initial = initial
+        self.modulations = modulations or []
+
+    def to_spec(self, channel_names: "list[str]", gate_names: "list[str]",
+                substance_map: "dict[str, int] | None" = None) -> "_IntracellularSpec":
+        """
+        Pattern-match the ODE and Nernst expressions, then compile to IntracellularSpec.
+
+        Parameters
+        ----------
+        channel_names : list[str]
+            Channel names for resolving modulation targets.
+        gate_names : list[str]
+            Gate names for resolving modulation targets.
+        substance_map : dict[str, int] | None
+            Existing substance name → index mapping (for PUSH_X cross-references).
+        """
+        import sympy as _sp
+        from .._codegen import _substance_cache, I_source as _I_src
+
+        substance_map = substance_map or {}
+        substance_idx = len(substance_map)  # this substance will be appended
+
+        X_sym = _sp.Symbol(self.name)
+
+        ic = _IntracellularSpec()
+        ic.name = self.name
+        ic.initial = self.initial
+        ic.source_channels = [
+            channel_names.index(ch) for ch in self.source_channels
+            if ch in channel_names
+        ]
+
+        # --- Pattern match ODE ---
+        k_decay = _match_ode_decay(self.ode, X_sym)
+        if k_decay is not None:
+            ic.update_form = _IntracellularUpdateForm.DECAY
+            ic.k_decay = k_decay
+        else:
+            driven = _match_ode_driven_decay(self.ode, X_sym, _I_src)
+            if driven is not None:
+                eps, k = driven
+                # Check if Nernst is also standard form
+                if self.nernst is not None and _is_standard_nernst(self.nernst, X_sym):
+                    ic.update_form = _IntracellularUpdateForm.DRIVEN_DECAY_NERNST
+                    ic.nernst_enabled = True
+                    _fill_nernst_params(ic, self.nernst, X_sym)
+                else:
+                    ic.update_form = _IntracellularUpdateForm.DRIVEN_DECAY
+                ic.epsilon = eps
+                ic.k_decay = k
+                # Compile nernst_vm if non-standard
+                if self.nernst is not None and not _is_standard_nernst(self.nernst, X_sym):
+                    ic.nernst_vm = compile_to_vm_bytecode(self.nernst, dep_sym=X_sym)
+                    ic.nernst_enabled = True
+            else:
+                ic.update_form = _IntracellularUpdateForm.CUSTOM_EXPR
+                # Compile ode_vm: PUSH_DEP = I_source, PUSH_S = X (self), PUSH_X(n) = X_n
+                from hodgkin_huxley._core import VmOp as _VmOp
+                extra: dict = {X_sym: _VmOp.PUSH_S}
+                # Map other substance symbols to PUSH_X with the right index
+                ode_free = _sp.sympify(self.ode).free_symbols
+                for sname, sidx in substance_map.items():
+                    other_sym = _sp.Symbol(sname)
+                    if other_sym in ode_free:
+                        extra[other_sym] = (_VmOp.PUSH_X, sidx)
+                ic.ode_vm = compile_to_vm_bytecode(
+                    self.ode, dep_sym=_I_src, extra_syms=extra
+                )
+                if self.nernst is not None:
+                    ic.nernst_vm = compile_to_vm_bytecode(self.nernst, dep_sym=X_sym)
+                    ic.nernst_enabled = True
+
+        # --- Compile modulations ---
+        for mod in self.modulations:
+            m_spec = mod._to_spec(
+                channel_names, gate_names,
+                list(substance_map.keys()), substance_idx, X_sym
+            )
+            ic.modulations.append(m_spec)
+
+        return ic
+
+    def __repr__(self) -> str:
+        return f"<IntracellularDynamics '{self.name}'>"
+
+
+def _is_standard_nernst(expr, X_sym) -> bool:
+    """Check if expr matches (R*T/(z*F))*log(X_o/X) pattern."""
+    import sympy as _sp
+    e = _sp.sympify(expr)
+    free = e.free_symbols
+    if X_sym not in free:
+        return False
+    # Must be of form C * log(something / X)
+    if not isinstance(e, _sp.Mul):
+        return False
+    log_parts = [a for a in e.args if isinstance(a, _sp.log)]
+    if not log_parts:
+        return False
+    inner = log_parts[0].args[0]
+    # inner should be X_o / X
+    if not isinstance(inner, _sp.Mul):
+        return False
+    has_X_inv = any(
+        isinstance(a, _sp.Pow) and a.args[0] == X_sym and a.args[1] == -1
+        for a in inner.args
+    )
+    return has_X_inv
+
+
+def _fill_nernst_params(ic: "_IntracellularSpec", expr, X_sym) -> None:
+    """Extract scalar Nernst params from standard (R*T/(z*F))*log(X_o/X) expression."""
+    import sympy as _sp
+    e = _sp.sympify(expr)
+    # Collect multiplier and X_o
+    for arg in e.args:
+        if isinstance(arg, _sp.log):
+            inner = arg.args[0]
+            for a in _sp.Mul.make_args(inner):
+                if not (isinstance(a, _sp.Pow) and a.args[0] == X_sym):
+                    try:
+                        ic.nernst_Ca_o = float(a)
+                    except Exception:
+                        pass
+    # Overall scale = R*T/(z*F); we don't parse individual R,T,z,F here since
+    # the defaults in IntracellularSpec already encode physiological values.
+    # The nernst_enabled flag + defaults will be used.
 
 
 if TYPE_CHECKING:

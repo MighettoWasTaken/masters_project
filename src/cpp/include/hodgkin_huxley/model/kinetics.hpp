@@ -467,4 +467,61 @@ inline double vm_eval_scalar_3arg(const VmExpr& prog, double dep, double S, doub
     return stk.empty() ? 0.0 : stk.back();
 }
 
+// =============================================================================
+// Substance ODE VM evaluator — vectorized, handles PUSH_DEP, PUSH_S, PUSH_X.
+//
+// dep      = I_source sum (per-neuron ArrayXd) or voltage (for GATE_INF_EXPR)
+// self     = this substance's concentration array (pushed by PUSH_S)
+// X_all    = all substance concentration arrays (PUSH_X(n) → X_all[n])
+//
+// This single evaluator covers:
+//   - Substance ODEs (dep=I_src, self=X_self, X_all=all substances)
+//   - Modulation VMs (dep=X_substance, self unused or = X, X_all=substances)
+//   - GATE_INF_EXPR (dep=V, self=gate_state, X_all=substances)
+// =============================================================================
+
+inline Eigen::ArrayXd vm_eval_substance(
+    const VmExpr& prog,
+    const Eigen::ArrayXd& dep,
+    const Eigen::ArrayXd& self,
+    const std::vector<Eigen::ArrayXd>& X_all,
+    Eigen::ArrayXd* tmp_fast_exp = nullptr)
+{
+    const Eigen::Index N = dep.size();
+    std::vector<Eigen::ArrayXd> stk;
+    stk.reserve(8);
+    for (const auto& ins : prog.instructions) {
+        switch (ins.op) {
+            case VmOp::PUSH_DEP:   stk.push_back(dep);   break;
+            case VmOp::PUSH_CONST: stk.push_back(Eigen::ArrayXd::Constant(N, prog.constants[ins.operand])); break;
+            case VmOp::PUSH_S:     stk.push_back(self);  break;
+            case VmOp::PUSH_X:
+                if (ins.operand >= 0 && ins.operand < static_cast<int32_t>(X_all.size()))
+                    stk.push_back(X_all[ins.operand]);
+                else
+                    stk.push_back(Eigen::ArrayXd::Zero(N));
+                break;
+            case VmOp::ADD: { auto b=std::move(stk.back()); stk.pop_back(); stk.back()+=b; break; }
+            case VmOp::MUL: { auto b=std::move(stk.back()); stk.pop_back(); stk.back()*=b; break; }
+            case VmOp::NEG:      stk.back() = -stk.back(); break;
+            case VmOp::RCP:      stk.back() = 1.0/stk.back(); break;
+            case VmOp::POW_INT:  stk.back() = stk.back().pow(ins.operand); break;
+            case VmOp::POW_HALF: stk.back() = stk.back().sqrt(); break;
+            case VmOp::POW_GEN:  { auto e=std::move(stk.back()); stk.pop_back(); stk.back()=stk.back().pow(e); break; }
+            case VmOp::EXP:
+                if (tmp_fast_exp) { fast_exp(stk.back(), stk.back(), *tmp_fast_exp); }
+                else              { stk.back() = stk.back().exp(); }
+                break;
+            case VmOp::LOG:      stk.back() = stk.back().log();  break;
+            case VmOp::TANH:     stk.back() = stk.back().tanh(); break;
+            case VmOp::SIN:      stk.back() = stk.back().sin();  break;
+            case VmOp::COS:      stk.back() = stk.back().cos();  break;
+            case VmOp::SQRT:     stk.back() = stk.back().sqrt(); break;
+            case VmOp::ABS:      stk.back() = stk.back().abs();  break;
+            default: break;
+        }
+    }
+    return stk.empty() ? Eigen::ArrayXd::Zero(N) : stk.back();
+}
+
 } // namespace hodgkin_huxley

@@ -96,6 +96,23 @@ void RegionalNetwork::add_population(const std::string& name, size_t count,
     }
     pop_index_[name] = populations_.size();
     populations_.push_back({name, start, count});
+    pop_specs_[name] = spec;  // store for update_population_spec
+}
+
+void RegionalNetwork::update_population_spec(const std::string& name,
+                                             const NeuronModelSpec& spec) {
+    validate_population(name);
+    pop_specs_[name] = spec;
+
+    // Push updated spec to all ComposableNeuron instances in this population
+    const auto& pop = population(name);
+    for (size_t i = pop.start_idx; i < pop.end_idx(); ++i) {
+        auto* cn = dynamic_cast<ComposableNeuron*>(&net_.neuron(i));
+        if (cn) cn->set_model(spec);
+    }
+
+    // Mark pools dirty so they are rebuilt on the next simulate() call
+    net_.mark_pools_dirty();
 }
 
 void RegionalNetwork::add_population(const std::string& name,

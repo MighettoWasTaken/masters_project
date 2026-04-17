@@ -46,13 +46,14 @@ enum class VmOp : uint8_t {
     EXP=9, LOG=10, TANH=11,            // transcendental
     SIN=12, COS=13, SQRT=14, ABS=15,   // more functions
     PUSH_GATE=16,                           // push gate_states_[operand] onto stack
-    PUSH_S=17,                              // push kinetic synapse gating variable S
+    PUSH_S=17,                              // push kinetic synapse gating variable S (or self substance concentration)
     PUSH_A=18,                              // push auxiliary synapse state variable A
+    PUSH_X=19,                              // push X_[operand] (substance concentration by index; 0 = self)
 };
 
 struct VmInstruction {
     VmOp    op      = VmOp::PUSH_CONST;
-    int32_t operand = 0;  // const index (PUSH_CONST) or integer exponent (POW_INT)
+    int32_t operand = 0;  // const index (PUSH_CONST) or integer exponent (POW_INT) or substance index (PUSH_X)
 };
 
 struct VmExpr {
@@ -70,11 +71,15 @@ struct VmExpr {
 
 struct GateSpec {
     enum class UpdateForm { INF_TAU=0, ALPHA_BETA=1, INSTANT=2, DERIVED=3, CUSTOM_EXPR=4 };
-    enum class Dependency { VOLTAGE, CALCIUM };
+    enum class Dependency {
+        VOLTAGE,
+        INTRACELLULAR  // replaces CALCIUM; intracellular_idx selects which substance
+    };
 
     std::string name;
     UpdateForm update_form = UpdateForm::INF_TAU;
     Dependency dependency = Dependency::VOLTAGE;
+    int intracellular_idx = 0;  // which IntracellularSpec provides X (default 0 = calcium by convention)
     double scale = 1.0;
     double initial_value = 0.0;
 
@@ -96,12 +101,93 @@ struct GateSpec {
     // inf_vm / tau_vm: INF_TAU-style update  (x -> x_inf + (x - x_inf)*exp(-dt*scale/tau))
     // alpha_vm / beta_vm: ALPHA_BETA-style   (alpha/(alpha+beta) steady state)
     // dxdt_vm: arbitrary ODE  dx/dt = F(x, V)  — integrated with Euler
-    //   PUSH_DEP pushes V (or Ca for calcium-dependent gates)
+    //   PUSH_DEP pushes V (or X_[intracellular_idx] for intracellular-dependent gates)
     //   PUSH_S   pushes the current gate state x
     VmExpr inf_vm, tau_vm, alpha_vm, beta_vm;
     VmExpr dxdt_vm;
 };
 
+// =============================================================================
+// Intracellular dynamics structs
+// =============================================================================
+
+// Forward declaration
+struct IntracellularSpec;
+
+/// Describes how one intracellular substance modulates channels, gates, or synapses.
+struct IntracellularModulation {
+    enum class Target {
+        CHANNEL_G,       // g_eff = g * mod_vm(X) — mod_vm returns scale factor
+        CHANNEL_EREV,    // E_rev = mod_vm(X)     — replaces channel E_rev
+        GATE_INF_SHIFT,  // x_inf(V + shift) where shift = shift_scale*X or mod_vm(X)
+        GATE_INF_SCALE,  // x_inf_eff = x_inf * mod_vm(X)
+        GATE_TAU_SCALE,  // tau_eff = tau * mod_vm(X)
+        GATE_INF_EXPR,   // x_inf fully replaced by mod_vm(V, X) — PUSH_DEP=V, PUSH_X=X
+        SYNAPSE_G,       // scale all incoming synaptic g for neurons in this population
+    };
+
+    Target target;
+    int    target_idx    = -1;  // channel index (CHANNEL_*) or gate index (GATE_*)
+    int    substance_idx =  0;  // which IntracellularSpec provides X for the modulation
+
+    // mod_vm semantics depend on target:
+    //   CHANNEL_G, CHANNEL_EREV, GATE_INF_SHIFT, GATE_INF_SCALE, GATE_TAU_SCALE, SYNAPSE_G:
+    //     PUSH_DEP → substance X concentration (ArrayXd)
+    //     PUSH_X(n) → X_[n] concentration (for cascade mods)
+    //   GATE_INF_EXPR:
+    //     PUSH_DEP → V (voltage array)
+    //     PUSH_S   → gate state (if needed)
+    //     PUSH_X(n) → X_[n] concentration
+    VmExpr mod_vm;
+
+    // GATE_INF_SHIFT with scalar scale: if mod_vm is empty, shift = shift_scale * X
+    double shift_scale = 0.0;
+};
+
+/// Describes one intracellular substance (calcium, dopamine, cAMP, IP3, etc.)
+struct IntracellularSpec {
+    std::string name;
+    double      initial = 0.0;  // initial concentration
+
+    /// ODE update form for d[X]/dt
+    enum class UpdateForm {
+        DECAY,               // d[X]/dt = -k_decay * X
+        DRIVEN_DECAY,        // d[X]/dt = epsilon * (-I_src - k_decay * X)
+        DRIVEN_DECAY_NERNST, // as DRIVEN_DECAY + standard Nernst E_rev update
+        CUSTOM_EXPR,         // VM bytecode (see ode_vm below)
+    };
+    UpdateForm update_form = UpdateForm::CUSTOM_EXPR;
+
+    // Scalar parameters for standard forms
+    double epsilon = 1e-4;
+    double k_decay = 15.0;
+    std::vector<int> source_channels;  // channel indices contributing to I_src
+
+    // Nernst parameters (DRIVEN_DECAY_NERNST standard form)
+    bool   nernst_enabled = false;
+    double nernst_Ca_o    = 2000.0;  // extracellular concentration (µM)
+    double nernst_z       = 2.0;
+    double nernst_R       = 8314.0;  // gas constant (mJ/(mol·K))
+    double nernst_F       = 96485.0; // Faraday constant
+    double nernst_T       = 298.0;   // temperature (K)
+
+    // CUSTOM_EXPR Nernst: PUSH_DEP = X → returns E_rev
+    VmExpr nernst_vm;
+
+    // CUSTOM_EXPR ODE:
+    //   PUSH_DEP → I_source sum (sum of source channel currents)
+    //   PUSH_S   → this substance's concentration (reuses PUSH_S opcode)
+    //   PUSH_X(n) → other substance concentration X_[n]
+    VmExpr ode_vm;
+
+    /// What this substance modulates each step
+    std::vector<IntracellularModulation> modulations;
+};
+
+// =============================================================================
+// Legacy CalciumSpec — kept for backward compatibility with old code paths.
+// New code should use IntracellularSpec with UpdateForm::DRIVEN_DECAY_NERNST.
+// =============================================================================
 struct CalciumSpec {
     bool enabled = false;
     bool use_nernst = false;
@@ -114,6 +200,26 @@ struct CalciumSpec {
     double R = 8314.0;     // gas constant (mJ/(mol*K))
     double T = 298.0;      // temperature (K)
     std::vector<int> source_channels;  // channel indices contributing to Ca influx
+
+    /// Convert to the new IntracellularSpec representation.
+    IntracellularSpec to_intracellular_spec() const {
+        IntracellularSpec ic;
+        ic.name    = "Ca";
+        ic.initial = Ca_init;
+        ic.epsilon = epsilon;
+        ic.k_decay = K_Ca;
+        ic.source_channels = source_channels;
+        ic.nernst_enabled  = use_nernst;
+        ic.nernst_Ca_o     = Ca_o;
+        ic.nernst_z        = z;
+        ic.nernst_R        = R;
+        ic.nernst_F        = F;
+        ic.nernst_T        = T;
+        ic.update_form     = use_nernst
+            ? IntracellularSpec::UpdateForm::DRIVEN_DECAY_NERNST
+            : IntracellularSpec::UpdateForm::DRIVEN_DECAY;
+        return ic;
+    }
 };
 
 } // namespace hodgkin_huxley

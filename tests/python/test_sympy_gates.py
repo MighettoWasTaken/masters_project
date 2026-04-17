@@ -495,7 +495,7 @@ class TestDoubleExpSumPatternMatch:
         import sys, os
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../benchmarks'))
         from ctxbgth_model import _make_stn_spec
-        spec = _make_stn_spec()
+        spec, _ = _make_stn_spec()
         custom_expr_gates = [
             g.name for g in spec.gates
             if g.update_form == GateUpdateForm.CUSTOM_EXPR

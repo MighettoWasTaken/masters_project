@@ -37,6 +37,11 @@ void PoolManager::build_from_neurons(
         }
     }
 
+    // Set synapse_g_mods flag
+    has_synapse_g_mods_ = false;
+    for (const auto& kv : comp_pools_)
+        if (kv.second.has_synapse_g_mods()) { has_synapse_g_mods_ = true; break; }
+
     // Populate with current neuron state
     for (size_t i = 0; i < nn; ++i) {
         if (auto* hh = dynamic_cast<HHNeuron*>(neurons[i].get())) {
@@ -47,7 +52,7 @@ void PoolManager::build_from_neurons(
             auto it = comp_pools_.find(cn->model_spec().name);
             if (it != comp_pools_.end())
                 it->second.add(i, cn->membrane_potential(),
-                               cn->gate_states(), cn->calcium());
+                               cn->gate_states(), cn->substances());
         }
     }
 }
@@ -91,6 +96,17 @@ void PoolManager::scatter_calcium(double* ca_buf, size_t n_rec, size_t tr) const
 
 void PoolManager::scatter_recoveries(double* u_buf, size_t n_rec, size_t tr) const {
     iz_pool_.scatter_recoveries(u_buf, n_rec, tr);
+}
+
+void PoolManager::scatter_substances(size_t subst_idx, double* buf,
+                                      size_t n_rec, size_t tr) const {
+    for (const auto& kv : comp_pools_)
+        kv.second.scatter_substance_into(subst_idx, buf, n_rec, tr);
+}
+
+void PoolManager::scatter_synapse_g_scale(double* buf) const {
+    for (const auto& kv : comp_pools_)
+        kv.second.scatter_synapse_g_scale(buf);
 }
 
 } // namespace hodgkin_huxley

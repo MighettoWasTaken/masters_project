@@ -217,30 +217,33 @@ class TestDerivedSourceGateOutOfRange:
 
 class TestCalciumSourceChannels:
 
+    def _make_spec_with_intracellular(self, source_channels):
+        """Build a spec with an IntracellularSpec using the new API (task14)."""
+        from hodgkin_huxley._core import IntracellularSpec, IntracellularUpdateForm
+        spec = make_valid_spec()
+        ic = IntracellularSpec()
+        ic.name = "Ca"
+        ic.update_form = IntracellularUpdateForm.DRIVEN_DECAY
+        ic.source_channels = source_channels
+        spec.intracellular.append(ic)
+        return spec
+
     def test_source_channel_index_too_large(self):
-        spec = make_valid_spec()   # has 1 channel (index 0)
-        spec.calcium.enabled = True
-        spec.calcium.source_channels = [99]
+        spec = self._make_spec_with_intracellular([99])  # only index 0 exists
         with pytest.raises(ValueError, match="source_channels"):
             spec.validate()
 
     def test_source_channel_index_negative(self):
-        spec = make_valid_spec()
-        spec.calcium.enabled = True
-        spec.calcium.source_channels = [-1]
+        spec = self._make_spec_with_intracellular([-1])
         with pytest.raises(ValueError, match="source_channels"):
             spec.validate()
 
     def test_valid_source_channel(self):
-        spec = make_valid_spec()   # channel 0 exists
-        spec.calcium.enabled = True
-        spec.calcium.source_channels = [0]
+        spec = self._make_spec_with_intracellular([0])  # channel 0 exists
         spec.validate()  # should not raise
 
     def test_empty_source_channels_ok(self):
-        spec = make_valid_spec()
-        spec.calcium.enabled = True
-        spec.calcium.source_channels = []
+        spec = self._make_spec_with_intracellular([])
         spec.validate()  # should not raise
 
 
