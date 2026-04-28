@@ -6,13 +6,7 @@ import collections.abc
 import numpy
 import numpy.typing
 import typing
-__all__: list[str] = ['ABS', 'ADD', 'ALL_TO_ALL', 'ALPHA', 'ALPHA_BETA', 'AMPA', 'AlphaSynapse', 'BOLTZMANN', 'BOLTZMANN_GATE', 'BoltzmannParams', 'CALCIUM', 'CHATTERING', 'COMPOSABLE', 'COMPOUND_AB', 'CONSTANT', 'COS', 'CUSTOM', 'CUSTOM_EXPR', 'CalciumSpec', 'ChannelSpec', 'ChannelSpecVector', 'ComposableNeuron', 'ConnectivityPattern', 'DBSParameters', 'DBSStimulator', 'DERIVED', 'DOUBLE_EXPONENTIAL', 'DOUBLE_EXP_SUM', 'DoubleExponentialSynapse', 'EULER', 'EXP', 'EXPONENTIAL', 'EXP_DECAY', 'ExponentialSynapse', 'FAST_SPIKING', 'GABA_A', 'GateDependency', 'GateSpec', 'GateSpecVector', 'GateUpdateForm', 'HH', 'HHNeuron', 'HHParameters', 'HHState', 'INF_TAU', 'INSTANT', 'INTRINSICALLY_BURSTING', 'IZHIKEVICH_CH', 'IZHIKEVICH_CUSTOM', 'IZHIKEVICH_FS', 'IZHIKEVICH_IB', 'IZHIKEVICH_LTS', 'IZHIKEVICH_RS', 'IntegrationMethod', 'IzhikevichNeuron', 'IzhikevichParameters', 'IzhikevichState', 'IzhikevichType', 'KineticCurrentForm', 'KineticSynapseSpec', 'KineticUpdateForm', 'LINEAR', 'LINEAR_OVER_EXP', 'LINEAR_OVER_EXPM1', 'LOG', 'LOW_THRESHOLD_SPIKING', 'MG_BLOCK', 'MUL', 'NEG', 'NMDA', 'NORMAL', 'NeuronBase', 'NeuronModelSpec', 'OFFSET_DOUBLE_EXP', 'ONE_TO_ONE', 'POW_GEN', 'POW_HALF', 'POW_INT', 'PUSH_CONST', 'PUSH_DEP', 'PUSH_GATE', 'PUSH_S', 'Parameters', 'RANDOM_PERMUTATION', 'RANDOM_SPARSE', 'RCP', 'REGULAR_SPIKING', 'RK4', 'RK45_ADAPTIVE', 'RateFuncForm', 'RateFuncParams', 'ReceptorType', 'RegionalNetwork', 'SCALED_EXP', 'SHIFTED', 'SIGMOID', 'SIN', 'SQRT', 'State', 'SynapseBase', 'SynapseSpec', 'SynapseSpecType', 'TANH', 'TANH_GATE', 'TauForm', 'TauParams', 'UNIFORM', 'VOLTAGE', 'VmExpr', 'VmInstruction', 'VmInstructionVector', 'VmOp', 'WeightDistType', 'WeightDistribution']
-class AlphaSynapse(SynapseBase):
-    @property
-    def tau(self) -> float:
-        """
-        Time to peak (ms)
-        """
+__all__: list[str] = ['ABS', 'ADD', 'ALL_TO_ALL', 'ALPHA_BETA', 'ALPHA_FUNC', 'AMPA', 'BOLTZMANN', 'BOLTZMANN_GATE', 'BoltzmannParams', 'CALCIUM', 'CHANNEL_EREV', 'CHANNEL_G', 'CHATTERING', 'COMPOSABLE', 'COMPOUND_AB', 'CONSTANT', 'COS', 'CUSTOM', 'CUSTOM_EXPR', 'CalciumSpec', 'ChannelSpec', 'ChannelSpecVector', 'ComposableNeuron', 'ConnectivityPattern', 'DBSParameters', 'DBSStimulator', 'DECAY', 'DERIVED', 'DOUBLE_EXP', 'DOUBLE_EXP_SUM', 'DRIVEN_DECAY', 'DRIVEN_DECAY_NERNST', 'EULER', 'EXP', 'EXP_DECAY', 'FAST_SPIKING', 'GABA_A', 'GATE_INF_EXPR', 'GATE_INF_SCALE', 'GATE_INF_SHIFT', 'GATE_TAU_SCALE', 'GateDependency', 'GateSpec', 'GateSpecVector', 'GateUpdateForm', 'HH', 'HHNeuron', 'HHParameters', 'HHState', 'INF_TAU', 'INSTANT', 'INTRACELLULAR', 'INTRINSICALLY_BURSTING', 'IZHIKEVICH_CH', 'IZHIKEVICH_CUSTOM', 'IZHIKEVICH_FS', 'IZHIKEVICH_IB', 'IZHIKEVICH_LTS', 'IZHIKEVICH_RS', 'IntegrationMethod', 'IntracellularModulation', 'IntracellularModulationTarget', 'IntracellularModulationVector', 'IntracellularSpec', 'IntracellularSpecVector', 'IntracellularUpdateForm', 'IzhikevichNeuron', 'IzhikevichParameters', 'IzhikevichState', 'IzhikevichType', 'KineticCurrentForm', 'KineticSynapseSpec', 'KineticUpdateForm', 'LINEAR', 'LINEAR_OVER_EXP', 'LINEAR_OVER_EXPM1', 'LOG', 'LOW_THRESHOLD_SPIKING', 'MG_BLOCK', 'MUL', 'NEG', 'NMDA', 'NONE', 'NORMAL', 'NeuronBase', 'NeuronModelSpec', 'OFFSET_DOUBLE_EXP', 'ONE_TO_ONE', 'POW_GEN', 'POW_HALF', 'POW_INT', 'PUSH_A', 'PUSH_CONST', 'PUSH_DEP', 'PUSH_GATE', 'PUSH_S', 'PUSH_X', 'Parameters', 'PlasticitySpec', 'PlasticityType', 'RANDOM_PERMUTATION', 'RANDOM_SPARSE', 'RCP', 'REGULAR_SPIKING', 'RK4', 'RK45_ADAPTIVE', 'RateFuncForm', 'RateFuncParams', 'ReceptorType', 'RegionalNetwork', 'SCALED_EXP', 'SHIFTED', 'SIGMOID', 'SIN', 'SQRT', 'STDP', 'STDPParams', 'STP', 'STPParams', 'SYNAPSE_G', 'State', 'SynapseBase', 'SynapseCurrentForm', 'SynapseSpec', 'SynapseUpdateForm', 'TANH', 'TANH_GATE', 'TauForm', 'TauParams', 'UNIFORM', 'VOLTAGE', 'VmExpr', 'VmInstruction', 'VmInstructionVector', 'VmOp', 'WeightDistType', 'WeightDistribution']
 class BoltzmannParams:
     def __init__(self) -> None:
         ...
@@ -113,6 +107,14 @@ class ChannelSpec:
     def ahp_k1(self, arg0: typing.SupportsFloat) -> None:
         ...
     @property
+    def ahp_substance_idx(self) -> int:
+        """
+        Index into NeuronModelSpec.intracellular for AHP drive substance
+        """
+    @ahp_substance_idx.setter
+    def ahp_substance_idx(self, arg0: typing.SupportsInt) -> None:
+        ...
+    @property
     def g(self) -> float:
         ...
     @g.setter
@@ -123,6 +125,14 @@ class ChannelSpec:
         ...
     @gates.setter
     def gates(self, arg0: collections.abc.Sequence[tuple[typing.SupportsInt, typing.SupportsInt]]) -> None:
+        ...
+    @property
+    def nernst_substance_idx(self) -> int:
+        """
+        Index into NeuronModelSpec.intracellular for Nernst reversal (-1=none)
+        """
+    @nernst_substance_idx.setter
+    def nernst_substance_idx(self, arg0: typing.SupportsInt) -> None:
         ...
 class ChannelSpecVector:
     def __bool__(self) -> bool:
@@ -158,12 +168,12 @@ class ChannelSpecVector:
     @typing.overload
     def __init__(self, arg0: collections.abc.Iterable) -> None:
         ...
-    def __iter__(self) -> collections.abc.Iterator[typing.Any]:
+    def __iter__(self) -> collections.abc.Iterator[...]:
         ...
     def __len__(self) -> int:
         ...
     @typing.overload
-    def __setitem__(self, arg0: typing.SupportsInt, arg1: typing.Any) -> None:
+    def __setitem__(self, arg0: typing.SupportsInt, arg1: ...) -> None:
         ...
     @typing.overload
     def __setitem__(self, arg0: slice, arg1: ChannelSpecVector) -> None:
@@ -321,34 +331,20 @@ class DBSStimulator:
         """
         Current stimulator parameters
         """
-class DoubleExponentialSynapse(SynapseBase):
-    @property
-    def tau_decay(self) -> float:
-        """
-        Decay time constant (ms)
-        """
-    @property
-    def tau_rise(self) -> float:
-        """
-        Rise time constant (ms)
-        """
-class ExponentialSynapse(SynapseBase):
-    @property
-    def tau(self) -> float:
-        """
-        Decay time constant (ms)
-        """
 class GateDependency:
     """
     Members:
     
       VOLTAGE
     
+      INTRACELLULAR
+    
       CALCIUM
     """
-    CALCIUM: typing.ClassVar[GateDependency]  # value = <GateDependency.CALCIUM: 1>
+    CALCIUM: typing.ClassVar[GateDependency]  # value = <GateDependency.INTRACELLULAR: 1>
+    INTRACELLULAR: typing.ClassVar[GateDependency]  # value = <GateDependency.INTRACELLULAR: 1>
     VOLTAGE: typing.ClassVar[GateDependency]  # value = <GateDependency.VOLTAGE: 0>
-    __members__: typing.ClassVar[dict[str, GateDependency]]  # value = {'VOLTAGE': <GateDependency.VOLTAGE: 0>, 'CALCIUM': <GateDependency.CALCIUM: 1>}
+    __members__: typing.ClassVar[dict[str, GateDependency]]  # value = {'VOLTAGE': <GateDependency.VOLTAGE: 0>, 'INTRACELLULAR': <GateDependency.INTRACELLULAR: 1>, 'CALCIUM': <GateDependency.INTRACELLULAR: 1>}
     def __eq__(self, other: typing.Any) -> bool:
         ...
     def __getstate__(self) -> int:
@@ -379,8 +375,6 @@ class GateSpec:
     alpha: RateFuncParams
     alpha_vm: VmExpr
     beta: RateFuncParams
-    beta_vm: VmExpr
-    alpha_vm: VmExpr
     beta_vm: VmExpr
     dependency: GateDependency
     dxdt_vm: VmExpr
@@ -425,6 +419,12 @@ class GateSpec:
     def initial_value(self, arg0: typing.SupportsFloat) -> None:
         ...
     @property
+    def intracellular_idx(self) -> int:
+        ...
+    @intracellular_idx.setter
+    def intracellular_idx(self, arg0: typing.SupportsInt) -> None:
+        ...
+    @property
     def scale(self) -> float:
         ...
     @scale.setter
@@ -464,12 +464,12 @@ class GateSpecVector:
     @typing.overload
     def __init__(self, arg0: collections.abc.Iterable) -> None:
         ...
-    def __iter__(self) -> collections.abc.Iterator[typing.Any]:
+    def __iter__(self) -> collections.abc.Iterator[...]:
         ...
     def __len__(self) -> int:
         ...
     @typing.overload
-    def __setitem__(self, arg0: typing.SupportsInt, arg1: typing.Any) -> None:
+    def __setitem__(self, arg0: typing.SupportsInt, arg1: ...) -> None:
         ...
     @typing.overload
     def __setitem__(self, arg0: slice, arg1: GateSpecVector) -> None:
@@ -728,6 +728,347 @@ class IntegrationMethod:
     @property
     def value(self) -> int:
         ...
+class IntracellularModulation:
+    mod_vm: VmExpr
+    target: IntracellularModulationTarget
+    def __init__(self) -> None:
+        ...
+    def __repr__(self) -> str:
+        ...
+    @property
+    def shift_scale(self) -> float:
+        ...
+    @shift_scale.setter
+    def shift_scale(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def substance_idx(self) -> int:
+        ...
+    @substance_idx.setter
+    def substance_idx(self, arg0: typing.SupportsInt) -> None:
+        ...
+    @property
+    def target_idx(self) -> int:
+        ...
+    @target_idx.setter
+    def target_idx(self, arg0: typing.SupportsInt) -> None:
+        ...
+class IntracellularModulationTarget:
+    """
+    Members:
+    
+      CHANNEL_G
+    
+      CHANNEL_EREV
+    
+      GATE_INF_SHIFT
+    
+      GATE_INF_SCALE
+    
+      GATE_TAU_SCALE
+    
+      GATE_INF_EXPR
+    
+      SYNAPSE_G
+    """
+    CHANNEL_EREV: typing.ClassVar[IntracellularModulationTarget]  # value = <IntracellularModulationTarget.CHANNEL_EREV: 1>
+    CHANNEL_G: typing.ClassVar[IntracellularModulationTarget]  # value = <IntracellularModulationTarget.CHANNEL_G: 0>
+    GATE_INF_EXPR: typing.ClassVar[IntracellularModulationTarget]  # value = <IntracellularModulationTarget.GATE_INF_EXPR: 5>
+    GATE_INF_SCALE: typing.ClassVar[IntracellularModulationTarget]  # value = <IntracellularModulationTarget.GATE_INF_SCALE: 3>
+    GATE_INF_SHIFT: typing.ClassVar[IntracellularModulationTarget]  # value = <IntracellularModulationTarget.GATE_INF_SHIFT: 2>
+    GATE_TAU_SCALE: typing.ClassVar[IntracellularModulationTarget]  # value = <IntracellularModulationTarget.GATE_TAU_SCALE: 4>
+    SYNAPSE_G: typing.ClassVar[IntracellularModulationTarget]  # value = <IntracellularModulationTarget.SYNAPSE_G: 6>
+    __members__: typing.ClassVar[dict[str, IntracellularModulationTarget]]  # value = {'CHANNEL_G': <IntracellularModulationTarget.CHANNEL_G: 0>, 'CHANNEL_EREV': <IntracellularModulationTarget.CHANNEL_EREV: 1>, 'GATE_INF_SHIFT': <IntracellularModulationTarget.GATE_INF_SHIFT: 2>, 'GATE_INF_SCALE': <IntracellularModulationTarget.GATE_INF_SCALE: 3>, 'GATE_TAU_SCALE': <IntracellularModulationTarget.GATE_TAU_SCALE: 4>, 'GATE_INF_EXPR': <IntracellularModulationTarget.GATE_INF_EXPR: 5>, 'SYNAPSE_G': <IntracellularModulationTarget.SYNAPSE_G: 6>}
+    def __eq__(self, other: typing.Any) -> bool:
+        ...
+    def __getstate__(self) -> int:
+        ...
+    def __hash__(self) -> int:
+        ...
+    def __index__(self) -> int:
+        ...
+    def __init__(self, value: typing.SupportsInt) -> None:
+        ...
+    def __int__(self) -> int:
+        ...
+    def __ne__(self, other: typing.Any) -> bool:
+        ...
+    def __repr__(self) -> str:
+        ...
+    def __setstate__(self, state: typing.SupportsInt) -> None:
+        ...
+    def __str__(self) -> str:
+        ...
+    @property
+    def name(self) -> str:
+        ...
+    @property
+    def value(self) -> int:
+        ...
+class IntracellularModulationVector:
+    def __bool__(self) -> bool:
+        """
+        Check whether the list is nonempty
+        """
+    @typing.overload
+    def __delitem__(self, arg0: typing.SupportsInt) -> None:
+        """
+        Delete the list elements at index ``i``
+        """
+    @typing.overload
+    def __delitem__(self, arg0: slice) -> None:
+        """
+        Delete list elements using a slice object
+        """
+    @typing.overload
+    def __getitem__(self, s: slice) -> IntracellularModulationVector:
+        """
+        Retrieve list elements using a slice object
+        """
+    @typing.overload
+    def __getitem__(self, arg0: typing.SupportsInt) -> ...:
+        ...
+    @typing.overload
+    def __init__(self) -> None:
+        ...
+    @typing.overload
+    def __init__(self, arg0: IntracellularModulationVector) -> None:
+        """
+        Copy constructor
+        """
+    @typing.overload
+    def __init__(self, arg0: collections.abc.Iterable) -> None:
+        ...
+    def __iter__(self) -> collections.abc.Iterator[...]:
+        ...
+    def __len__(self) -> int:
+        ...
+    @typing.overload
+    def __setitem__(self, arg0: typing.SupportsInt, arg1: ...) -> None:
+        ...
+    @typing.overload
+    def __setitem__(self, arg0: slice, arg1: IntracellularModulationVector) -> None:
+        """
+        Assign list elements using a slice object
+        """
+    def append(self, x: ...) -> None:
+        """
+        Add an item to the end of the list
+        """
+    def clear(self) -> None:
+        """
+        Clear the contents
+        """
+    @typing.overload
+    def extend(self, L: IntracellularModulationVector) -> None:
+        """
+        Extend the list by appending all the items in the given list
+        """
+    @typing.overload
+    def extend(self, L: collections.abc.Iterable) -> None:
+        """
+        Extend the list by appending all the items in the given list
+        """
+    def insert(self, i: typing.SupportsInt, x: ...) -> None:
+        """
+        Insert an item at a given position.
+        """
+    @typing.overload
+    def pop(self) -> ...:
+        """
+        Remove and return the last item
+        """
+    @typing.overload
+    def pop(self, i: typing.SupportsInt) -> ...:
+        """
+        Remove and return the item at index ``i``
+        """
+class IntracellularSpec:
+    modulations: IntracellularModulationVector
+    name: str
+    nernst_enabled: bool
+    nernst_vm: VmExpr
+    ode_vm: VmExpr
+    update_form: IntracellularUpdateForm
+    def __init__(self) -> None:
+        ...
+    def __repr__(self) -> str:
+        ...
+    @property
+    def epsilon(self) -> float:
+        ...
+    @epsilon.setter
+    def epsilon(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def initial(self) -> float:
+        ...
+    @initial.setter
+    def initial(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def k_decay(self) -> float:
+        ...
+    @k_decay.setter
+    def k_decay(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def nernst_Ca_o(self) -> float:
+        ...
+    @nernst_Ca_o.setter
+    def nernst_Ca_o(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def nernst_F(self) -> float:
+        ...
+    @nernst_F.setter
+    def nernst_F(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def nernst_R(self) -> float:
+        ...
+    @nernst_R.setter
+    def nernst_R(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def nernst_T(self) -> float:
+        ...
+    @nernst_T.setter
+    def nernst_T(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def nernst_z(self) -> float:
+        ...
+    @nernst_z.setter
+    def nernst_z(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def source_channels(self) -> list[int]:
+        ...
+    @source_channels.setter
+    def source_channels(self, arg0: collections.abc.Sequence[typing.SupportsInt]) -> None:
+        ...
+class IntracellularSpecVector:
+    def __bool__(self) -> bool:
+        """
+        Check whether the list is nonempty
+        """
+    @typing.overload
+    def __delitem__(self, arg0: typing.SupportsInt) -> None:
+        """
+        Delete the list elements at index ``i``
+        """
+    @typing.overload
+    def __delitem__(self, arg0: slice) -> None:
+        """
+        Delete list elements using a slice object
+        """
+    @typing.overload
+    def __getitem__(self, s: slice) -> IntracellularSpecVector:
+        """
+        Retrieve list elements using a slice object
+        """
+    @typing.overload
+    def __getitem__(self, arg0: typing.SupportsInt) -> ...:
+        ...
+    @typing.overload
+    def __init__(self) -> None:
+        ...
+    @typing.overload
+    def __init__(self, arg0: IntracellularSpecVector) -> None:
+        """
+        Copy constructor
+        """
+    @typing.overload
+    def __init__(self, arg0: collections.abc.Iterable) -> None:
+        ...
+    def __iter__(self) -> collections.abc.Iterator[...]:
+        ...
+    def __len__(self) -> int:
+        ...
+    @typing.overload
+    def __setitem__(self, arg0: typing.SupportsInt, arg1: ...) -> None:
+        ...
+    @typing.overload
+    def __setitem__(self, arg0: slice, arg1: IntracellularSpecVector) -> None:
+        """
+        Assign list elements using a slice object
+        """
+    def append(self, x: ...) -> None:
+        """
+        Add an item to the end of the list
+        """
+    def clear(self) -> None:
+        """
+        Clear the contents
+        """
+    @typing.overload
+    def extend(self, L: IntracellularSpecVector) -> None:
+        """
+        Extend the list by appending all the items in the given list
+        """
+    @typing.overload
+    def extend(self, L: collections.abc.Iterable) -> None:
+        """
+        Extend the list by appending all the items in the given list
+        """
+    def insert(self, i: typing.SupportsInt, x: ...) -> None:
+        """
+        Insert an item at a given position.
+        """
+    @typing.overload
+    def pop(self) -> ...:
+        """
+        Remove and return the last item
+        """
+    @typing.overload
+    def pop(self, i: typing.SupportsInt) -> ...:
+        """
+        Remove and return the item at index ``i``
+        """
+class IntracellularUpdateForm:
+    """
+    Members:
+    
+      DECAY
+    
+      DRIVEN_DECAY
+    
+      DRIVEN_DECAY_NERNST
+    
+      CUSTOM_EXPR
+    """
+    CUSTOM_EXPR: typing.ClassVar[IntracellularUpdateForm]  # value = <IntracellularUpdateForm.CUSTOM_EXPR: 3>
+    DECAY: typing.ClassVar[IntracellularUpdateForm]  # value = <IntracellularUpdateForm.DECAY: 0>
+    DRIVEN_DECAY: typing.ClassVar[IntracellularUpdateForm]  # value = <IntracellularUpdateForm.DRIVEN_DECAY: 1>
+    DRIVEN_DECAY_NERNST: typing.ClassVar[IntracellularUpdateForm]  # value = <IntracellularUpdateForm.DRIVEN_DECAY_NERNST: 2>
+    __members__: typing.ClassVar[dict[str, IntracellularUpdateForm]]  # value = {'DECAY': <IntracellularUpdateForm.DECAY: 0>, 'DRIVEN_DECAY': <IntracellularUpdateForm.DRIVEN_DECAY: 1>, 'DRIVEN_DECAY_NERNST': <IntracellularUpdateForm.DRIVEN_DECAY_NERNST: 2>, 'CUSTOM_EXPR': <IntracellularUpdateForm.CUSTOM_EXPR: 3>}
+    def __eq__(self, other: typing.Any) -> bool:
+        ...
+    def __getstate__(self) -> int:
+        ...
+    def __hash__(self) -> int:
+        ...
+    def __index__(self) -> int:
+        ...
+    def __init__(self, value: typing.SupportsInt) -> None:
+        ...
+    def __int__(self) -> int:
+        ...
+    def __ne__(self, other: typing.Any) -> bool:
+        ...
+    def __repr__(self) -> str:
+        ...
+    def __setstate__(self, state: typing.SupportsInt) -> None:
+        ...
+    def __str__(self) -> str:
+        ...
+    @property
+    def name(self) -> str:
+        ...
+    @property
+    def value(self) -> int:
+        ...
 class IzhikevichNeuron(NeuronBase):
     @staticmethod
     def get_preset(type: IzhikevichType) -> IzhikevichParameters:
@@ -886,188 +1227,6 @@ class IzhikevichType:
     @property
     def value(self) -> int:
         ...
-class KineticCurrentForm:
-    """
-    Members:
-    
-      LINEAR
-    
-      MG_BLOCK
-    
-      CUSTOM_EXPR
-    """
-    CUSTOM_EXPR: typing.ClassVar[KineticCurrentForm]  # value = <KineticCurrentForm.CUSTOM_EXPR: 2>
-    LINEAR: typing.ClassVar[KineticCurrentForm]  # value = <KineticCurrentForm.LINEAR: 0>
-    MG_BLOCK: typing.ClassVar[KineticCurrentForm]  # value = <KineticCurrentForm.MG_BLOCK: 1>
-    __members__: typing.ClassVar[dict[str, KineticCurrentForm]]  # value = {'LINEAR': <KineticCurrentForm.LINEAR: 0>, 'MG_BLOCK': <KineticCurrentForm.MG_BLOCK: 1>, 'CUSTOM_EXPR': <KineticCurrentForm.CUSTOM_EXPR: 2>}
-    def __eq__(self, other: typing.Any) -> bool:
-        ...
-    def __getstate__(self) -> int:
-        ...
-    def __hash__(self) -> int:
-        ...
-    def __index__(self) -> int:
-        ...
-    def __init__(self, value: typing.SupportsInt) -> None:
-        ...
-    def __int__(self) -> int:
-        ...
-    def __ne__(self, other: typing.Any) -> bool:
-        ...
-    def __repr__(self) -> str:
-        ...
-    def __setstate__(self, state: typing.SupportsInt) -> None:
-        ...
-    def __str__(self) -> str:
-        ...
-    @property
-    def name(self) -> str:
-        ...
-    @property
-    def value(self) -> int:
-        ...
-class KineticSynapseSpec:
-    alpha: RateFuncParams
-    beta: RateFuncParams
-    current_form: KineticCurrentForm
-    name: str
-    s_inf: BoltzmannParams
-    tau: TauParams
-    update_form: KineticUpdateForm
-    @staticmethod
-    def gaba_b() -> KineticSynapseSpec:
-        ...
-    @staticmethod
-    def gaba_kinetic() -> KineticSynapseSpec:
-        ...
-    @staticmethod
-    def nmda_kinetic() -> KineticSynapseSpec:
-        ...
-    def __init__(self) -> None:
-        ...
-    def __repr__(self) -> str:
-        ...
-    @property
-    def E_syn(self) -> float:
-        ...
-    @E_syn.setter
-    def E_syn(self, arg0: typing.SupportsFloat) -> None:
-        ...
-    @property
-    def S_init(self) -> float:
-        ...
-    @S_init.setter
-    def S_init(self, arg0: typing.SupportsFloat) -> None:
-        ...
-    @property
-    def current_fn_ptr(self) -> int:
-        ...
-    @current_fn_ptr.setter
-    def current_fn_ptr(self, arg0: typing.SupportsInt) -> None:
-        ...
-    @property
-    def dS_dt_fn_ptr(self) -> int:
-        ...
-    @dS_dt_fn_ptr.setter
-    def dS_dt_fn_ptr(self, arg0: typing.SupportsInt) -> None:
-        ...
-    @property
-    def g(self) -> float:
-        ...
-    @g.setter
-    def g(self, arg0: typing.SupportsFloat) -> None:
-        ...
-    @property
-    def mg_conc(self) -> float:
-        ...
-    @mg_conc.setter
-    def mg_conc(self, arg0: typing.SupportsFloat) -> None:
-        ...
-    @property
-    def mg_denom(self) -> float:
-        ...
-    @mg_denom.setter
-    def mg_denom(self, arg0: typing.SupportsFloat) -> None:
-        ...
-    @property
-    def mg_scale(self) -> float:
-        ...
-    @mg_scale.setter
-    def mg_scale(self, arg0: typing.SupportsFloat) -> None:
-        ...
-    @property
-    def power(self) -> int:
-        ...
-    @power.setter
-    def power(self, arg0: typing.SupportsInt) -> None:
-        ...
-    @property
-    def tanh_amp(self) -> float:
-        ...
-    @tanh_amp.setter
-    def tanh_amp(self, arg0: typing.SupportsFloat) -> None:
-        ...
-    @property
-    def tanh_k(self) -> float:
-        ...
-    @tanh_k.setter
-    def tanh_k(self, arg0: typing.SupportsFloat) -> None:
-        ...
-    @property
-    def tanh_vh(self) -> float:
-        ...
-    @tanh_vh.setter
-    def tanh_vh(self, arg0: typing.SupportsFloat) -> None:
-        ...
-    @property
-    def tau_decay(self) -> float:
-        ...
-    @tau_decay.setter
-    def tau_decay(self, arg0: typing.SupportsFloat) -> None:
-        ...
-class KineticUpdateForm:
-    """
-    Members:
-    
-      ALPHA_BETA
-    
-      TANH_GATE
-    
-      BOLTZMANN_GATE
-    
-      CUSTOM_EXPR
-    """
-    ALPHA_BETA: typing.ClassVar[KineticUpdateForm]  # value = <KineticUpdateForm.ALPHA_BETA: 0>
-    BOLTZMANN_GATE: typing.ClassVar[KineticUpdateForm]  # value = <KineticUpdateForm.BOLTZMANN_GATE: 2>
-    CUSTOM_EXPR: typing.ClassVar[KineticUpdateForm]  # value = <KineticUpdateForm.CUSTOM_EXPR: 3>
-    TANH_GATE: typing.ClassVar[KineticUpdateForm]  # value = <KineticUpdateForm.TANH_GATE: 1>
-    __members__: typing.ClassVar[dict[str, KineticUpdateForm]]  # value = {'ALPHA_BETA': <KineticUpdateForm.ALPHA_BETA: 0>, 'TANH_GATE': <KineticUpdateForm.TANH_GATE: 1>, 'BOLTZMANN_GATE': <KineticUpdateForm.BOLTZMANN_GATE: 2>, 'CUSTOM_EXPR': <KineticUpdateForm.CUSTOM_EXPR: 3>}
-    def __eq__(self, other: typing.Any) -> bool:
-        ...
-    def __getstate__(self) -> int:
-        ...
-    def __hash__(self) -> int:
-        ...
-    def __index__(self) -> int:
-        ...
-    def __init__(self, value: typing.SupportsInt) -> None:
-        ...
-    def __int__(self) -> int:
-        ...
-    def __ne__(self, other: typing.Any) -> bool:
-        ...
-    def __repr__(self) -> str:
-        ...
-    def __setstate__(self, state: typing.SupportsInt) -> None:
-        ...
-    def __str__(self) -> str:
-        ...
-    @property
-    def name(self) -> str:
-        ...
-    @property
-    def value(self) -> int:
-        ...
 class NeuronBase:
     def __repr__(self) -> str:
         ...
@@ -1156,6 +1315,14 @@ class NeuronModelSpec:
     def V_init(self, arg0: typing.SupportsFloat) -> None:
         ...
     @property
+    def intracellular(self) -> IntracellularSpecVector:
+        """
+        List of IntracellularSpec (ordered: index 0 = calcium by convention)
+        """
+    @intracellular.setter
+    def intracellular(self, arg0: IntracellularSpecVector) -> None:
+        ...
+    @property
     def is_izhikevich(self) -> bool:
         """
         True when this spec represents an Izhikevich neuron
@@ -1170,6 +1337,54 @@ class NeuronModelSpec:
         """
     @iz_params.setter
     def iz_params(self, arg0: IzhikevichParameters) -> None:
+        ...
+class PlasticitySpec:
+    stdp: STDPParams
+    stp: STPParams
+    type: PlasticityType
+    def __init__(self) -> None:
+        ...
+    def __repr__(self) -> str:
+        ...
+class PlasticityType:
+    """
+    Members:
+    
+      NONE
+    
+      STDP
+    
+      STP
+    """
+    NONE: typing.ClassVar[PlasticityType]  # value = <PlasticityType.NONE: 0>
+    STDP: typing.ClassVar[PlasticityType]  # value = <PlasticityType.STDP: 1>
+    STP: typing.ClassVar[PlasticityType]  # value = <PlasticityType.STP: 2>
+    __members__: typing.ClassVar[dict[str, PlasticityType]]  # value = {'NONE': <PlasticityType.NONE: 0>, 'STDP': <PlasticityType.STDP: 1>, 'STP': <PlasticityType.STP: 2>}
+    def __eq__(self, other: typing.Any) -> bool:
+        ...
+    def __getstate__(self) -> int:
+        ...
+    def __hash__(self) -> int:
+        ...
+    def __index__(self) -> int:
+        ...
+    def __init__(self, value: typing.SupportsInt) -> None:
+        ...
+    def __int__(self) -> int:
+        ...
+    def __ne__(self, other: typing.Any) -> bool:
+        ...
+    def __repr__(self) -> str:
+        ...
+    def __setstate__(self, state: typing.SupportsInt) -> None:
+        ...
+    def __str__(self) -> str:
+        ...
+    @property
+    def name(self) -> str:
+        ...
+    @property
+    def value(self) -> int:
         ...
 class RateFuncForm:
     """
@@ -1284,11 +1499,17 @@ class RegionalNetwork:
         ...
     def __repr__(self) -> str:
         ...
+    @typing.overload
     def add_connection(self, src: str, src_local: typing.SupportsInt, dst: str, dst_local: typing.SupportsInt, weight: typing.SupportsFloat, synapse: SynapseSpec, delay: typing.SupportsFloat = 0.0) -> None:
         """
         Add a single connection using local indices
         """
-    def add_kinetic_connection(self, src: str, i: typing.SupportsInt, dst: str, j: typing.SupportsInt, weight: typing.SupportsFloat, spec: KineticSynapseSpec, delay: typing.SupportsFloat = 0.0) -> None:
+    @typing.overload
+    def add_connection(self, src: str, src_local: typing.SupportsInt, dst: str, dst_local: typing.SupportsInt, weight: typing.SupportsFloat, synapse: SynapseSpec, delay: typing.SupportsFloat, plasticity: PlasticitySpec) -> None:
+        """
+        Add a single connection with plasticity using local indices
+        """
+    def add_kinetic_connection(self, src: str, i: typing.SupportsInt, dst: str, j: typing.SupportsInt, weight: typing.SupportsFloat, spec: SynapseSpec, delay: typing.SupportsFloat = 0.0) -> None:
         ...
     @typing.overload
     def add_population(self, name: str, count: typing.SupportsInt, neuron_type: _NetworkNeuronType) -> None:
@@ -1306,12 +1527,12 @@ class RegionalNetwork:
         Add a population with custom Izhikevich parameters
         """
     @typing.overload
-    def add_population(self, name: str, count: typing.SupportsInt, spec: ...) -> None:
+    def add_population(self, name: str, count: typing.SupportsInt, spec: NeuronModelSpec) -> None:
         """
         Add a population with a composable neuron model spec
         """
     @typing.overload
-    def add_population(self, name: str, specs: collections.abc.Sequence[...]) -> None:
+    def add_population(self, name: str, specs: collections.abc.Sequence[NeuronModelSpec]) -> None:
         """
         Add a heterogeneous population from a list of per-neuron specs
         """
@@ -1335,11 +1556,97 @@ class RegionalNetwork:
         """
     def reset(self) -> None:
         ...
+    def update_population_spec(self, name: str, spec: NeuronModelSpec) -> None:
+        """
+        Push an updated NeuronModelSpec (e.g., with new intracellular) back to C++
+        """
     @property
     def num_neurons(self) -> int:
         ...
     @property
     def num_synapses(self) -> int:
+        ...
+class STDPParams:
+    def __init__(self) -> None:
+        ...
+    def __repr__(self) -> str:
+        ...
+    @property
+    def A_minus(self) -> float:
+        ...
+    @A_minus.setter
+    def A_minus(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def A_plus(self) -> float:
+        ...
+    @A_plus.setter
+    def A_plus(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def modulator_pop_start(self) -> int:
+        ...
+    @modulator_pop_start.setter
+    def modulator_pop_start(self, arg0: typing.SupportsInt) -> None:
+        ...
+    @property
+    def modulator_scale(self) -> float:
+        ...
+    @modulator_scale.setter
+    def modulator_scale(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def modulator_substance_idx(self) -> int:
+        ...
+    @modulator_substance_idx.setter
+    def modulator_substance_idx(self, arg0: typing.SupportsInt) -> None:
+        ...
+    @property
+    def tau_minus(self) -> float:
+        ...
+    @tau_minus.setter
+    def tau_minus(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def tau_plus(self) -> float:
+        ...
+    @tau_plus.setter
+    def tau_plus(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def w_max(self) -> float:
+        ...
+    @w_max.setter
+    def w_max(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def w_min(self) -> float:
+        ...
+    @w_min.setter
+    def w_min(self, arg0: typing.SupportsFloat) -> None:
+        ...
+class STPParams:
+    def __init__(self) -> None:
+        ...
+    def __repr__(self) -> str:
+        ...
+    @property
+    def U(self) -> float:
+        ...
+    @U.setter
+    def U(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def tau_u(self) -> float:
+        ...
+    @tau_u.setter
+    def tau_u(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def tau_x(self) -> float:
+        ...
+    @tau_x.setter
+    def tau_x(self, arg0: typing.SupportsFloat) -> None:
         ...
 class SynapseBase:
     def __repr__(self) -> str:
@@ -1378,27 +1685,93 @@ class SynapseBase:
         """
         Synaptic weight
         """
+class SynapseCurrentForm:
+    """
+    Members:
+    
+      LINEAR
+    
+      MG_BLOCK
+    
+      CUSTOM_EXPR
+    """
+    CUSTOM_EXPR: typing.ClassVar[SynapseCurrentForm]  # value = <SynapseCurrentForm.CUSTOM_EXPR: 2>
+    LINEAR: typing.ClassVar[SynapseCurrentForm]  # value = <SynapseCurrentForm.LINEAR: 0>
+    MG_BLOCK: typing.ClassVar[SynapseCurrentForm]  # value = <SynapseCurrentForm.MG_BLOCK: 1>
+    __members__: typing.ClassVar[dict[str, SynapseCurrentForm]]  # value = {'LINEAR': <SynapseCurrentForm.LINEAR: 0>, 'MG_BLOCK': <SynapseCurrentForm.MG_BLOCK: 1>, 'CUSTOM_EXPR': <SynapseCurrentForm.CUSTOM_EXPR: 2>}
+    def __eq__(self, other: typing.Any) -> bool:
+        ...
+    def __getstate__(self) -> int:
+        ...
+    def __hash__(self) -> int:
+        ...
+    def __index__(self) -> int:
+        ...
+    def __init__(self, value: typing.SupportsInt) -> None:
+        ...
+    def __int__(self) -> int:
+        ...
+    def __ne__(self, other: typing.Any) -> bool:
+        ...
+    def __repr__(self) -> str:
+        ...
+    def __setstate__(self, state: typing.SupportsInt) -> None:
+        ...
+    def __str__(self) -> str:
+        ...
+    @property
+    def name(self) -> str:
+        ...
+    @property
+    def value(self) -> int:
+        ...
 class SynapseSpec:
-    type: ...
+    alpha: ...
+    beta: ...
+    current_form: SynapseCurrentForm
+    current_vm: ...
+    dA_dt_vm: ...
+    dS_dt_vm: ...
+    name: str
+    s_inf: ...
+    tau: ...
+    update_form: SynapseUpdateForm
     @staticmethod
-    def alpha(E_syn: typing.SupportsFloat, tau: typing.SupportsFloat) -> SynapseSpec:
+    def alpha_function(tau: typing.SupportsFloat, g: typing.SupportsFloat = 1.0, E_syn: typing.SupportsFloat = 0.0) -> SynapseSpec:
         ...
     @staticmethod
     def ampa() -> SynapseSpec:
         ...
     @staticmethod
-    def double_exponential(E_syn: typing.SupportsFloat, tau_rise: typing.SupportsFloat, tau_decay: typing.SupportsFloat) -> SynapseSpec:
+    def double_exponential(tau_rise: typing.SupportsFloat, tau_decay: typing.SupportsFloat, g: typing.SupportsFloat = 1.0, E_syn: typing.SupportsFloat = 0.0) -> SynapseSpec:
         ...
     @staticmethod
-    def exponential(E_syn: typing.SupportsFloat, tau: typing.SupportsFloat) -> SynapseSpec:
+    def exponential(tau_S: typing.SupportsFloat, g: typing.SupportsFloat = 1.0, E_syn: typing.SupportsFloat = 0.0) -> SynapseSpec:
         ...
     @staticmethod
     def gaba_a() -> SynapseSpec:
         ...
     @staticmethod
+    def gaba_b() -> SynapseSpec:
+        ...
+    @staticmethod
+    def gaba_kinetic() -> SynapseSpec:
+        ...
+    @staticmethod
     def nmda() -> SynapseSpec:
         ...
+    @staticmethod
+    def nmda_kinetic() -> SynapseSpec:
+        ...
+    def __init__(self) -> None:
+        ...
     def __repr__(self) -> str:
+        ...
+    @property
+    def A_init(self) -> float:
+        ...
+    @A_init.setter
+    def A_init(self, arg0: typing.SupportsFloat) -> None:
         ...
     @property
     def E_syn(self) -> float:
@@ -1407,10 +1780,88 @@ class SynapseSpec:
     def E_syn(self, arg0: typing.SupportsFloat) -> None:
         ...
     @property
-    def tau(self) -> float:
+    def S_init(self) -> float:
         ...
-    @tau.setter
-    def tau(self, arg0: typing.SupportsFloat) -> None:
+    @S_init.setter
+    def S_init(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def delta_A(self) -> float:
+        ...
+    @delta_A.setter
+    def delta_A(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def delta_S(self) -> float:
+        ...
+    @delta_S.setter
+    def delta_S(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def g(self) -> float:
+        ...
+    @g.setter
+    def g(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def mg_conc(self) -> float:
+        ...
+    @mg_conc.setter
+    def mg_conc(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def mg_denom(self) -> float:
+        ...
+    @mg_denom.setter
+    def mg_denom(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def mg_scale(self) -> float:
+        ...
+    @mg_scale.setter
+    def mg_scale(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def norm_factor(self) -> float:
+        ...
+    @norm_factor.setter
+    def norm_factor(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def power(self) -> int:
+        ...
+    @power.setter
+    def power(self, arg0: typing.SupportsInt) -> None:
+        ...
+    @property
+    def tanh_amp(self) -> float:
+        ...
+    @tanh_amp.setter
+    def tanh_amp(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def tanh_k(self) -> float:
+        ...
+    @tanh_k.setter
+    def tanh_k(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def tanh_vh(self) -> float:
+        ...
+    @tanh_vh.setter
+    def tanh_vh(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def tau_A(self) -> float:
+        ...
+    @tau_A.setter
+    def tau_A(self, arg0: typing.SupportsFloat) -> None:
+        ...
+    @property
+    def tau_S(self) -> float:
+        ...
+    @tau_S.setter
+    def tau_S(self, arg0: typing.SupportsFloat) -> None:
         ...
     @property
     def tau_decay(self) -> float:
@@ -1418,26 +1869,32 @@ class SynapseSpec:
     @tau_decay.setter
     def tau_decay(self, arg0: typing.SupportsFloat) -> None:
         ...
-    @property
-    def tau_rise(self) -> float:
-        ...
-    @tau_rise.setter
-    def tau_rise(self, arg0: typing.SupportsFloat) -> None:
-        ...
-class SynapseSpecType:
+class SynapseUpdateForm:
     """
     Members:
     
-      EXPONENTIAL
+      EXP_DECAY
     
-      ALPHA
+      ALPHA_FUNC
     
-      DOUBLE_EXPONENTIAL
+      DOUBLE_EXP
+    
+      TANH_GATE
+    
+      BOLTZMANN_GATE
+    
+      ALPHA_BETA
+    
+      CUSTOM_EXPR
     """
-    ALPHA: typing.ClassVar[SynapseSpecType]  # value = <SynapseSpecType.ALPHA: 1>
-    DOUBLE_EXPONENTIAL: typing.ClassVar[SynapseSpecType]  # value = <SynapseSpecType.DOUBLE_EXPONENTIAL: 2>
-    EXPONENTIAL: typing.ClassVar[SynapseSpecType]  # value = <SynapseSpecType.EXPONENTIAL: 0>
-    __members__: typing.ClassVar[dict[str, SynapseSpecType]]  # value = {'EXPONENTIAL': <SynapseSpecType.EXPONENTIAL: 0>, 'ALPHA': <SynapseSpecType.ALPHA: 1>, 'DOUBLE_EXPONENTIAL': <SynapseSpecType.DOUBLE_EXPONENTIAL: 2>}
+    ALPHA_BETA: typing.ClassVar[SynapseUpdateForm]  # value = <SynapseUpdateForm.ALPHA_BETA: 5>
+    ALPHA_FUNC: typing.ClassVar[SynapseUpdateForm]  # value = <SynapseUpdateForm.ALPHA_FUNC: 1>
+    BOLTZMANN_GATE: typing.ClassVar[SynapseUpdateForm]  # value = <SynapseUpdateForm.BOLTZMANN_GATE: 4>
+    CUSTOM_EXPR: typing.ClassVar[SynapseUpdateForm]  # value = <SynapseUpdateForm.CUSTOM_EXPR: 6>
+    DOUBLE_EXP: typing.ClassVar[SynapseUpdateForm]  # value = <SynapseUpdateForm.DOUBLE_EXP: 2>
+    EXP_DECAY: typing.ClassVar[SynapseUpdateForm]  # value = <SynapseUpdateForm.EXP_DECAY: 0>
+    TANH_GATE: typing.ClassVar[SynapseUpdateForm]  # value = <SynapseUpdateForm.TANH_GATE: 3>
+    __members__: typing.ClassVar[dict[str, SynapseUpdateForm]]  # value = {'EXP_DECAY': <SynapseUpdateForm.EXP_DECAY: 0>, 'ALPHA_FUNC': <SynapseUpdateForm.ALPHA_FUNC: 1>, 'DOUBLE_EXP': <SynapseUpdateForm.DOUBLE_EXP: 2>, 'TANH_GATE': <SynapseUpdateForm.TANH_GATE: 3>, 'BOLTZMANN_GATE': <SynapseUpdateForm.BOLTZMANN_GATE: 4>, 'ALPHA_BETA': <SynapseUpdateForm.ALPHA_BETA: 5>, 'CUSTOM_EXPR': <SynapseUpdateForm.CUSTOM_EXPR: 6>}
     def __eq__(self, other: typing.Any) -> bool:
         ...
     def __getstate__(self) -> int:
@@ -1583,12 +2040,12 @@ class VmInstructionVector:
     @typing.overload
     def __init__(self, arg0: collections.abc.Iterable) -> None:
         ...
-    def __iter__(self) -> collections.abc.Iterator[typing.Any]:
+    def __iter__(self) -> collections.abc.Iterator[...]:
         ...
     def __len__(self) -> int:
         ...
     @typing.overload
-    def __setitem__(self, arg0: typing.SupportsInt, arg1: typing.Any) -> None:
+    def __setitem__(self, arg0: typing.SupportsInt, arg1: ...) -> None:
         ...
     @typing.overload
     def __setitem__(self, arg0: slice, arg1: VmInstructionVector) -> None:
@@ -1664,6 +2121,12 @@ class VmOp:
       ABS
     
       PUSH_GATE
+    
+      PUSH_S
+    
+      PUSH_A
+    
+      PUSH_X
     """
     ABS: typing.ClassVar[VmOp]  # value = <VmOp.ABS: 15>
     ADD: typing.ClassVar[VmOp]  # value = <VmOp.ADD: 2>
@@ -1675,15 +2138,17 @@ class VmOp:
     POW_GEN: typing.ClassVar[VmOp]  # value = <VmOp.POW_GEN: 8>
     POW_HALF: typing.ClassVar[VmOp]  # value = <VmOp.POW_HALF: 7>
     POW_INT: typing.ClassVar[VmOp]  # value = <VmOp.POW_INT: 6>
+    PUSH_A: typing.ClassVar[VmOp]  # value = <VmOp.PUSH_A: 18>
     PUSH_CONST: typing.ClassVar[VmOp]  # value = <VmOp.PUSH_CONST: 1>
     PUSH_DEP: typing.ClassVar[VmOp]  # value = <VmOp.PUSH_DEP: 0>
     PUSH_GATE: typing.ClassVar[VmOp]  # value = <VmOp.PUSH_GATE: 16>
     PUSH_S: typing.ClassVar[VmOp]  # value = <VmOp.PUSH_S: 17>
+    PUSH_X: typing.ClassVar[VmOp]  # value = <VmOp.PUSH_X: 19>
     RCP: typing.ClassVar[VmOp]  # value = <VmOp.RCP: 5>
     SIN: typing.ClassVar[VmOp]  # value = <VmOp.SIN: 12>
     SQRT: typing.ClassVar[VmOp]  # value = <VmOp.SQRT: 14>
     TANH: typing.ClassVar[VmOp]  # value = <VmOp.TANH: 11>
-    __members__: typing.ClassVar[dict[str, VmOp]]  # value = {'PUSH_DEP': <VmOp.PUSH_DEP: 0>, 'PUSH_CONST': <VmOp.PUSH_CONST: 1>, 'ADD': <VmOp.ADD: 2>, 'MUL': <VmOp.MUL: 3>, 'NEG': <VmOp.NEG: 4>, 'RCP': <VmOp.RCP: 5>, 'POW_INT': <VmOp.POW_INT: 6>, 'POW_HALF': <VmOp.POW_HALF: 7>, 'POW_GEN': <VmOp.POW_GEN: 8>, 'EXP': <VmOp.EXP: 9>, 'LOG': <VmOp.LOG: 10>, 'TANH': <VmOp.TANH: 11>, 'SIN': <VmOp.SIN: 12>, 'COS': <VmOp.COS: 13>, 'SQRT': <VmOp.SQRT: 14>, 'ABS': <VmOp.ABS: 15>, 'PUSH_GATE': <VmOp.PUSH_GATE: 16>}
+    __members__: typing.ClassVar[dict[str, VmOp]]  # value = {'PUSH_DEP': <VmOp.PUSH_DEP: 0>, 'PUSH_CONST': <VmOp.PUSH_CONST: 1>, 'ADD': <VmOp.ADD: 2>, 'MUL': <VmOp.MUL: 3>, 'NEG': <VmOp.NEG: 4>, 'RCP': <VmOp.RCP: 5>, 'POW_INT': <VmOp.POW_INT: 6>, 'POW_HALF': <VmOp.POW_HALF: 7>, 'POW_GEN': <VmOp.POW_GEN: 8>, 'EXP': <VmOp.EXP: 9>, 'LOG': <VmOp.LOG: 10>, 'TANH': <VmOp.TANH: 11>, 'SIN': <VmOp.SIN: 12>, 'COS': <VmOp.COS: 13>, 'SQRT': <VmOp.SQRT: 14>, 'ABS': <VmOp.ABS: 15>, 'PUSH_GATE': <VmOp.PUSH_GATE: 16>, 'PUSH_S': <VmOp.PUSH_S: 17>, 'PUSH_A': <VmOp.PUSH_A: 18>, 'PUSH_X': <VmOp.PUSH_X: 19>}
     def __eq__(self, other: typing.Any) -> bool:
         ...
     def __getstate__(self) -> int:
@@ -1815,7 +2280,7 @@ class _Network:
         """
         Add a GABA_A synapse (E=-80, tau_r=0.4, tau_d=7.7)
         """
-    def add_kinetic_synapse(self, pre: typing.SupportsInt, post: typing.SupportsInt, weight: typing.SupportsFloat, spec: KineticSynapseSpec, delay: typing.SupportsFloat = 0.0) -> int:
+    def add_kinetic_synapse(self, pre: typing.SupportsInt, post: typing.SupportsInt, weight: typing.SupportsFloat, spec: SynapseSpec, delay: typing.SupportsFloat = 0.0) -> int:
         ...
     @typing.overload
     def add_neuron(self) -> int:
@@ -1838,7 +2303,7 @@ class _Network:
         Add an Izhikevich neuron with custom parameters, returns index
         """
     @typing.overload
-    def add_neuron(self, spec: ...) -> int:
+    def add_neuron(self, spec: NeuronModelSpec) -> int:
         """
         Add a composable neuron from a model spec, returns index
         """
@@ -1850,6 +2315,17 @@ class _Network:
         """
         Add a synapse by receptor type (AMPA, NMDA, GABA_A)
         """
+    @typing.overload
+    def add_synapse(self, pre: typing.SupportsInt, post: typing.SupportsInt, weight: typing.SupportsFloat, spec: SynapseSpec, delay: typing.SupportsFloat = 0.0) -> int:
+        """
+        Add a synapse from a unified SynapseSpec, returns index
+        """
+    @typing.overload
+    def add_synapse(self, pre: typing.SupportsInt, post: typing.SupportsInt, weight: typing.SupportsFloat, spec: SynapseSpec, delay: typing.SupportsFloat, plasticity: PlasticitySpec) -> int:
+        """
+        Add a synapse with optional plasticity rule, returns index
+        """
+    @typing.overload
     def add_synapse(self, pre_idx: typing.SupportsInt, post_idx: typing.SupportsInt, weight: typing.SupportsFloat, E_syn: typing.SupportsFloat = 0.0, tau: typing.SupportsFloat = 2.0, delay: typing.SupportsFloat = 0.0) -> None:
         """
         Add an exponential synapse between neurons
@@ -1873,6 +2349,10 @@ class _Network:
     def get_synapse_pre_indices(self) -> list[int]:
         """
         Flat presynaptic neuron index vector
+        """
+    def get_synapse_weights(self) -> list[float]:
+        """
+        Return current weights of all synapses as a list
         """
     def hh_neuron(self, idx: typing.SupportsInt) -> HHNeuron:
         """
@@ -1918,6 +2398,16 @@ class _Network:
     @fast_math.setter
     def fast_math(self, arg1: bool) -> None:
         ...
+    @property
+    def has_stdp(self) -> bool:
+        """
+        True if any synapse has STDP plasticity
+        """
+    @property
+    def has_stp(self) -> bool:
+        """
+        True if any synapse has STP plasticity
+        """
     @property
     def num_neurons(self) -> int:
         ...
@@ -1982,31 +2472,40 @@ class _NetworkNeuronType:
 ABS: VmOp  # value = <VmOp.ABS: 15>
 ADD: VmOp  # value = <VmOp.ADD: 2>
 ALL_TO_ALL: ConnectivityPattern  # value = <ConnectivityPattern.ALL_TO_ALL: 0>
-ALPHA: SynapseSpecType  # value = <SynapseSpecType.ALPHA: 1>
-ALPHA_BETA: KineticUpdateForm  # value = <KineticUpdateForm.ALPHA_BETA: 0>
+ALPHA_BETA: GateUpdateForm  # value = <GateUpdateForm.ALPHA_BETA: 1>
+ALPHA_FUNC: SynapseUpdateForm  # value = <SynapseUpdateForm.ALPHA_FUNC: 1>
 AMPA: ReceptorType  # value = <ReceptorType.AMPA: 0>
 BOLTZMANN: TauForm  # value = <TauForm.BOLTZMANN: 1>
-BOLTZMANN_GATE: KineticUpdateForm  # value = <KineticUpdateForm.BOLTZMANN_GATE: 2>
-CALCIUM: GateDependency  # value = <GateDependency.CALCIUM: 1>
+BOLTZMANN_GATE: SynapseUpdateForm  # value = <SynapseUpdateForm.BOLTZMANN_GATE: 4>
+CALCIUM: GateDependency  # value = <GateDependency.INTRACELLULAR: 1>
+CHANNEL_EREV: IntracellularModulationTarget  # value = <IntracellularModulationTarget.CHANNEL_EREV: 1>
+CHANNEL_G: IntracellularModulationTarget  # value = <IntracellularModulationTarget.CHANNEL_G: 0>
 CHATTERING: IzhikevichType  # value = <IzhikevichType.CHATTERING: 3>
 COMPOSABLE: _NetworkNeuronType  # value = <_NetworkNeuronType.COMPOSABLE: 7>
 COMPOUND_AB: TauForm  # value = <TauForm.COMPOUND_AB: 5>
 CONSTANT: TauForm  # value = <TauForm.CONSTANT: 0>
 COS: VmOp  # value = <VmOp.COS: 13>
 CUSTOM: IzhikevichType  # value = <IzhikevichType.CUSTOM: 5>
-CUSTOM_EXPR: KineticCurrentForm  # value = <KineticCurrentForm.CUSTOM_EXPR: 2>
+CUSTOM_EXPR: IntracellularUpdateForm  # value = <IntracellularUpdateForm.CUSTOM_EXPR: 3>
+DECAY: IntracellularUpdateForm  # value = <IntracellularUpdateForm.DECAY: 0>
 DERIVED: GateUpdateForm  # value = <GateUpdateForm.DERIVED: 3>
-DOUBLE_EXPONENTIAL: SynapseSpecType  # value = <SynapseSpecType.DOUBLE_EXPONENTIAL: 2>
+DOUBLE_EXP: SynapseUpdateForm  # value = <SynapseUpdateForm.DOUBLE_EXP: 2>
 DOUBLE_EXP_SUM: TauForm  # value = <TauForm.DOUBLE_EXP_SUM: 2>
+DRIVEN_DECAY: IntracellularUpdateForm  # value = <IntracellularUpdateForm.DRIVEN_DECAY: 1>
+DRIVEN_DECAY_NERNST: IntracellularUpdateForm  # value = <IntracellularUpdateForm.DRIVEN_DECAY_NERNST: 2>
 EULER: IntegrationMethod  # value = <IntegrationMethod.EULER: 0>
 EXP: VmOp  # value = <VmOp.EXP: 9>
-EXPONENTIAL: SynapseSpecType  # value = <SynapseSpecType.EXPONENTIAL: 0>
 EXP_DECAY: RateFuncForm  # value = <RateFuncForm.EXP_DECAY: 1>
 FAST_SPIKING: IzhikevichType  # value = <IzhikevichType.FAST_SPIKING: 1>
 GABA_A: ReceptorType  # value = <ReceptorType.GABA_A: 2>
+GATE_INF_EXPR: IntracellularModulationTarget  # value = <IntracellularModulationTarget.GATE_INF_EXPR: 5>
+GATE_INF_SCALE: IntracellularModulationTarget  # value = <IntracellularModulationTarget.GATE_INF_SCALE: 3>
+GATE_INF_SHIFT: IntracellularModulationTarget  # value = <IntracellularModulationTarget.GATE_INF_SHIFT: 2>
+GATE_TAU_SCALE: IntracellularModulationTarget  # value = <IntracellularModulationTarget.GATE_TAU_SCALE: 4>
 HH: _NetworkNeuronType  # value = <_NetworkNeuronType.HH: 0>
 INF_TAU: GateUpdateForm  # value = <GateUpdateForm.INF_TAU: 0>
 INSTANT: GateUpdateForm  # value = <GateUpdateForm.INSTANT: 2>
+INTRACELLULAR: GateDependency  # value = <GateDependency.INTRACELLULAR: 1>
 INTRINSICALLY_BURSTING: IzhikevichType  # value = <IzhikevichType.INTRINSICALLY_BURSTING: 2>
 IZHIKEVICH_CH: _NetworkNeuronType  # value = <_NetworkNeuronType.IZHIKEVICH_CH: 4>
 IZHIKEVICH_CUSTOM: _NetworkNeuronType  # value = <_NetworkNeuronType.IZHIKEVICH_CUSTOM: 6>
@@ -2014,25 +2513,28 @@ IZHIKEVICH_FS: _NetworkNeuronType  # value = <_NetworkNeuronType.IZHIKEVICH_FS: 
 IZHIKEVICH_IB: _NetworkNeuronType  # value = <_NetworkNeuronType.IZHIKEVICH_IB: 3>
 IZHIKEVICH_LTS: _NetworkNeuronType  # value = <_NetworkNeuronType.IZHIKEVICH_LTS: 5>
 IZHIKEVICH_RS: _NetworkNeuronType  # value = <_NetworkNeuronType.IZHIKEVICH_RS: 1>
-LINEAR: KineticCurrentForm  # value = <KineticCurrentForm.LINEAR: 0>
+LINEAR: SynapseCurrentForm  # value = <SynapseCurrentForm.LINEAR: 0>
 LINEAR_OVER_EXP: RateFuncForm  # value = <RateFuncForm.LINEAR_OVER_EXP: 0>
 LINEAR_OVER_EXPM1: RateFuncForm  # value = <RateFuncForm.LINEAR_OVER_EXPM1: 2>
 LOG: VmOp  # value = <VmOp.LOG: 10>
 LOW_THRESHOLD_SPIKING: IzhikevichType  # value = <IzhikevichType.LOW_THRESHOLD_SPIKING: 4>
-MG_BLOCK: KineticCurrentForm  # value = <KineticCurrentForm.MG_BLOCK: 1>
+MG_BLOCK: SynapseCurrentForm  # value = <SynapseCurrentForm.MG_BLOCK: 1>
 MUL: VmOp  # value = <VmOp.MUL: 3>
 NEG: VmOp  # value = <VmOp.NEG: 4>
 NMDA: ReceptorType  # value = <ReceptorType.NMDA: 1>
+NONE: PlasticityType  # value = <PlasticityType.NONE: 0>
 NORMAL: WeightDistType  # value = <WeightDistType.NORMAL: 2>
 OFFSET_DOUBLE_EXP: TauForm  # value = <TauForm.OFFSET_DOUBLE_EXP: 3>
 ONE_TO_ONE: ConnectivityPattern  # value = <ConnectivityPattern.ONE_TO_ONE: 1>
 POW_GEN: VmOp  # value = <VmOp.POW_GEN: 8>
 POW_HALF: VmOp  # value = <VmOp.POW_HALF: 7>
 POW_INT: VmOp  # value = <VmOp.POW_INT: 6>
+PUSH_A: VmOp  # value = <VmOp.PUSH_A: 18>
 PUSH_CONST: VmOp  # value = <VmOp.PUSH_CONST: 1>
 PUSH_DEP: VmOp  # value = <VmOp.PUSH_DEP: 0>
 PUSH_GATE: VmOp  # value = <VmOp.PUSH_GATE: 16>
 PUSH_S: VmOp  # value = <VmOp.PUSH_S: 17>
+PUSH_X: VmOp  # value = <VmOp.PUSH_X: 19>
 RANDOM_PERMUTATION: ConnectivityPattern  # value = <ConnectivityPattern.RANDOM_PERMUTATION: 4>
 RANDOM_SPARSE: ConnectivityPattern  # value = <ConnectivityPattern.RANDOM_SPARSE: 3>
 RCP: VmOp  # value = <VmOp.RCP: 5>
@@ -2044,10 +2546,16 @@ SHIFTED: ConnectivityPattern  # value = <ConnectivityPattern.SHIFTED: 2>
 SIGMOID: RateFuncForm  # value = <RateFuncForm.SIGMOID: 3>
 SIN: VmOp  # value = <VmOp.SIN: 12>
 SQRT: VmOp  # value = <VmOp.SQRT: 14>
+STDP: PlasticityType  # value = <PlasticityType.STDP: 1>
+STP: PlasticityType  # value = <PlasticityType.STP: 2>
+SYNAPSE_G: IntracellularModulationTarget  # value = <IntracellularModulationTarget.SYNAPSE_G: 6>
 TANH: VmOp  # value = <VmOp.TANH: 11>
-TANH_GATE: KineticUpdateForm  # value = <KineticUpdateForm.TANH_GATE: 1>
+TANH_GATE: SynapseUpdateForm  # value = <SynapseUpdateForm.TANH_GATE: 3>
 UNIFORM: WeightDistType  # value = <WeightDistType.UNIFORM: 1>
 VOLTAGE: GateDependency  # value = <GateDependency.VOLTAGE: 0>
 __version__: str = '0.7.0'
+KineticCurrentForm = SynapseCurrentForm
+KineticSynapseSpec = SynapseSpec
+KineticUpdateForm = SynapseUpdateForm
 Parameters = HHParameters
 State = HHState
