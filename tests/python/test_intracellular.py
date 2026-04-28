@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import sympy as sp
 
-import hodgkin_huxley as hh
+import hodgkin_huxley as hh  # must precede sympy to block broken gmpy2 DLL on Windows
+import sympy as sp
 from hodgkin_huxley import (
     NeuronModel,
     NeuronModelSpec,

@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import sympy
 
-import hodgkin_huxley as hh
+import hodgkin_huxley as hh  # must precede sympy to block broken gmpy2 DLL on Windows
+import sympy
 from hodgkin_huxley import (
     V, Ca, V_pre, V_post, S, x,
     Boltzmann, Tau, RateFunc,

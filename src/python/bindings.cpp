@@ -246,6 +246,12 @@ PYBIND11_MODULE(_core, m) {
              "Add a synapse from a unified SynapseSpec, returns index",
              py::arg("pre"), py::arg("post"), py::arg("weight"),
              py::arg("spec"), py::arg("delay") = 0.0)
+        .def("add_synapse",
+             py::overload_cast<size_t, size_t, double, const SynapseSpec&, double, const PlasticitySpec&>(
+                 &Network::add_synapse),
+             "Add a synapse with optional plasticity rule, returns index",
+             py::arg("pre"), py::arg("post"), py::arg("weight"),
+             py::arg("spec"), py::arg("delay"), py::arg("plasticity"))
         // Legacy wrappers (backward compat)
         .def("add_synapse",
              py::overload_cast<size_t, size_t, double, double, double, double>(
@@ -314,6 +320,14 @@ PYBIND11_MODULE(_core, m) {
         .def("get_kin_g", &Network::get_kin_g,
              "Get effective conductance g for a synapse by index",
              py::arg("synapse_idx"))
+
+        // Plasticity accessors
+        .def("get_synapse_weights", &Network::get_synapse_weights,
+             "Return current weights of all synapses as a list")
+        .def_property_readonly("has_stdp", &Network::has_stdp,
+             "True if any synapse has STDP plasticity")
+        .def_property_readonly("has_stp",  &Network::has_stp,
+             "True if any synapse has STP plasticity")
 
         // Simulation
         .def("get_potentials", &Network::get_potentials,
@@ -594,12 +608,24 @@ PYBIND11_MODULE(_core, m) {
              py::arg("delay") = 0.0, py::arg("shift") = 1,
              py::arg("probability") = 0.1, py::arg("allow_self") = false,
              py::arg("seed") = 0)
-        .def("add_connection", &RegionalNetwork::add_connection,
+        .def("add_connection",
+             py::overload_cast<const std::string&, size_t, const std::string&, size_t,
+                               double, const SynapseSpec&, double>(
+                 &RegionalNetwork::add_connection),
              "Add a single connection using local indices",
              py::arg("src"), py::arg("src_local"),
              py::arg("dst"), py::arg("dst_local"),
              py::arg("weight"), py::arg("synapse"),
              py::arg("delay") = 0.0)
+        .def("add_connection",
+             py::overload_cast<const std::string&, size_t, const std::string&, size_t,
+                               double, const SynapseSpec&, double, const PlasticitySpec&>(
+                 &RegionalNetwork::add_connection),
+             "Add a single connection with plasticity using local indices",
+             py::arg("src"), py::arg("src_local"),
+             py::arg("dst"), py::arg("dst_local"),
+             py::arg("weight"), py::arg("synapse"),
+             py::arg("delay"), py::arg("plasticity"))
 
         // Initial conditions
         .def("randomize_membrane_potentials",
@@ -855,6 +881,51 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("modulations",     &IntracellularSpec::modulations)
         .def("__repr__", [](const IntracellularSpec& s) {
             return "<IntracellularSpec '" + s.name + "'>";
+        });
+
+    // =========================================================================
+    // Plasticity types (task15)
+    // =========================================================================
+    py::enum_<PlasticityType>(m, "PlasticityType")
+        .value("NONE", PlasticityType::NONE)
+        .value("STDP", PlasticityType::STDP)
+        .value("STP",  PlasticityType::STP)
+        .export_values();
+
+    py::class_<STDPParams>(m, "STDPParams")
+        .def(py::init<>())
+        .def_readwrite("A_plus",                  &STDPParams::A_plus)
+        .def_readwrite("A_minus",                 &STDPParams::A_minus)
+        .def_readwrite("tau_plus",                &STDPParams::tau_plus)
+        .def_readwrite("tau_minus",               &STDPParams::tau_minus)
+        .def_readwrite("w_min",                   &STDPParams::w_min)
+        .def_readwrite("w_max",                   &STDPParams::w_max)
+        .def_readwrite("modulator_pop_start",     &STDPParams::modulator_pop_start)
+        .def_readwrite("modulator_substance_idx", &STDPParams::modulator_substance_idx)
+        .def_readwrite("modulator_scale",         &STDPParams::modulator_scale)
+        .def("__repr__", [](const STDPParams& p) {
+            return "<STDPParams A+=" + std::to_string(p.A_plus) +
+                   " A-=" + std::to_string(p.A_minus) + ">";
+        });
+
+    py::class_<STPParams>(m, "STPParams")
+        .def(py::init<>())
+        .def_readwrite("U",     &STPParams::U)
+        .def_readwrite("tau_u", &STPParams::tau_u)
+        .def_readwrite("tau_x", &STPParams::tau_x)
+        .def("__repr__", [](const STPParams& p) {
+            return "<STPParams U=" + std::to_string(p.U) + ">";
+        });
+
+    py::class_<PlasticitySpec>(m, "PlasticitySpec")
+        .def(py::init<>())
+        .def_readwrite("type", &PlasticitySpec::type)
+        .def_readwrite("stdp", &PlasticitySpec::stdp)
+        .def_readwrite("stp",  &PlasticitySpec::stp)
+        .def("__repr__", [](const PlasticitySpec& ps) {
+            std::string t = ps.type == PlasticityType::STDP ? "STDP"
+                          : ps.type == PlasticityType::STP  ? "STP" : "NONE";
+            return "<PlasticitySpec type=" + t + ">";
         });
 
     // NeuronModelSpec

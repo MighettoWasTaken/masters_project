@@ -16,6 +16,18 @@ ComposablePool::ComposablePool(const NeuronModelSpec& model, size_t capacity, bo
     const size_t ns = model_.intracellular.size();
     X_.resize(ns);
     E_nernst_.resize(ns);
+
+    // Compute flags once — model is fixed for the pool's lifetime.
+    // Done here rather than finalize() so add() can gate synapse_g_scale_ allocation.
+    has_intracellular_ = ns > 0;
+    has_any_mods_ = false;
+    has_synapse_g_mods_ = false;
+    for (const auto& ic : model_.intracellular)
+        for (const auto& mod : ic.modulations) {
+            has_any_mods_ = true;
+            if (mod.target == IntracellularModulation::Target::SYNAPSE_G)
+                has_synapse_g_mods_ = true;
+        }
 }
 
 void ComposablePool::add(size_t network_idx, double V_init,
@@ -30,10 +42,13 @@ void ComposablePool::add(size_t network_idx, double V_init,
     // Grow arrays
     V_.conservativeResize(N_);
     I_ext_.conservativeResize(N_);
-    synapse_g_scale_.conservativeResize(N_);
 
     V_(i) = V_init;
-    synapse_g_scale_(i) = 1.0;
+
+    if (has_synapse_g_mods_) {
+        synapse_g_scale_.conservativeResize(N_);
+        synapse_g_scale_(i) = 1.0;
+    }
 
     // Substance state
     const size_t ns = model_.intracellular.size();
@@ -76,26 +91,26 @@ void ComposablePool::finalize() {
     const size_t nc = model_.channels.size();
     const size_t ng = model_.gates.size();
 
-    mod_ch_g_.assign(nc, Eigen::ArrayXd::Ones(N_));
-    mod_ch_E_ovr_.assign(nc, Eigen::ArrayXd());
-    mod_gate_shift_.assign(ng, Eigen::ArrayXd::Zero(N_));
-    mod_gate_scale_.assign(ng, Eigen::ArrayXd::Ones(N_));
-    mod_gate_tau_.assign(ng, Eigen::ArrayXd::Ones(N_));
-    mod_gate_expr_.assign(ng, Eigen::ArrayXd());
-    I_channel_.assign(nc, Eigen::ArrayXd::Zero(N_));
+    // Mod scratch arrays: only allocated when modulations are present.
+    // Populations with no add_intracellular() modulations pay zero memory cost.
+    if (has_any_mods_) {
+        mod_ch_g_.assign(nc, Eigen::ArrayXd::Ones(N_));
+        mod_ch_E_ovr_.assign(nc, Eigen::ArrayXd());
+        mod_gate_shift_.assign(ng, Eigen::ArrayXd::Zero(N_));
+        mod_gate_scale_.assign(ng, Eigen::ArrayXd::Ones(N_));
+        mod_gate_tau_.assign(ng, Eigen::ArrayXd::Ones(N_));
+        mod_gate_expr_.assign(ng, Eigen::ArrayXd());
+    }
+
+    // Per-channel current cache: only needed when substances reference source channels.
+    if (has_intracellular_)
+        I_channel_.assign(nc, Eigen::ArrayXd::Zero(N_));
+
     ch_E_rev_.resize(nc);
     for (size_t ci = 0; ci < nc; ++ci)
         ch_E_rev_[ci] = Eigen::ArrayXd::Constant(N_, model_.channels[ci].E_rev);
 
-    has_any_mods_ = false;
-    has_synapse_g_mods_ = false;
-    for (const auto& ic : model_.intracellular) {
-        for (const auto& mod : ic.modulations) {
-            has_any_mods_ = true;
-            if (mod.target == IntracellularModulation::Target::SYNAPSE_G)
-                has_synapse_g_mods_ = true;
-        }
-    }
+    // Flags were computed in the constructor — no recomputation needed.
 
     finalized_ = true;
 }
@@ -459,23 +474,25 @@ void ComposablePool::step(double dt) {
                 ? E_nernst_[ch.nernst_substance_idx]
                 : ch_E_rev_[ci];
 
-        // Write directly into pre-allocated I_channel_[ci] — no extra per-channel malloc
+        // Output buffer: I_channel_[ci] when substances need the cache; tmp_ otherwise.
+        // tmp_ is free at this point (gate loop is done) and pre-allocated — zero malloc.
+        Eigen::ArrayXd& I_ci = has_intracellular_ ? I_channel_[ci] : tmp_;
         if (ch.is_ahp) {
             int aidx = ch.ahp_substance_idx;
             const Eigen::ArrayXd& X_ahp = (aidx >= 0 && aidx < static_cast<int>(X_.size()))
                 ? X_[aidx] : (tmp2_.setZero(), tmp2_);
             Eigen::ArrayXd ca_factor = X_ahp / (X_ahp + ch.ahp_k1).max(1e-10);
             if (has_any_mods_)
-                I_channel_[ci] = ch.g * mod_ch_g_[ci] * ca_factor * (V_ - E_rev);
+                I_ci = ch.g * mod_ch_g_[ci] * ca_factor * (V_ - E_rev);
             else
-                I_channel_[ci] = ch.g * ca_factor * (V_ - E_rev);
+                I_ci = ch.g * ca_factor * (V_ - E_rev);
         } else {
             if (has_any_mods_)
-                I_channel_[ci] = ch.g * mod_ch_g_[ci] * gate_prod * (V_ - E_rev);
+                I_ci = ch.g * mod_ch_g_[ci] * gate_prod * (V_ - E_rev);
             else
-                I_channel_[ci] = ch.g * gate_prod * (V_ - E_rev);
+                I_ci = ch.g * gate_prod * (V_ - E_rev);
         }
-        I_total_ += I_channel_[ci];
+        I_total_ += I_ci;
     }
 
     // =========================================================================
@@ -518,6 +535,7 @@ void ComposablePool::scatter_substance_into(size_t subst_idx, double* buf,
 }
 
 void ComposablePool::scatter_synapse_g_scale(double* buf) const {
+    if (!has_synapse_g_mods_) return;  // array not allocated — nothing to scatter
     for (size_t i = 0; i < N_; ++i) {
         buf[net_idx_[i]] = synapse_g_scale_(i);
     }

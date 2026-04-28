@@ -45,6 +45,22 @@ public:
 
     const NeuronModelSpec& model() const { return model_; }
 
+    bool contains_neuron(size_t global_neuron_idx) const {
+        for (size_t i = 0; i < N_; ++i)
+            if (net_idx_[i] == global_neuron_idx) return true;
+        return false;
+    }
+
+    /// Return substance concentration for global neuron index; returns 0 if not in this pool.
+    double get_substance_at(size_t global_neuron_idx, size_t subst_idx) const {
+        if (subst_idx >= X_.size()) return 0.0;
+        for (size_t i = 0; i < N_; ++i) {
+            if (net_idx_[i] == global_neuron_idx)
+                return X_[subst_idx](i);
+        }
+        return 0.0;
+    }
+
 private:
     NeuronModelSpec model_;
     size_t N_ = 0;
@@ -90,7 +106,8 @@ private:
     // Per-channel currents cached during channel loop, reused by update_substances
     std::vector<Eigen::ArrayXd> I_channel_;      // nc × N_
 
-    bool has_any_mods_      = false; // any substance has modulations
+    bool has_intracellular_  = false; // any IntracellularSpec present
+    bool has_any_mods_       = false; // any substance has modulations
     bool has_synapse_g_mods_ = false; // any substance has SYNAPSE_G modulation
 
     // Helpers for substance dynamics

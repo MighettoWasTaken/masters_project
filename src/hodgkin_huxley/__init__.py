@@ -7,6 +7,17 @@ Supports Hodgkin-Huxley, Izhikevich, and extensible to other models.
 
 from __future__ import annotations
 
+import sys
+
+# Block gmpy2 before any sympy import. On Windows some conda environments ship
+# a gmpy2 build with a broken DLL (STATUS_ENTRYPOINT_NOT_FOUND) that fatally
+# crashes the process rather than raising ImportError. mpmath falls back to its
+# pure-Python backend when gmpy2 is absent — numerically equivalent for all
+# pattern matching and codegen we do. Placed here (package __init__) so the
+# guard fires regardless of import order in user / test code.
+if sys.platform == "win32":
+    sys.modules.setdefault("gmpy2", None)  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Public types from C++ extension
 # ---------------------------------------------------------------------------
@@ -40,14 +51,18 @@ KineticCurrentForm = SynapseCurrentForm
 from ._dbs import DBSStimulator
 from ._equations import (
     Boltzmann,
+    DopamineGating,
     GateRef,
     GateSpec,
+    HomeostaticScaling,
     IntracellularDynamics,
     KineticSynapseModel,
     KineticSynapseSpec,
     Modulation,
     NeuronModel,
     RateFunc,
+    STDPRule,
+    STPRule,
     SynapseModel,
     Tau,
 )
@@ -119,6 +134,11 @@ __all__ = [
     # Intracellular dynamics (task14)
     "IntracellularDynamics",
     "Modulation",
+    # Plasticity presets and rules (task15)
+    "DopamineGating",
+    "HomeostaticScaling",
+    "STDPRule",
+    "STPRule",
     # Synapse builders
     "SynapseModel",
     "KineticSynapseSpec",

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "hodgkin_huxley/plasticity.hpp"
 #include "hodgkin_huxley/neuron_base.hpp"
 #include "hodgkin_huxley/neuron.hpp"
 #include "hodgkin_huxley/izhikevich.hpp"
@@ -110,6 +111,11 @@ public:
     size_t add_synapse(size_t pre, size_t post, double weight,
                        const SynapseSpec& spec, double delay = 0.0);
 
+    /// Overload with optional plasticity rule.
+    size_t add_synapse(size_t pre, size_t post, double weight,
+                       const SynapseSpec& spec, double delay,
+                       const PlasticitySpec& plast);
+
     // Backward-compatible convenience wrappers — delegate to add_synapse()
     void add_synapse(size_t pre_idx, size_t post_idx, double weight,
                      double E_syn = 0.0, double tau = 2.0, double delay = 0.0);
@@ -158,6 +164,9 @@ public:
     void mark_pools_dirty() { pools_dirty_ = true; }
 
     [[nodiscard]] std::vector<double> get_potentials() const;
+    [[nodiscard]] std::vector<double> get_synapse_weights() const;
+    [[nodiscard]] bool has_stdp() const { return has_stdp_; }
+    [[nodiscard]] bool has_stp()  const { return has_stp_; }
 
     void reset();
     void step(double dt, const std::vector<double>& I_ext);
@@ -231,6 +240,15 @@ private:
 
         std::vector<size_t> spec_idx;    // index into Network::synapse_specs_
 
+        // Plasticity state (task15) — all empty when no plasticity used
+        std::vector<PlasticityType> plast_type;     // full-length, NONE by default
+        std::vector<int32_t>  plast_state_idx;      // full-length, -1 = no state
+        std::vector<size_t>   plast_spec_idx_arr;   // full-length, → plasticity_specs_
+        std::vector<double>   plast_x_pre;          // sparse (n_STDP_synapses)
+        std::vector<double>   plast_x_post;         // sparse (n_STDP_synapses)
+        std::vector<double>   stp_u;                // sparse (n_STP_synapses)
+        std::vector<double>   stp_x;                // sparse (n_STP_synapses)
+
         double cached_dt = -1.0;
         size_t size() const { return pre.size(); }
 
@@ -246,6 +264,10 @@ private:
             decay_S.push_back(0.0);
             decay_A.push_back(0.0);
             spec_idx.push_back(0);
+            // Plasticity defaults: NONE, no state
+            plast_type.push_back(PlasticityType::NONE);
+            plast_state_idx.push_back(-1);
+            plast_spec_idx_arr.push_back(0);
         }
     } sa_;
 
@@ -270,8 +292,18 @@ private:
         std::vector<size_t> alpha_func;     // ALPHA_FUNC
         std::vector<size_t> double_exp;     // DOUBLE_EXP
         std::vector<size_t> voltage_gated;  // TANH_GATE, BOLTZMANN_GATE, ALPHA_BETA, CUSTOM_EXPR
+        // Plasticity index lists (task15)
+        std::vector<size_t> stdp;           // synapses with STDP
+        std::vector<size_t> stp;            // synapses with STP
     } syn_groups_;
     std::vector<uint8_t> spike_detected_;
+
+    // Plasticity (task15)
+    std::vector<PlasticitySpec> plasticity_specs_;
+    bool has_stdp_ = false;
+    bool has_stp_  = false;
+    std::vector<uint8_t> post_spiked_;   // per-neuron; allocated when has_stdp_
+    std::vector<double>  V_all_prev_;    // per-neuron; allocated when has_stdp_
 
     // Synapse specs (deduped by name)
     std::vector<SynapseSpec> synapse_specs_;
@@ -293,6 +325,9 @@ private:
     void update_decay_factors(double dt);
     void build_synapse_groups();
     void sort_synapses_by_pre();
+    void apply_stdp(double dt);
+    void apply_stp(double dt);
+    size_t add_or_find_plasticity_spec(const PlasticitySpec& ps);
 };
 
 } // namespace hodgkin_huxley

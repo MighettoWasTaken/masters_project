@@ -316,6 +316,11 @@ class RegionalNetwork:
             # Append to the Python-side spec
             spec.intracellular.append(ic_spec)
 
+            # Give each population a unique model name so build_from_neurons
+            # creates separate pools for populations with different dynamics.
+            if spec.name != pop_name:
+                spec.name = pop_name
+
             # Push updated spec back to C++
             self._rnet.update_population_spec(pop_name, spec)
 
@@ -334,6 +339,7 @@ class RegionalNetwork:
         kinetic_spec=None,
         g_syn: float | None = None,
         g_pre: float | None = None,
+        plasticity=None,
     ) -> None:
         """
         Connect two populations.
@@ -399,6 +405,22 @@ class RegionalNetwork:
             synapse = kinetic_spec
             kinetic_spec = None
 
+        # Resolve plasticity rule: STDPRule/STPRule → PlasticitySpec
+        import copy as _copy
+        plast_spec = None
+        if plasticity is not None:
+            pl = _copy.copy(plasticity)
+            if hasattr(pl, 'modulator_population') and pl.modulator_population:
+                pl._resolved_pop_start = int(self._rnet.population_start(pl.modulator_population))
+            if hasattr(pl, 'modulator_substance') and pl.modulator_substance is not None:
+                pop_name = pl.modulator_population or dst
+                pop_model = self._pop_specs.get(pop_name)
+                if pop_model is not None:
+                    names = [s.name for s in pop_model.intracellular]
+                    if pl.modulator_substance in names:
+                        pl._resolved_subst_idx = names.index(pl.modulator_substance)
+            plast_spec = pl.to_spec()
+
         if kinetic_spec is not None:
             # Kinetic synapse path — generate pairs and call add_kinetic_connection
             rng = np.random.default_rng(seed if seed != 0 else None)
@@ -432,12 +454,21 @@ class RegionalNetwork:
 
         synapse = synapse or SynapseSpec.ampa()
 
-        if callable(pattern):
-            # Custom pattern: call Python function, add connections individually
+        if callable(pattern) or plast_spec is not None:
+            # Per-connection path: custom pattern OR plasticity (C++ connect() doesn't thread plasticity)
             src_size = self._rnet.population_size(src)
             dst_size = self._rnet.population_size(dst)
-            pairs = pattern(src_size, dst_size)
+            same_pop = src == dst
             rng = np.random.default_rng(seed if seed != 0 else None)
+            if callable(pattern):
+                pairs = pattern(src_size, dst_size)
+            else:
+                if isinstance(pattern, str):
+                    pattern = _PATTERN_MAP[pattern.upper()]
+                pairs = _generate_pairs(
+                    pattern, src_size, dst_size, shift, probability,
+                    allow_self, rng, same_pop=same_pop,
+                )
             for i, j in pairs:  # type: ignore[union-attr]
                 if wdist.type == WeightDistType.CONSTANT:
                     w = wdist.param1
@@ -445,11 +476,16 @@ class RegionalNetwork:
                     w = rng.uniform(wdist.param1, wdist.param2)
                 else:  # NORMAL
                     w = rng.normal(wdist.param1, wdist.param2)
-                self._rnet.add_connection(
-                    src, int(i), dst, int(j), float(w), synapse, delay
-                )
+                if plast_spec is not None:
+                    self._rnet.add_connection(
+                        src, int(i), dst, int(j), float(w), synapse, delay, plast_spec
+                    )
+                else:
+                    self._rnet.add_connection(
+                        src, int(i), dst, int(j), float(w), synapse, delay
+                    )
         else:
-            # Preset pattern: delegate to C++
+            # Preset pattern, no plasticity: delegate to C++
             if isinstance(pattern, str):
                 pattern = _PATTERN_MAP[pattern.upper()]
             self._rnet.connect(
@@ -640,6 +676,10 @@ class RegionalNetwork:
     def detach_stimulator(self, pop_name: str) -> None:
         """Remove any attached stimulator from a population."""
         self._stimulators.pop(pop_name, None)
+
+    def get_synapse_weights(self) -> "np.ndarray":
+        """Return current weights of all synapses as a numpy array."""
+        return np.array(self._rnet.network().get_synapse_weights())
 
     @property
     def network(self) -> "_Network":

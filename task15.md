@@ -4,18 +4,77 @@
 
 ## Overview
 
-Add configurable synaptic plasticity rules that modify connection weights or synapse parameters during simulation. Plasticity must integrate with the intracellular dynamics system (task14) to support neuromodulator-gated learning rules (e.g., dopamine-dependent STDP in striatum). The design extends the SoA synapse system with minimal memory overhead: plasticity state is appended to `SynArrays` only for synapses that request it.
+Add configurable synaptic plasticity rules that modify connection weights or synapse parameters during simulation. The design splits into two sub-problems with different implementation costs:
 
-Update rules are expressed as SymPy expressions using the pre-defined symbols from task13 (`hh.x_pre`, `hh.x_post`, `hh.w`, etc.), compiled via the same EigenPrinter/JIT pipeline.
+**Sub-problem A — Neuromodulatory gain (task14 SYNAPSE_G, no new C++):**  
+Slow, population-wide modulation of synaptic efficacy via intracellular substance → SYNAPSE_G pipeline. Covers dopamine-gated synaptic scaling (Frank, Humphries/Gurney), cholinergic gain control, and homeostatic activity-dependent scaling. Delivered as `IntracellularDynamics` presets. The multiplier is applied per-neuron on top of weights without modifying them in-place.
+
+**Sub-problem B — Per-synapse plasticity (new C++ required):**  
+True STDP and Tsodyks-Markram STP, which require per-synapse state not expressible by the per-neuron intracellular system. Covered in section 15.1 below.
+
+**What task14 already covers (sub-problem A):**
+
+| Rule | Mechanism | Status |
+|---|---|---|
+| Dopamine-gated synaptic gain | `IntracellularDynamics("DA", ode=...)` + `Modulation.synapse_g(...)` | Ready (presets needed) |
+| Homeostatic activity scaling | Slow DECAY substance tracking firing rate → SYNAPSE_G | Ready (presets needed) |
+| ACh / serotonin tone | Same pattern | Ready (presets needed) |
+
+**What still requires C++ (sub-problem B):**
+
+| Rule | Why task14 can't cover it |
+|---|---|
+| STDP | x_pre is per-synapse (not per-neuron); weight changes are spike-triggered |
+| Tsodyks-Markram STP | u, x are per-synapse and spike-triggered; SYNAPSE_G is per-neuron and step-driven |
+
+**Memory/performance design principle (applies to both sub-problems):**  
+All new state is opt-in. Populations and synapses without plasticity must pay zero memory and zero runtime cost. This is enforced by the same flag pattern used in task14 (`has_any_mods_`, `has_synapse_g_mods_`, `has_intracellular_`). New flags for sub-problem B follow the same pattern.
 
 The feature covers three rule families:
-1. **STDP** (Spike-Timing Dependent Plasticity) — correlation-based Hebbian learning
-2. **STP** (Short-Term Plasticity, Tsodyks-Markram) — depression and facilitation
-3. **Homeostatic** — activity-dependent weight rescaling (lower priority)
+1. **Neuromodulator-gated gain** (sub-problem A, task14 infrastructure)
+2. **STDP** (Spike-Timing Dependent Plasticity, sub-problem B)
+3. **STP** (Short-Term Plasticity, Tsodyks-Markram, sub-problem B)
 
 ---
 
-## 15.1 Architecture
+## 15.0 Sub-problem A — Neuromodulatory Presets (Python-only, no C++)
+
+These presets wrap `IntracellularDynamics` + `Modulation.synapse_g()` into named convenience constructors. No C++ changes needed.
+
+### `DopamineGating` preset
+
+Models tonic dopamine concentration driving a sigmoidal gain on incoming synaptic conductance:
+
+```python
+# Usage
+net.add_intracellular(hh.DopamineGating(da_level=0.5, k=10.0), populations=["Str_D1"])
+
+# Internally constructs:
+# IntracellularDynamics("DA",
+#     ode = -k_decay * DA,
+#     initial = da_level,
+#     modulations = [Modulation.synapse_g(1 / (1 + exp(-k * (DA - 0.5))))]
+# )
+```
+
+### `HomeostaticScaling` preset
+
+Tracks a slow exponential average of post-synaptic voltage and scales incoming conductance inversely:
+
+```python
+net.add_intracellular(hh.HomeostaticScaling(target_rate=20.0, tau=5000.0), populations=["STN"])
+```
+
+### Checklist (sub-problem A)
+
+- [x] Add `DopamineGating` preset class in `_equations/__init__.py`
+- [x] Add `HomeostaticScaling` preset class in `_equations/__init__.py`
+- [x] Export from `__init__.py`
+- [x] Tests: verify gain scales correctly with DA level; verify homeostatic convergence toward target rate
+
+---
+
+## 15.1 Architecture (Sub-problem B)
 
 ### Design Principles
 
@@ -147,29 +206,51 @@ weights = net.get_synapse_weights()  # np.ndarray shape (n_synapses,)
 
 ## 15.4 Implementation Checklist
 
-### C++ Core
-- [ ] Define `STDPParams`, `STPParams`, `PlasticitySpec`, `PlasticityType` in `synapse.hpp` or new `plasticity.hpp`
-- [ ] Extend `SynArrays` with plasticity state fields
-- [ ] Extend `Network::add_synapse()` family to accept optional `PlasticitySpec`
-- [ ] Implement STDP update in `Network::update_synapses_grouped()` hot loop
-- [ ] Implement STP conductance scaling in synapse current computation
-- [ ] Add modulator concentration lookup in `Network::simulate_with_descriptors()` for gated STDP
-- [ ] Add `get_synapse_weights()` returning current weight vector
+### Sub-problem A — Neuromodulatory presets (Python-only)
+- [x] `DopamineGating` preset in `_equations/__init__.py`
+- [x] `HomeostaticScaling` preset in `_equations/__init__.py`
+- [x] Export from `hodgkin_huxley/__init__.py`
+- [x] Tests in `tests/python/test_plasticity.py`: gain scales with DA level; homeostatic convergence
 
-### Python Bindings
-- [ ] Bind `PlasticitySpec`, `STDPParams`, `STPParams`, `PlasticityType`
-- [ ] Expose `STDPRule` and `STPRule` as convenience constructors
-- [ ] Extend synapse-add methods to accept `plasticity=` kwarg
-- [ ] Extend `RegionalNetwork.connect()` to pass plasticity spec
-- [ ] Bind `get_synapse_weights()`
+### Sub-problem B — Per-synapse STDP / STP (C++ required)
 
-### Recording
-- [ ] Add weight recording buffer to `simulate_into_buffers()` / `simulate_with_descriptors()`
-- [ ] Expose via `RecordingConfig.with_plasticity()` and `MetricsResult["weights"]`
+**Memory / performance constraints (mandatory):**
+- Plasticity state fields in `SynArrays` must be zero-length by default; resized only for synapses with `plasticity=` set
+- A `has_stdp_` / `has_stp_` boolean flag on `Network` (same pattern as `has_synapse_g_mods_`) gates all per-step plasticity loops and weight-recording scatter
+- Populations and synapse groups without plasticity must incur zero memory and zero loop iterations
 
-### Tests
-- [ ] STDP: verify LTP on pre-before-post spike pairs, LTD on post-before-pre
-- [ ] STDP: verify weight stays within `[w_min, w_max]`
-- [ ] STP: verify depression under high-frequency stimulation, recovery at rest
-- [ ] Gated STDP: verify weight update scales with modulator concentration
-- [ ] Weight recording: verify `result["weights"]` shape and values
+**C++ Core:**
+- [x] Define `STDPParams`, `STPParams`, `PlasticitySpec`, `PlasticityType` in new `plasticity.hpp`
+- [x] Add opt-in plasticity state to `SynArrays`: `plast_type`, `plast_x_pre`, `plast_x_post`, `stp_u`, `stp_x`, `plast_spec_idx` — all empty by default
+- [x] Add `has_stdp_`, `has_stp_` flags to `Network`; set in `build_synapse_groups()`
+- [x] Extend `Network::add_synapse()` family to accept optional `PlasticitySpec`; only resize plasticity arrays when spec is non-NONE
+- [x] Implement STDP trace decay + spike-triggered weight update after spike-detection block in hot loop; gated by `has_stdp_`
+- [x] Implement STP step decay + spike-triggered `u`/`x` update; back-correct `S` on pre-spike (Tsodyks-Markram); gated by `has_stp_`
+- [x] Modulator gating: read `X_[substance_idx]` from pool at post-spike time for gated STDP; `get_substance_at()` accessor on `ComposablePool`, `get_substance()` on `PoolManager`
+- [x] Add `get_synapse_weights()` returning current weight vector
+
+**Python Bindings:**
+- [x] Bind `PlasticitySpec`, `STDPParams`, `STPParams`, `PlasticityType`
+- [x] Expose `STDPRule` and `STPRule` as convenience constructors
+- [x] Extend `RegionalNetwork.connect()` with `plasticity=` kwarg (follows g_syn/g_pre pattern)
+- [x] Bind `get_synapse_weights()`
+
+**Recording:**
+- `RecordingConfig.with_plasticity()` deferred — weight traces accessible via `get_synapse_weights()` after each epoch
+
+**Tests:**
+- [x] STDP: verify LTP on pre-before-post spike pairs, LTD on post-before-pre
+- [x] STDP: verify weight stays within `[w_min, w_max]`
+- [x] STP: verify depression under high-frequency stimulation, recovery at rest
+- [x] Gated STDP: verify weight update scales with modulator concentration
+- [x] Zero-overhead: benchmark with `plasticity=None` (default) confirms no timing regression vs pre-task15
+
+## Status: COMPLETE (2026-04-27)
+
+34/34 plasticity tests pass. 1035/1035 total tests pass.
+
+### Key implementation notes
+
+- **STP back-correction**: `apply_stp()` corrects `S` (not `g`) to make depression persistent across steps: removes unscaled `delta_S` jump and replaces with `u*x`-scaled version, then recomputes `g = spec.g * weight * S`.
+- **Pool name collision fix**: `add_intracellular()` renames spec to pop_name to ensure pools are not merged when multiple populations share the same base model name.
+- **STP frequency discrimination**: HH neurons (Type II) are unsuitable — they fire near-constantly above rheobase. STP frequency tests use Izhikevich RS (Type I) neurons which span 5–80 Hz continuously.

@@ -1316,6 +1316,82 @@ class IntracellularDynamics:
         return f"<IntracellularDynamics '{self.name}'>"
 
 
+class DopamineGating(IntracellularDynamics):
+    """
+    Convenience preset for dopamine-gated synaptic gain.
+
+    Wraps ``IntracellularDynamics("DA", ode=-k_decay*DA, initial=da_level,
+    modulations=[Modulation.synapse_g(1/(1+exp(-k*(DA-0.5))))])``.
+
+    Parameters
+    ----------
+    da_level : float
+        Initial / resting DA concentration (dimensionless, 0–1). Default 0.5.
+    k : float
+        Sigmoid steepness for DA → SYNAPSE_G gain curve. Default 10.0.
+    k_decay : float
+        First-order DA decay rate (1/ms). Default 0.01 (τ = 100 ms).
+    """
+
+    def __init__(self, da_level: float = 0.5, k: float = 10.0,
+                 k_decay: float = 0.01):
+        import sympy as _sp
+        _DA = _sp.Symbol("DA")
+        ode = -_sp.Float(k_decay) * _DA
+        gain = 1 / (1 + _sp.exp(-_sp.Float(k) * (_DA - _sp.Float(0.5))))
+        super().__init__("DA", ode=ode, initial=da_level,
+                         modulations=[Modulation.synapse_g(gain)])
+        self._da_level = da_level
+        self._k = k
+        self._k_decay = k_decay
+
+    def __repr__(self) -> str:
+        return (f"<DopamineGating da_level={self._da_level} "
+                f"k={self._k} k_decay={self._k_decay}>")
+
+
+class HomeostaticScaling(IntracellularDynamics):
+    """
+    Convenience preset for homeostatic synaptic scaling.
+
+    Tracks a slow exponential average of post-synaptic drive and scales
+    incoming synaptic conductance inversely.  The substance H evolves as::
+
+        dH/dt = (I_source - target_rate - H) / tau
+
+    and the SYNAPSE_G multiplier is ``1 / (1 + H)``.
+
+    H converges to ``I_source - target_rate``, so set ``target_rate`` close
+    to the mean I_ext that produces the desired firing rate.  If
+    ``|I_source - target_rate|`` is large the gain expression may diverge;
+    use ``target_rate`` accordingly.
+
+    Note: the ODE does not match the DRIVEN_DECAY pattern (sign difference),
+    so it compiles via CUSTOM_EXPR — this is expected and correct.
+
+    Parameters
+    ----------
+    target_rate : float
+        Target activity level in µA/cm² (same units as I_ext). Default 20.0.
+    tau : float
+        Integrator time constant in ms. Default 5000.0 (5 s).
+    """
+
+    def __init__(self, target_rate: float = 20.0, tau: float = 5000.0):
+        import sympy as _sp
+        _H = _sp.Symbol("H")
+        ode = (_I_source_sym - _sp.Float(target_rate) - _H) / _sp.Float(tau)
+        gain = 1 / (1 + _H)
+        super().__init__("H", ode=ode, initial=0.0,
+                         modulations=[Modulation.synapse_g(gain)])
+        self._target_rate = target_rate
+        self._tau = tau
+
+    def __repr__(self) -> str:
+        return (f"<HomeostaticScaling target_rate={self._target_rate} "
+                f"tau={self._tau}>")
+
+
 def _is_standard_nernst(expr, X_sym) -> bool:
     """Check if expr matches (R*T/(z*F))*log(X_o/X) pattern."""
     import sympy as _sp
@@ -1418,3 +1494,112 @@ else:
             for k_attr, v_attr in kwargs.items():
                 setattr(spec, k_attr, v_attr)
             return spec
+
+
+# =============================================================================
+# Plasticity rule builders (task15)
+# =============================================================================
+
+
+class STDPRule:
+    """
+    Spike-Timing Dependent Plasticity rule specification.
+
+    Pass as ``plasticity=`` to :meth:`RegionalNetwork.connect` or
+    ``Network.add_synapse``.
+
+    Parameters
+    ----------
+    A_plus : float   LTP learning rate. Default 0.005.
+    A_minus : float  LTD learning rate. Default 0.006.
+    tau_plus : float Pre-trace time constant (ms). Default 20.0.
+    tau_minus : float Post-trace time constant (ms). Default 20.0.
+    w_min : float    Minimum weight. Default 0.0.
+    w_max : float    Maximum weight. Default 1.0.
+    modulator_population : str | None
+        Population name whose substance gates learning rate. None = no gating.
+    modulator_substance : str | None
+        Substance name within that population (e.g. ``"DA"``).
+    modulator_scale : float
+        Linear multiplier applied to the modulator concentration before
+        scaling A_plus / A_minus. Default 1.0.
+    """
+
+    def __init__(self, *, A_plus: float = 0.005, A_minus: float = 0.006,
+                 tau_plus: float = 20.0, tau_minus: float = 20.0,
+                 w_min: float = 0.0, w_max: float = 1.0,
+                 modulator_population: "str | None" = None,
+                 modulator_substance: "str | None" = None,
+                 modulator_scale: float = 1.0):
+        self.A_plus          = A_plus
+        self.A_minus         = A_minus
+        self.tau_plus        = tau_plus
+        self.tau_minus       = tau_minus
+        self.w_min           = w_min
+        self.w_max           = w_max
+        self.modulator_population = modulator_population
+        self.modulator_substance  = modulator_substance
+        self.modulator_scale      = modulator_scale
+        self._resolved_pop_start  = -1   # filled by RegionalNetwork.connect()
+        self._resolved_subst_idx  = -1   # filled by RegionalNetwork.connect()
+
+    def to_spec(self):
+        """Return a C++ ``PlasticitySpec`` from current parameters."""
+        from .._core import (PlasticitySpec as _PS, STDPParams as _STDP,
+                             PlasticityType as _PT)
+        ps = _PS()
+        ps.type = _PT.STDP
+        s = _STDP()
+        s.A_plus              = self.A_plus
+        s.A_minus             = self.A_minus
+        s.tau_plus            = self.tau_plus
+        s.tau_minus           = self.tau_minus
+        s.w_min               = self.w_min
+        s.w_max               = self.w_max
+        s.modulator_pop_start    = self._resolved_pop_start
+        s.modulator_substance_idx = self._resolved_subst_idx
+        s.modulator_scale        = self.modulator_scale
+        ps.stdp = s
+        return ps
+
+    def __repr__(self) -> str:
+        return (f"<STDPRule A+={self.A_plus} A-={self.A_minus} "
+                f"tau+={self.tau_plus} tau-={self.tau_minus} "
+                f"[{self.w_min},{self.w_max}]>")
+
+
+class STPRule:
+    """
+    Tsodyks-Markram Short-Term Plasticity (depression / facilitation) rule.
+
+    Pass as ``plasticity=`` to :meth:`RegionalNetwork.connect` or
+    ``Network.add_synapse``.
+
+    Parameters
+    ----------
+    U : float      Baseline utilization (release probability). Default 0.5.
+    tau_u : float  Recovery time constant of *u* (ms). Default 1000.0.
+    tau_x : float  Recovery time constant of *x* (ms). Default 100.0.
+    """
+
+    def __init__(self, *, U: float = 0.5,
+                 tau_u: float = 1000.0, tau_x: float = 100.0):
+        self.U     = U
+        self.tau_u = tau_u
+        self.tau_x = tau_x
+
+    def to_spec(self):
+        """Return a C++ ``PlasticitySpec`` from current parameters."""
+        from .._core import (PlasticitySpec as _PS, STPParams as _STP,
+                             PlasticityType as _PT)
+        ps = _PS()
+        ps.type = _PT.STP
+        s = _STP()
+        s.U     = self.U
+        s.tau_u = self.tau_u
+        s.tau_x = self.tau_x
+        ps.stp = s
+        return ps
+
+    def __repr__(self) -> str:
+        return f"<STPRule U={self.U} tau_u={self.tau_u} tau_x={self.tau_x}>"

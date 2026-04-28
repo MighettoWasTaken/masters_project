@@ -192,6 +192,11 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
     sa_.decay_A.push_back(0.0);
     sa_.spec_idx.push_back(sidx);
 
+    // Plasticity defaults (NONE — no state allocated)
+    sa_.plast_type.push_back(PlasticityType::NONE);
+    sa_.plast_state_idx.push_back(-1);
+    sa_.plast_spec_idx_arr.push_back(0);
+
     // Push lightweight view (always valid — no heap per synapse)
     synapses_.emplace_back(sa_.size() - 1, this);
 
@@ -200,6 +205,58 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
     groups_built_ = false;
 
     return sa_.size() - 1;
+}
+
+// =============================================================================
+// add_synapse overload with PlasticitySpec
+// =============================================================================
+
+size_t Network::add_or_find_plasticity_spec(const PlasticitySpec& ps) {
+    for (size_t i = 0; i < plasticity_specs_.size(); ++i) {
+        const auto& e = plasticity_specs_[i];
+        if (e.type != ps.type) continue;
+        if (ps.type == PlasticityType::STDP) {
+            const auto& a = e.stdp; const auto& b = ps.stdp;
+            if (a.A_plus == b.A_plus && a.A_minus == b.A_minus &&
+                a.tau_plus == b.tau_plus && a.tau_minus == b.tau_minus &&
+                a.w_min == b.w_min && a.w_max == b.w_max &&
+                a.modulator_pop_start == b.modulator_pop_start &&
+                a.modulator_substance_idx == b.modulator_substance_idx)
+                return i;
+        } else if (ps.type == PlasticityType::STP) {
+            const auto& a = e.stp; const auto& b = ps.stp;
+            if (a.U == b.U && a.tau_u == b.tau_u && a.tau_x == b.tau_x)
+                return i;
+        }
+    }
+    plasticity_specs_.push_back(ps);
+    return plasticity_specs_.size() - 1;
+}
+
+size_t Network::add_synapse(size_t pre, size_t post, double weight,
+                             const SynapseSpec& spec, double delay,
+                             const PlasticitySpec& plast) {
+    size_t syn_i = add_synapse(pre, post, weight, spec, delay);
+
+    if (plast.type == PlasticityType::NONE) return syn_i;
+
+    size_t ps_idx = add_or_find_plasticity_spec(plast);
+    sa_.plast_type[syn_i] = plast.type;
+    sa_.plast_spec_idx_arr[syn_i] = ps_idx;
+
+    if (plast.type == PlasticityType::STDP) {
+        int32_t state_i = (int32_t)sa_.plast_x_pre.size();
+        sa_.plast_state_idx[syn_i] = state_i;
+        sa_.plast_x_pre.push_back(0.0);
+        sa_.plast_x_post.push_back(0.0);
+    } else if (plast.type == PlasticityType::STP) {
+        int32_t state_i = (int32_t)sa_.stp_u.size();
+        sa_.plast_state_idx[syn_i] = state_i;
+        sa_.stp_u.push_back(plast.stp.U);
+        sa_.stp_x.push_back(1.0);
+    }
+
+    return syn_i;
 }
 
 // =============================================================================
@@ -479,6 +536,8 @@ void Network::build_synapse_groups() {
     syn_groups_.alpha_func.clear();
     syn_groups_.double_exp.clear();
     syn_groups_.voltage_gated.clear();
+    syn_groups_.stdp.clear();
+    syn_groups_.stp.clear();
 
     using UF = SynapseSpec::UpdateForm;
     const size_t S = sa_.size();
@@ -488,9 +547,22 @@ void Network::build_synapse_groups() {
         else if (form == UF::ALPHA_FUNC) syn_groups_.alpha_func.push_back(i);
         else if (form == UF::DOUBLE_EXP) syn_groups_.double_exp.push_back(i);
         else                              syn_groups_.voltage_gated.push_back(i);
+
+        if (sa_.plast_type[i] == PlasticityType::STDP) syn_groups_.stdp.push_back(i);
+        if (sa_.plast_type[i] == PlasticityType::STP)  syn_groups_.stp.push_back(i);
     }
 
     spike_detected_.resize(S);
+
+    has_stdp_ = !syn_groups_.stdp.empty();
+    has_stp_  = !syn_groups_.stp.empty();
+
+    if (has_stdp_) {
+        size_t N = neurons_.size();
+        V_all_prev_.assign(N, spike_threshold_ - 10.0);
+        post_spiked_.assign(N, 0);
+    }
+
     groups_built_ = true;
 }
 
@@ -503,6 +575,16 @@ void Network::update_synapses_grouped(double dt) {
 
     const size_t S = sa_.size();
     const double spike_threshold = spike_threshold_;
+
+    // Phase 0: post-synaptic spike detection (STDP only, zero cost otherwise)
+    if (has_stdp_) {
+        const size_t N = neurons_.size();
+        for (size_t j = 0; j < N; ++j) {
+            double Vj = V_cache_[j];
+            post_spiked_[j] = (Vj > spike_threshold && V_all_prev_[j] <= spike_threshold) ? 1 : 0;
+            V_all_prev_[j] = Vj;
+        }
+    }
 
     // Phase 1: spike detection + delay processing for ALL synapses
     for (size_t i = 0; i < S; ++i) {
@@ -630,6 +712,12 @@ void Network::update_synapses_grouped(double dt) {
             sa_.g[k] = gS;
         }
     }
+
+    // Phase 3: STDP weight updates
+    if (has_stdp_) apply_stdp(dt);
+
+    // Phase 4: STP conductance scaling
+    if (has_stp_) apply_stp(dt);
 }
 
 // =============================================================================
@@ -947,6 +1035,78 @@ void Network::simulate_with_descriptors(
     }
 
     pool_mgr_.sync_all_to_neurons(neurons_);
+}
+
+// =============================================================================
+// Plasticity update methods
+// =============================================================================
+
+void Network::apply_stdp(double dt) {
+    for (size_t k : syn_groups_.stdp) {
+        int32_t si = sa_.plast_state_idx[k];
+        const auto& spec = plasticity_specs_[sa_.plast_spec_idx_arr[k]].stdp;
+
+        // Trace decay
+        sa_.plast_x_pre[si]  *= std::exp(-dt / spec.tau_plus);
+        sa_.plast_x_post[si] *= std::exp(-dt / spec.tau_minus);
+
+        double& w = sa_.weight[k];
+        double mod_scale = 1.0;
+        if (spec.modulator_pop_start >= 0 && spec.modulator_substance_idx >= 0) {
+            size_t post_n = sa_.post[k];
+            mod_scale = spec.modulator_scale
+                        * pool_mgr_.get_substance(post_n,
+                                                   (size_t)spec.modulator_substance_idx);
+        }
+
+        // Pre-spike: LTP
+        if (spike_detected_[k]) {
+            w += mod_scale * spec.A_plus * sa_.plast_x_post[si];
+            sa_.plast_x_pre[si] += 1.0;
+        }
+        // Post-spike: LTD
+        if (post_spiked_[sa_.post[k]]) {
+            w -= mod_scale * spec.A_minus * sa_.plast_x_pre[si];
+            sa_.plast_x_post[si] += 1.0;
+        }
+
+        w = std::max(spec.w_min, std::min(spec.w_max, w));
+    }
+}
+
+void Network::apply_stp(double dt) {
+    for (size_t k : syn_groups_.stp) {
+        int32_t si = sa_.plast_state_idx[k];
+        const auto& spec = plasticity_specs_[sa_.plast_spec_idx_arr[k]].stp;
+
+        double& u = sa_.stp_u[si];
+        double& x = sa_.stp_x[si];
+
+        // Recovery toward baseline every step
+        u += dt * (spec.U - u) / spec.tau_u;
+        x += dt * (1.0 - x)   / spec.tau_x;
+
+        if (spike_detected_[k]) {
+            // Scale S persistently so the depressed conductance decays from
+            // the correct amplitude (u*x) rather than reverting next step.
+            // Phase 2a already ran: S was jumped by delta_S then decayed once.
+            // We back-correct: remove the unscaled jump and add the scaled one.
+            // Correction: S -= delta_S * decay_S * (1 - u*x)
+            double ux = u * x;
+            sa_.S[k] -= sa_.delta_S[k] * sa_.decay_S[k] * (1.0 - ux);
+            if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
+            // Recompute g from corrected S
+            const auto& syn_spec = synapse_specs_[sa_.spec_idx[k]];
+            sa_.g[k] = syn_spec.g * sa_.weight[k] * sa_.S[k];
+            // Update facilitation then depression (standard TM order)
+            u += spec.U * (1.0 - u);
+            x -= u * x;
+        }
+    }
+}
+
+std::vector<double> Network::get_synapse_weights() const {
+    return sa_.weight;
 }
 
 } // namespace hodgkin_huxley

@@ -81,6 +81,12 @@ public:
                         double weight, const SynapseSpec& synapse,
                         double delay = 0.0);
 
+    // Overload with plasticity rule
+    void add_connection(const std::string& src, size_t src_local,
+                        const std::string& dst, size_t dst_local,
+                        double weight, const SynapseSpec& synapse,
+                        double delay, const PlasticitySpec& plast);
+
     // Add a kinetic synapse between two populations using local indices
     void add_kinetic_connection(const std::string& src, size_t i,
                                 const std::string& dst, size_t j,

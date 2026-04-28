@@ -57,6 +57,16 @@ public:
     // True if any ComposablePool has a SYNAPSE_G modulation (set after build)
     bool has_synapse_g_mods() const { return has_synapse_g_mods_; }
 
+    /// Return intracellular substance concentration for a global neuron index.
+    /// Scans all ComposablePools; returns 0 if neuron has no intracellular dynamics.
+    double get_substance(size_t global_neuron_idx, size_t subst_idx) const {
+        for (const auto& kv : comp_pools_) {
+            if (kv.second.contains_neuron(global_neuron_idx))
+                return kv.second.get_substance_at(global_neuron_idx, subst_idx);
+        }
+        return 0.0;
+    }
+
 private:
     bool has_synapse_g_mods_ = false;
     HHPool hh_pool_;
