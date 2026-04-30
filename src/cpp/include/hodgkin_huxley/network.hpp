@@ -1,5 +1,6 @@
 #pragma once
 
+#include "hodgkin_huxley/parallel_sim.hpp"
 #include "hodgkin_huxley/plasticity.hpp"
 #include "hodgkin_huxley/neuron_base.hpp"
 #include "hodgkin_huxley/neuron.hpp"
@@ -160,6 +161,9 @@ public:
     void set_fast_math(bool enabled) { fast_math_ = enabled; }
     [[nodiscard]] bool fast_math() const { return fast_math_; }
 
+    void set_num_threads(int n);
+    [[nodiscard]] int num_threads() const { return num_threads_; }
+
     // Called by RegionalNetwork::update_population_spec() after modifying a pop's spec
     void mark_pools_dirty() { pools_dirty_ = true; }
 
@@ -199,6 +203,28 @@ public:
         const StimPlan& stim,
         double* V_buf,
         double* gate_buf,       size_t max_gates,
+        double* calcium_buf,
+        double* u_buf,
+        double* g_syn_buf,
+        double* I_syn_buf,
+        double* spike_event_buf,
+        size_t  interval,
+        size_t  n_rec,
+        double  spike_threshold = 0.0
+    );
+
+    /// Phase 2 parallel simulate: each GroupDef runs in its own std::thread.
+    /// Pre-condition: groups partition all neurons; each inter-group synapse has delay >= dt.
+    /// STDP/STP are not applied per-step in this path (require network-wide barrier).
+    /// spike_event_buf records only intra-group spike arrivals (inter-group spikes omitted
+    /// to avoid data races on spike_detected_ across threads).
+    void simulate_with_descriptors_parallel(
+        double duration, double dt,
+        const StimPlan& stim,
+        const std::map<int, std::vector<size_t>>& group_neurons,
+        const std::map<int, std::vector<std::string>>& group_pools,
+        double* V_buf,
+        double* gate_buf,        size_t max_gates,
         double* calcium_buf,
         double* u_buf,
         double* g_syn_buf,
@@ -310,6 +336,7 @@ private:
 
     bool fast_math_ = true;
     double spike_threshold_ = 0.0;
+    int  num_threads_ = 0;
 
     mutable bool soa_dirty_ = false;
     bool soa_sorted_ = false;

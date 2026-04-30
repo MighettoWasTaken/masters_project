@@ -3,6 +3,9 @@
 #include "hodgkin_huxley/izhikevich.hpp"
 #include "hodgkin_huxley/composable_neuron.hpp"
 #include <map>
+#ifdef HH_USE_OPENMP
+#  include <omp.h>
+#endif
 
 namespace hodgkin_huxley {
 
@@ -42,11 +45,15 @@ void PoolManager::build_from_neurons(
     for (const auto& kv : comp_pools_)
         if (kv.second.has_synapse_g_mods()) { has_synapse_g_mods_ = true; break; }
 
-    // Populate with current neuron state
+    // Populate with current neuron state; build global→local index maps
+    hh_global_to_local_.clear();
+    iz_global_to_local_.clear();
     for (size_t i = 0; i < nn; ++i) {
         if (auto* hh = dynamic_cast<HHNeuron*>(neurons[i].get())) {
+            hh_global_to_local_[i] = hh_pool_.size();
             hh_pool_.add(i, hh->parameters(), hh->state());
         } else if (auto* iz = dynamic_cast<IzhikevichNeuron*>(neurons[i].get())) {
+            iz_global_to_local_[i] = iz_pool_.size();
             iz_pool_.add(i, iz->parameters(), iz->state());
         } else if (auto* cn = dynamic_cast<ComposableNeuron*>(neurons[i].get())) {
             auto it = comp_pools_.find(cn->model_spec().name);
@@ -70,6 +77,24 @@ void PoolManager::gather_all_currents(const double* I_buf) {
 }
 
 void PoolManager::step_all(double dt) {
+#ifdef HH_USE_OPENMP
+    if (num_threads_ > 0) {
+        // All pools are independent — one parallel for covers HH (slot 0),
+        // Iz (slot 1), and all composable pools (slots 2+). One OpenMP region
+        // per call avoids a second fork-join barrier.
+        std::vector<ComposablePool*> cpools;
+        cpools.reserve(comp_pools_.size());
+        for (auto& kv : comp_pools_) cpools.push_back(&kv.second);
+        const int n = static_cast<int>(cpools.size()) + 2;
+        #pragma omp parallel for schedule(dynamic) num_threads(num_threads_)
+        for (int i = 0; i < n; ++i) {
+            if (i == 0)      hh_pool_.step(dt);
+            else if (i == 1) iz_pool_.step(dt);
+            else             cpools[i - 2]->step(dt);
+        }
+        return;
+    }
+#endif
     hh_pool_.step(dt);
     iz_pool_.step(dt);
     for (auto& kv : comp_pools_) kv.second.step(dt);
@@ -107,6 +132,112 @@ void PoolManager::scatter_substances(size_t subst_idx, double* buf,
 void PoolManager::scatter_synapse_g_scale(double* buf) const {
     for (const auto& kv : comp_pools_)
         kv.second.scatter_synapse_g_scale(buf);
+}
+
+// =============================================================================
+// Per-group ops for Phase 2 delay-decomposition parallelism
+// =============================================================================
+
+void PoolManager::step_for_names(const std::vector<std::string>& names, double dt) {
+    for (const auto& name : names) {
+        auto it = comp_pools_.find(name);
+        if (it != comp_pools_.end()) it->second.step(dt);
+    }
+}
+
+void PoolManager::scatter_voltages_for_names(const std::vector<std::string>& names,
+                                              double* V_cache) const {
+    for (const auto& name : names) {
+        auto it = comp_pools_.find(name);
+        if (it != comp_pools_.end()) it->second.scatter_voltages(V_cache);
+    }
+}
+
+void PoolManager::gather_currents_for_names(const std::vector<std::string>& names,
+                                             const double* I_buf) {
+    for (const auto& name : names) {
+        auto it = comp_pools_.find(name);
+        if (it != comp_pools_.end()) it->second.gather_currents(I_buf);
+    }
+}
+
+void PoolManager::scatter_synapse_g_scale_for_names(const std::vector<std::string>& names,
+                                                     double* buf) const {
+    for (const auto& name : names) {
+        auto it = comp_pools_.find(name);
+        if (it != comp_pools_.end()) it->second.scatter_synapse_g_scale(buf);
+    }
+}
+
+// =============================================================================
+// HHPool / IzPool per-group subset ops
+// =============================================================================
+
+void PoolManager::fill_group_hh_iz_indices(
+    const std::vector<size_t>& global_neuron_indices,
+    std::vector<size_t>& hh_local_out,
+    std::vector<size_t>& iz_local_out) const
+{
+    hh_local_out.clear();
+    iz_local_out.clear();
+    for (size_t gi : global_neuron_indices) {
+        auto hh_it = hh_global_to_local_.find(gi);
+        if (hh_it != hh_global_to_local_.end()) {
+            hh_local_out.push_back(hh_it->second);
+            continue;
+        }
+        auto iz_it = iz_global_to_local_.find(gi);
+        if (iz_it != iz_global_to_local_.end())
+            iz_local_out.push_back(iz_it->second);
+    }
+}
+
+void PoolManager::gather_currents_for_hh(const std::vector<size_t>& local_indices,
+                                          const double* I_buf) {
+    hh_pool_.gather_currents_subset(local_indices, I_buf);
+}
+void PoolManager::step_for_hh(const std::vector<size_t>& local_indices, double dt) {
+    hh_pool_.step_subset(local_indices, dt);
+}
+void PoolManager::scatter_voltages_for_hh(const std::vector<size_t>& local_indices,
+                                           double* V_cache) const {
+    hh_pool_.scatter_voltages_subset(local_indices, V_cache);
+}
+
+void PoolManager::gather_currents_for_iz(const std::vector<size_t>& local_indices,
+                                          const double* I_buf) {
+    iz_pool_.gather_currents_subset(local_indices, I_buf);
+}
+void PoolManager::step_for_iz(const std::vector<size_t>& local_indices, double dt) {
+    iz_pool_.step_subset(local_indices, dt);
+}
+void PoolManager::scatter_voltages_for_iz(const std::vector<size_t>& local_indices,
+                                           double* V_cache) const {
+    iz_pool_.scatter_voltages_subset(local_indices, V_cache);
+}
+
+void PoolManager::scatter_gates_for_names(const std::vector<std::string>& names,
+                                           double* gate_buf, size_t max_gates,
+                                           size_t n_rec, size_t tr) const {
+    for (const auto& name : names) {
+        auto it = comp_pools_.find(name);
+        if (it != comp_pools_.end())
+            it->second.scatter_gate_states_into(gate_buf, max_gates, n_rec, tr);
+    }
+}
+
+void PoolManager::scatter_calcium_for_names(const std::vector<std::string>& names,
+                                             double* ca_buf, size_t n_rec, size_t tr) const {
+    for (const auto& name : names) {
+        auto it = comp_pools_.find(name);
+        if (it != comp_pools_.end())
+            it->second.scatter_calcium_into(ca_buf, n_rec, tr);
+    }
+}
+
+void PoolManager::scatter_recoveries_for_iz(const std::vector<size_t>& local_indices,
+                                              double* u_buf, size_t n_rec, size_t tr) const {
+    iz_pool_.scatter_recoveries_subset(local_indices, u_buf, n_rec, tr);
 }
 
 } // namespace hodgkin_huxley

@@ -384,4 +384,68 @@ void RegionalNetwork::randomize_membrane_potentials(const std::string& name,
     }
 }
 
+// =============================================================================
+// Phase 2: thread-group API
+// =============================================================================
+
+void RegionalNetwork::set_thread_groups(
+    const std::map<int, std::vector<std::string>>& groups)
+{
+    for (const auto& kv : groups) {
+        for (const auto& pop : kv.second)
+            validate_population(pop);
+    }
+    group_populations_ = groups;
+}
+
+void RegionalNetwork::clear_thread_groups() {
+    group_populations_.clear();
+}
+
+void RegionalNetwork::simulate_parallel(
+    const StimPlan& stim, double duration, double dt,
+    double* V_buf,
+    double* gate_buf,        size_t max_gates,
+    double* calcium_buf,
+    double* u_buf,
+    double* g_syn_buf,
+    double* I_syn_buf,
+    double* spike_event_buf,
+    size_t n_rec, size_t interval, double spike_threshold)
+{
+    // Build group_neurons (group_id → global neuron indices) and
+    // group_pools (group_id → ComposablePool spec names) from stored group_populations_.
+    std::map<int, std::vector<size_t>>  group_neurons;
+    std::map<int, std::vector<std::string>> group_pools;
+
+    for (const auto& kv : group_populations_) {
+        int gid = kv.first;
+        auto& nidxs = group_neurons[gid];
+        auto& pnames = group_pools[gid];
+
+        for (const auto& pop_name : kv.second) {
+            const auto& pop = population(pop_name);
+            for (size_t i = pop.start_idx; i < pop.end_idx(); ++i)
+                nidxs.push_back(i);
+
+            // Pool name is the spec name stored in pop_specs_
+            auto sit = pop_specs_.find(pop_name);
+            if (sit != pop_specs_.end())
+                pnames.push_back(sit->second.name);
+        }
+    }
+
+    net_.simulate_with_descriptors_parallel(
+        duration, dt, stim,
+        group_neurons, group_pools,
+        V_buf,
+        gate_buf,    max_gates,
+        calcium_buf,
+        u_buf,
+        g_syn_buf,
+        I_syn_buf,
+        spike_event_buf,
+        interval, n_rec, spike_threshold);
+}
+
 } // namespace hodgkin_huxley

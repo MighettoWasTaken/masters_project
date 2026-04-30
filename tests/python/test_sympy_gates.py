@@ -30,6 +30,8 @@ from hodgkin_huxley import (
     Boltzmann, Tau, RateFunc,
     GateSpec, NeuronModel,
     TaggedExpr, EigenPrinter,
+    SynapseModel, SynapseSpec,
+    IntracellularDynamics, Modulation, HomeostaticScaling,
 )
 from hodgkin_huxley._codegen import try_pattern_match
 from hodgkin_huxley._core import (
@@ -37,6 +39,11 @@ from hodgkin_huxley._core import (
     GateSpec as _CoreGateSpec, GateUpdateForm, GateDependency,
     NeuronModelSpec,
 )
+
+
+@pytest.fixture(params=[False, True], ids=["serial", "phase2"])
+def use_parallel(request):
+    return request.param
 
 
 # =============================================================================
@@ -320,7 +327,7 @@ class TestGateSpecFactory:
 class TestVMExprGate:
     """CUSTOM_EXPR path for novel SymPy gates — no g++ or Eigen3 needed at runtime."""
 
-    def test_custom_expr_gate_runs(self):
+    def test_custom_expr_gate_runs(self, use_parallel):
         """Novel SymPy expression uses CUSTOM_EXPR and produces finite voltages."""
         novel_inf = 1 / (1 + sympy.exp(-(V + 40) / 8))
         jit_inf   = novel_inf * sympy.Rational(999, 1000) + sympy.Rational(1, 1000)
@@ -339,11 +346,13 @@ class TestVMExprGate:
 
         rn = hh.RegionalNetwork()
         rn.add_population("pop", 2, model=spec)
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pop"]})
         traces = rn.simulate(5.0, dt=0.1, I_ext={"pop": 5.0})
         assert "pop" in traces
         assert np.all(np.isfinite(traces["pop"]))
 
-    def test_pattern_matched_sympy_vs_helper_equivalent(self):
+    def test_pattern_matched_sympy_vs_helper_equivalent(self, use_parallel):
         """SymPy Boltzmann (pattern-matched, INF_TAU path) gives identical traces to Boltzmann() helper."""
         v_half, k = -41.0, -4.0
         inf_sympy = 1 / (1 + sympy.exp(-(V - v_half) / k))
@@ -357,10 +366,14 @@ class TestVMExprGate:
 
         rn_sym = hh.RegionalNetwork()
         rn_sym.add_population("pop", 1, model=make_model(use_sympy=True))
+        if use_parallel:
+            rn_sym.set_thread_groups({"g0": ["pop"]})
         traces_sym = rn_sym.simulate(20.0, dt=0.1, I_ext={"pop": 5.0})
 
         rn_ref = hh.RegionalNetwork()
         rn_ref.add_population("pop", 1, model=make_model(use_sympy=False))
+        if use_parallel:
+            rn_ref.set_thread_groups({"g0": ["pop"]})
         traces_ref = rn_ref.simulate(20.0, dt=0.1, I_ext={"pop": 5.0})
 
         np.testing.assert_allclose(
@@ -376,7 +389,7 @@ class TestVMExprGate:
 class TestVMExprEdgeCases:
     """Edge cases for the CUSTOM_EXPR gate path."""
 
-    def test_vm_alpha_beta_form_runs(self):
+    def test_vm_alpha_beta_form_runs(self, use_parallel):
         """CUSTOM_EXPR with alpha/beta rate functions produces finite traces."""
         # Gaussian-shaped rates — don't match any catalog form
         alpha_expr = sympy.Float(0.5) * sympy.exp(-((V + 55) / sympy.Float(10.0)) ** 2)
@@ -394,10 +407,12 @@ class TestVMExprEdgeCases:
 
         rn = hh.RegionalNetwork()
         rn.add_population("pop", 2, model=spec)
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pop"]})
         traces = rn.simulate(10.0, dt=0.1, I_ext={"pop": 5.0})
         assert np.all(np.isfinite(traces["pop"]))
 
-    def test_vm_calcium_dependent_gate_runs(self):
+    def test_vm_calcium_dependent_gate_runs(self, use_parallel):
         """CUSTOM_EXPR gate with Ca as dependency produces finite traces."""
         # Hill-like function — doesn't match any catalog form
         ca_inf = Ca ** 2 / (Ca ** 2 + sympy.Float(0.001))
@@ -415,10 +430,12 @@ class TestVMExprEdgeCases:
 
         rn = hh.RegionalNetwork()
         rn.add_population("pop", 2, model=spec)
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pop"]})
         traces = rn.simulate(10.0, dt=0.1, I_ext={"pop": 5.0})
         assert np.all(np.isfinite(traces["pop"]))
 
-    def test_vm_trig_gate_runs(self):
+    def test_vm_trig_gate_runs(self, use_parallel):
         """CUSTOM_EXPR gate using sin/cos functions produces finite traces."""
         # Odd inf expression using sin — just tests the trig opcode path
         trig_inf = (sympy.sin(V / sympy.Float(20.0)) + sympy.Float(1.0)) / sympy.Float(2.0)
@@ -436,10 +453,12 @@ class TestVMExprEdgeCases:
 
         rn = hh.RegionalNetwork()
         rn.add_population("pop", 2, model=spec)
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pop"]})
         traces = rn.simulate(5.0, dt=0.1, I_ext={"pop": 5.0})
         assert np.all(np.isfinite(traces["pop"]))
 
-    def test_vm_two_gates_independent(self):
+    def test_vm_two_gates_independent(self, use_parallel):
         """Two independent CUSTOM_EXPR gates on the same model both run correctly."""
         novel1 = (1 / (1 + sympy.exp(-(V + 40) / 8))) * sympy.Rational(999, 1000) + sympy.Rational(1, 1000)
         novel2 = sympy.Float(0.5) + sympy.Float(0.4) * sympy.tanh(V / sympy.Float(10.0))
@@ -456,10 +475,12 @@ class TestVMExprEdgeCases:
 
         rn = hh.RegionalNetwork()
         rn.add_population("pop", 2, model=spec)
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pop"]})
         traces = rn.simulate(5.0, dt=0.1, I_ext={"pop": 5.0})
         assert np.all(np.isfinite(traces["pop"]))
 
-    def test_vm_log_gate_runs(self):
+    def test_vm_log_gate_runs(self, use_parallel):
         """CUSTOM_EXPR gate using log produces finite traces for positive inputs."""
         # log(|V| + 1) / 5 — stays in (0,1) for typical membrane potentials
         log_inf = sympy.log(sympy.Abs(V) + sympy.Integer(1)) / sympy.Float(5.0)
@@ -477,6 +498,8 @@ class TestVMExprEdgeCases:
 
         rn = hh.RegionalNetwork()
         rn.add_population("pop", 2, model=spec)
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pop"]})
         traces = rn.simulate(5.0, dt=0.1, I_ext={"pop": 5.0})
         assert np.all(np.isfinite(traces["pop"]))
 
@@ -588,3 +611,431 @@ class TestBackwardCompat:
         idx = m.add_gate("m", update_form="instant", inf=bp)
         g = m.to_spec().gates[idx]
         assert abs(g.inf.v_half - (-40.0)) < 1e-12
+
+
+# =============================================================================
+# TestSymPyParallelCorrectness
+# Rigorous serial-vs-Phase2 correctness tests for all four SymPy VM areas
+# (gates, channels, synapses, intracellular dynamics) under real multi-group
+# parallelism: groups g0=[A] and g1=[B] with delay=5ms between them.
+# Also covers OpenMP (Phase 1) with VM-compiled models.
+# =============================================================================
+
+
+class TestSymPyParallelCorrectness:
+    """
+    Serial-vs-Phase2 correctness for all SymPy VM code paths under real
+    multi-group parallelism.  Each test uses {"g0": ["A"], "g1": ["B"]}
+    so both groups execute concurrently.  Cross-group A→B connection always
+    has delay=5ms.  Intra-group B→B connections use delay=0ms.
+    """
+
+    _DURATION = 30.0   # ms — enough for spikes, fast enough not to bloat CI
+    _DT = 0.1
+    _N = 4
+    _DELAY = 5.0       # ms — satisfies inter-group > 0 constraint
+
+    def _run(self, rn, I_A=10.0, I_B=0.0):
+        return rn.simulate(self._DURATION, self._DT, {"A": I_A, "B": I_B})
+
+    def _assert_equal(self, serial, phase2, msg=""):
+        for pop in ("A", "B"):
+            np.testing.assert_allclose(
+                serial[pop], phase2[pop], atol=1e-10,
+                err_msg=f"Pop {pop}: serial vs Phase 2 traces differ. {msg}",
+            )
+
+    # -------------------------------------------------------------------------
+    # Gate VM — CUSTOM_EXPR alpha/beta (Gaussian shape) in group A
+    # -------------------------------------------------------------------------
+
+    def test_custom_gate_vm_multigroup_serial_vs_phase2(self):
+        """Gaussian alpha/beta gate (CUSTOM_EXPR) in one group matches serial exactly."""
+        # Gaussian-shaped rates: won't match any catalog alpha/beta form
+        alpha_expr = sympy.Float(0.5) * sympy.exp(-((V + 55) / sympy.Float(10.0)) ** 2)
+        beta_expr  = sympy.Float(0.5) * sympy.exp(-((V + 80) / sympy.Float(10.0)) ** 2)
+
+        m = NeuronModel("gauss_ab", C_m=1.0, V_init=-65.0)
+        m.add_gate("m", alpha=alpha_expr, beta=beta_expr)
+        m.add_channel("Leak", g=0.1, E_rev=-65.0)
+        spec_A = m.to_spec()
+
+        assert spec_A.gates[0].update_form == GateUpdateForm.CUSTOM_EXPR
+        assert not spec_A.gates[0].alpha_vm.empty()
+        assert not spec_A.gates[0].beta_vm.empty()
+
+        def make_net():
+            rn = hh.RegionalNetwork()
+            rn.add_population("A", self._N, model=spec_A)
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        phase2 = self._run(rn_p)
+        self._assert_equal(serial, phase2)
+
+        # Race probe — 5 independent parallel runs must all be identical
+        for _ in range(5):
+            rn_r = make_net()
+            rn_r.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+            rep = self._run(rn_r)
+            self._assert_equal(phase2, rep, msg="race probe")
+
+    # -------------------------------------------------------------------------
+    # Gate VM — CUSTOM_EXPR gates in BOTH groups simultaneously
+    # -------------------------------------------------------------------------
+
+    def test_custom_gate_both_groups_multigroup(self):
+        """Trig inf gate in A and log inf gate in B both match serial in two-group run."""
+        # Pop A: sin-based inf — not a Boltzmann form, compiles to CUSTOM_EXPR
+        trig_inf = (sympy.sin(V / sympy.Float(20.0)) + sympy.Float(1.0)) / sympy.Float(2.0)
+        mA = NeuronModel("trig_pop", C_m=1.0, V_init=-65.0)
+        mA.add_gate("m", inf=trig_inf, tau=sympy.Float(2.0))
+        mA.add_channel("Leak", g=0.1, E_rev=-65.0)
+        spec_A = mA.to_spec()
+
+        # Pop B: log-based inf — also CUSTOM_EXPR
+        log_inf = sympy.log(sympy.Abs(V) + sympy.Integer(1)) / sympy.Float(5.0)
+        mB = NeuronModel("log_pop", C_m=1.0, V_init=-65.0)
+        mB.add_gate("m", inf=log_inf, tau=sympy.Float(1.5))
+        mB.add_channel("Leak", g=0.1, E_rev=-65.0)
+        spec_B = mB.to_spec()
+
+        assert spec_A.gates[0].update_form == GateUpdateForm.CUSTOM_EXPR
+        assert spec_B.gates[0].update_form == GateUpdateForm.CUSTOM_EXPR
+
+        def make_net():
+            rn = hh.RegionalNetwork()
+            rn.add_population("A", self._N, model=spec_A)
+            rn.add_population("B", self._N, model=spec_B)
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        self._assert_equal(serial, self._run(rn_p))
+
+    # -------------------------------------------------------------------------
+    # Gate VM — calcium-dependent gate (Hill function) in one group
+    # -------------------------------------------------------------------------
+
+    def test_calcium_dependent_gate_multigroup(self):
+        """Ca-dependent CUSTOM_EXPR gate in group A matches serial across groups."""
+        ca_inf = Ca ** 2 / (Ca ** 2 + sympy.Float(0.001))
+
+        mA = NeuronModel("ca_vm_group", C_m=1.0, V_init=-65.0)
+        mA.add_gate("q", inf=ca_inf, tau=sympy.Float(10.0), dependency="calcium")
+        mA.add_channel("Leak", g=0.1, E_rev=-65.0)
+        spec_A = mA.to_spec()
+
+        assert spec_A.gates[0].update_form == GateUpdateForm.CUSTOM_EXPR
+
+        def make_net():
+            rn = hh.RegionalNetwork()
+            rn.add_population("A", self._N, model=spec_A)
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        self._assert_equal(serial, self._run(rn_p))
+
+    # -------------------------------------------------------------------------
+    # Channel VM — additive gate expression triggers compile_gate_product_vm
+    # -------------------------------------------------------------------------
+
+    def test_complex_channel_gating_vm_multigroup(self):
+        """Channel with additive gating (m**3*h + const) uses gate_product_vm, matches serial."""
+        # Odd inf forms — both CUSTOM_EXPR
+        tanh_inf = sympy.Float(0.5) + sympy.Float(0.4) * sympy.tanh(V / sympy.Float(15.0))
+        cos_inf  = (sympy.cos(V / sympy.Float(30.0)) + sympy.Float(1.5)) / sympy.Float(3.0)
+
+        mA = NeuronModel("complex_ch", C_m=1.0, V_init=-65.0)
+        m_ref = mA.add_gate("m", inf=tanh_inf, tau=sympy.Float(2.0))
+        h_ref = mA.add_gate("h", inf=cos_inf, tau=sympy.Float(5.0))
+        # Additive gating — NOT a pure product, falls through to compile_gate_product_vm
+        mA.add_channel("Nav", g=0.5, E_rev=50.0,
+                        gating=m_ref ** 3 * h_ref + sympy.Float(0.05))
+        mA.add_channel("Leak", g=0.05, E_rev=-65.0)
+        spec_A = mA.to_spec()
+
+        assert spec_A.gates[0].update_form == GateUpdateForm.CUSTOM_EXPR
+        assert spec_A.gates[1].update_form == GateUpdateForm.CUSTOM_EXPR
+        assert not spec_A.channels[0].gate_product_vm.empty()
+
+        def make_net():
+            rn = hh.RegionalNetwork()
+            rn.add_population("A", self._N, model=spec_A)
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        self._assert_equal(serial, self._run(rn_p))
+
+    # -------------------------------------------------------------------------
+    # Synapse VM — CUSTOM_EXPR ODE on intra-group B→B synapse
+    # -------------------------------------------------------------------------
+
+    def test_custom_synapse_ode_intragroup_multigroup(self):
+        """Nonlinear CUSTOM_EXPR synapse ODE on intra-group B→B matches serial."""
+        # dS/dt has V_pre dependency — won't match any EXP_DECAY / ALPHA_FUNC pattern
+        dS_dt = (-S / sympy.Float(10.0)
+                 + sympy.Float(0.05) * sympy.exp(-V_pre ** 2 / sympy.Float(2000.0)))
+        # Saturable current that also doesn't match linear form
+        current_expr = S ** 2 / (S ** 2 + sympy.Float(0.1))
+        syn_spec = SynapseModel(
+            "novel_syn", dS_dt=dS_dt, current=current_expr, g=0.3, E_syn=0.0
+        ).to_spec()
+
+        def make_net():
+            rn = hh.RegionalNetwork()
+            rn.add_population("A", self._N, model=NeuronModelSpec.hh_default())
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            # B→B intra-group: delay=0 is fine since both pre and post are in g1
+            rn.connect("B", "B", "all_to_all", weight=0.2,
+                       synapse=syn_spec, delay=0.0)
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        self._assert_equal(serial, self._run(rn_p))
+
+    # -------------------------------------------------------------------------
+    # Synapse VM — two different custom synapse ODEs, one per group
+    # -------------------------------------------------------------------------
+
+    def test_custom_synapse_both_groups_multigroup(self):
+        """Different CUSTOM_EXPR synapse ODEs active in each group simultaneously."""
+        # A→A intra-group: quadratic saturation with abs(V_pre) dependence
+        dS_A = (-S / sympy.Float(15.0)
+                + sympy.Float(0.04) * sympy.Abs(V_pre) / (sympy.Abs(V_pre) + sympy.Float(20.0)))
+        syn_A = SynapseModel("syn_A", dS_dt=dS_A, g=0.25, E_syn=0.0).to_spec()
+
+        # B→B intra-group: sigmoid-based drive
+        dS_B = (-S / sympy.Float(8.0)
+                + sympy.Float(0.06) / (sympy.Float(1.0) + sympy.exp(-(V_pre + 30) / sympy.Float(5.0))))
+        syn_B = SynapseModel("syn_B", dS_dt=dS_B, g=0.2, E_syn=-10.0).to_spec()
+
+        def make_net():
+            rn = hh.RegionalNetwork()
+            rn.add_population("A", self._N, model=NeuronModelSpec.hh_default())
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            rn.connect("A", "A", "all_to_all", weight=0.2, synapse=syn_A, delay=0.0)
+            rn.connect("B", "B", "all_to_all", weight=0.2, synapse=syn_B, delay=0.0)
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        self._assert_equal(serial, self._run(rn_p))
+
+    # -------------------------------------------------------------------------
+    # Intracellular VM — nonlinear CUSTOM_EXPR ODE (quadratic decay) in group A
+    # -------------------------------------------------------------------------
+
+    def test_custom_intracellular_ode_multigroup(self):
+        """Nonlinear intracellular CUSTOM_EXPR ODE in group A matches serial."""
+        # Build expressions once (SymPy exprs are immutable and safely shareable)
+        X_sym = sympy.Symbol("X")
+        ode = -(X_sym ** 2 + X_sym) / sympy.Float(100.0)
+        mod = Modulation.channel_g("Leak", X_sym / (X_sym + sympy.Float(0.1)))
+
+        def make_net():
+            # Recreate spec and dynamics per call — add_intracellular mutates spec
+            rn = hh.RegionalNetwork()
+            mA = NeuronModel("ic_vm", C_m=1.0, V_init=-65.0)
+            mA.add_gate("m", update_form="instant", inf=Boltzmann(-40.0, 8.0))
+            mA.add_channel("Leak", g=0.1, E_rev=-65.0)
+            rn.add_population("A", self._N, model=mA.to_spec())
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            # Quadratic decay: -(X^2 + X)/100 — won't match -k*X linear form
+            rn.add_intracellular(
+                IntracellularDynamics("X", ode=ode, initial=0.5, modulations=[mod]),
+                populations=["A"],
+            )
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        self._assert_equal(serial, self._run(rn_p))
+
+    # -------------------------------------------------------------------------
+    # Intracellular VM — HomeostaticScaling (confirmed CUSTOM_EXPR ODE)
+    # -------------------------------------------------------------------------
+
+    def test_homeostatic_scaling_multigroup(self):
+        """HomeostaticScaling (CUSTOM_EXPR ODE) in group A matches serial across groups."""
+        def make_net():
+            rn = hh.RegionalNetwork()
+            mA = NeuronModel("hs_pop", C_m=1.0, V_init=-65.0)
+            mA.add_gate("m", update_form="instant", inf=Boltzmann(-40.0, 8.0))
+            mA.add_channel("Leak", g=0.1, E_rev=-65.0)
+            rn.add_population("A", self._N, model=mA.to_spec())
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            rn.add_intracellular(HomeostaticScaling(target_rate=5.0, tau=1000.0),
+                                 populations=["A"])
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        self._assert_equal(serial, self._run(rn_p))
+
+    # -------------------------------------------------------------------------
+    # Intracellular VM — custom ODE in BOTH groups simultaneously
+    # -------------------------------------------------------------------------
+
+    def test_custom_intracellular_both_groups_multigroup(self):
+        """Different CUSTOM_EXPR intracellular ODEs active in each group concurrently."""
+        Xa_sym = sympy.Symbol("Xa")
+        ode_A = -(Xa_sym ** 3 + sympy.Float(2.0) * Xa_sym) / sympy.Float(50.0)
+
+        Xb_sym = sympy.Symbol("Xb")
+        ode_B = (sympy.Float(0.01) - sympy.sqrt(Xb_sym + sympy.Float(0.01))) / sympy.Float(200.0)
+
+        def make_net():
+            rn = hh.RegionalNetwork()
+            mA = NeuronModel("ic_A", C_m=1.0, V_init=-65.0)
+            mA.add_gate("m", update_form="instant", inf=Boltzmann(-40.0, 8.0))
+            mA.add_channel("Leak", g=0.1, E_rev=-65.0)
+            rn.add_population("A", self._N, model=mA.to_spec())
+            mB = NeuronModel("ic_B", C_m=1.0, V_init=-65.0)
+            mB.add_gate("m", update_form="instant", inf=Boltzmann(-38.0, 9.0))
+            mB.add_channel("Leak", g=0.12, E_rev=-65.0)
+            rn.add_population("B", self._N, model=mB.to_spec())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            # Cubic ODE for group A, square-root ODE for group B
+            rn.add_intracellular(IntracellularDynamics("Xa", ode=ode_A, initial=0.3),
+                                 populations=["A"])
+            rn.add_intracellular(IntracellularDynamics("Xb", ode=ode_B, initial=0.1),
+                                 populations=["B"])
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        self._assert_equal(serial, self._run(rn_p))
+
+    # -------------------------------------------------------------------------
+    # Combined — all four VM areas active together in a two-group run
+    # -------------------------------------------------------------------------
+
+    def test_combined_all_sympy_vm_areas_multigroup(self):
+        """All SymPy VM areas (gate, channel, synapse, intracellular) active in Phase 2."""
+        # Expressions are immutable SymPy objects — safe to share across make_net calls
+        alpha_expr = sympy.Float(0.3) * sympy.exp(-((V + 60) / sympy.Float(12.0)) ** 2)
+        beta_expr  = sympy.Float(0.3) * sympy.exp(-((V + 85) / sympy.Float(12.0)) ** 2)
+        h_inf      = sympy.Float(0.5) + sympy.Float(0.45) * sympy.tanh(V / sympy.Float(10.0))
+        Xc_sym     = sympy.Symbol("Xc")
+        ode_ic     = -(Xc_sym ** 2 + Xc_sym * sympy.Float(0.5)) / sympy.Float(80.0)
+        dS_dt      = (-S / sympy.Float(8.0)
+                      + sympy.Float(0.08) * sympy.exp(-(V_pre + 30) ** 2 / sympy.Float(1600.0)))
+        syn_spec   = SynapseModel("combo_syn", dS_dt=dS_dt, g=0.2, E_syn=-10.0).to_spec()
+
+        def make_net():
+            # Rebuild spec_A each time — add_intracellular mutates the spec in-place
+            mA = NeuronModel("combo_A", C_m=1.0, V_init=-65.0)
+            m_ref = mA.add_gate("m", alpha=alpha_expr, beta=beta_expr)
+            h_ref = mA.add_gate("h", inf=h_inf, tau=sympy.Float(4.0))
+            # Additive gating → compile_gate_product_vm
+            mA.add_channel("Nav", g=0.4, E_rev=50.0,
+                            gating=m_ref ** 3 * h_ref + sympy.Float(0.02))
+            mA.add_channel("Leak", g=0.08, E_rev=-65.0)
+            rn = hh.RegionalNetwork()
+            rn.add_population("A", self._N, model=mA.to_spec())
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            rn.connect("B", "B", "all_to_all", weight=0.2, synapse=syn_spec, delay=0.0)
+            rn.add_intracellular(IntracellularDynamics("Xc", ode=ode_ic, initial=0.2),
+                                 populations=["A"])
+            return rn
+
+        serial = self._run(make_net())
+        rn_p = make_net()
+        rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+        self._assert_equal(serial, self._run(rn_p))
+
+    # -------------------------------------------------------------------------
+    # Phase 1 (OpenMP) — custom gate VM model: 1 thread vs 4 threads identical
+    # -------------------------------------------------------------------------
+
+    def test_openmp_with_custom_gate_multigroup(self):
+        """set_num_threads(1) and set_num_threads(4) produce bit-identical traces."""
+        alpha_expr = sympy.Float(0.5) * sympy.exp(-((V + 55) / sympy.Float(10.0)) ** 2)
+        beta_expr  = sympy.Float(0.5) * sympy.exp(-((V + 80) / sympy.Float(10.0)) ** 2)
+
+        m = NeuronModel("omp_vm", C_m=1.0, V_init=-65.0)
+        m.add_gate("m", alpha=alpha_expr, beta=beta_expr)
+        m.add_channel("Leak", g=0.1, E_rev=-65.0)
+        spec_A = m.to_spec()
+
+        def make_net(n_threads):
+            rn = hh.RegionalNetwork()
+            rn.add_population("A", self._N, model=spec_A)
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            rn.set_num_threads(n_threads)
+            return rn
+
+        traces_1t = self._run(make_net(1))
+        traces_4t = self._run(make_net(4))
+
+        for pop in ("A", "B"):
+            np.testing.assert_allclose(
+                traces_1t[pop], traces_4t[pop], atol=1e-10,
+                err_msg=f"Pop {pop}: 1-thread vs 4-thread traces differ",
+            )
+
+    # -------------------------------------------------------------------------
+    # Phase 1 (OpenMP) + Phase 2 together: combined parallelism, custom models
+    # -------------------------------------------------------------------------
+
+    def test_phase1_and_phase2_combined_custom_models(self):
+        """Phase 1 (OpenMP) + Phase 2 (thread groups) together produce correct traces."""
+        trig_inf = (sympy.sin(V / sympy.Float(20.0)) + sympy.Float(1.0)) / sympy.Float(2.0)
+        mA = NeuronModel("combo_phases", C_m=1.0, V_init=-65.0)
+        mA.add_gate("m", inf=trig_inf, tau=sympy.Float(2.0))
+        mA.add_channel("Leak", g=0.1, E_rev=-65.0)
+        spec_A = mA.to_spec()
+
+        def make_net(use_phase2, n_threads=1):
+            rn = hh.RegionalNetwork()
+            rn.add_population("A", self._N, model=spec_A)
+            rn.add_population("B", self._N, model=NeuronModelSpec.hh_default())
+            rn.connect("A", "B", "all_to_all", weight=0.3,
+                       synapse=SynapseSpec.ampa(), delay=self._DELAY)
+            rn.set_num_threads(n_threads)
+            if use_phase2:
+                rn.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+            return rn
+
+        serial = self._run(make_net(use_phase2=False, n_threads=1))
+        phase2_4t = self._run(make_net(use_phase2=True, n_threads=4))
+
+        self._assert_equal(serial, phase2_4t)

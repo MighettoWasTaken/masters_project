@@ -37,6 +37,13 @@ public:
     void step_euler(double dt);
     void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const override;
 
+    // Per-group subset ops for Phase 2: operate only on specified pool-local indices.
+    void gather_currents_subset(const std::vector<size_t>& local_indices, const double* I_buf);
+    void step_subset(const std::vector<size_t>& local_indices, double dt);
+    void scatter_voltages_subset(const std::vector<size_t>& local_indices, double* V_buf) const;
+    void scatter_recoveries_subset(const std::vector<size_t>& local_indices,
+                                   double* u_buf, size_t n_rec, size_t tr) const;
+
 private:
     size_t N_ = 0;
     std::vector<size_t> net_idx_;

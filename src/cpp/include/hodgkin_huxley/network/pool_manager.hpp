@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace hodgkin_huxley {
@@ -57,6 +58,39 @@ public:
     // True if any ComposablePool has a SYNAPSE_G modulation (set after build)
     bool has_synapse_g_mods() const { return has_synapse_g_mods_; }
 
+    // OpenMP thread count for step_all() (0 = let OpenMP decide)
+    void set_num_threads(int n) { num_threads_ = n; }
+
+    // --- Per-group ops for Phase 2 parallel simulation ---
+    // ComposablePool subset (by spec name)
+    void step_for_names(const std::vector<std::string>& names, double dt);
+    void scatter_voltages_for_names(const std::vector<std::string>& names, double* V_cache) const;
+    void gather_currents_for_names(const std::vector<std::string>& names, const double* I_buf);
+    void scatter_synapse_g_scale_for_names(const std::vector<std::string>& names, double* buf) const;
+
+    // HHPool / IzPool subset (by pool-local index vectors).
+    // Build the index vectors once via fill_group_hh_iz_indices().
+    void fill_group_hh_iz_indices(const std::vector<size_t>& global_neuron_indices,
+                                   std::vector<size_t>& hh_local_out,
+                                   std::vector<size_t>& iz_local_out) const;
+
+    void gather_currents_for_hh(const std::vector<size_t>& local_indices, const double* I_buf);
+    void step_for_hh(const std::vector<size_t>& local_indices, double dt);
+    void scatter_voltages_for_hh(const std::vector<size_t>& local_indices, double* V_cache) const;
+
+    void gather_currents_for_iz(const std::vector<size_t>& local_indices, const double* I_buf);
+    void step_for_iz(const std::vector<size_t>& local_indices, double dt);
+    void scatter_voltages_for_iz(const std::vector<size_t>& local_indices, double* V_cache) const;
+
+    // Recording-subset ops for Phase 2 — write only this group's neurons/synapses.
+    void scatter_gates_for_names(const std::vector<std::string>& names,
+                                  double* gate_buf, size_t max_gates,
+                                  size_t n_rec, size_t tr) const;
+    void scatter_calcium_for_names(const std::vector<std::string>& names,
+                                    double* ca_buf, size_t n_rec, size_t tr) const;
+    void scatter_recoveries_for_iz(const std::vector<size_t>& local_indices,
+                                    double* u_buf, size_t n_rec, size_t tr) const;
+
     /// Return intracellular substance concentration for a global neuron index.
     /// Scans all ComposablePools; returns 0 if neuron has no intracellular dynamics.
     double get_substance(size_t global_neuron_idx, size_t subst_idx) const {
@@ -69,9 +103,15 @@ public:
 
 private:
     bool has_synapse_g_mods_ = false;
+    int  num_threads_ = 0;
     HHPool hh_pool_;
     IzPool iz_pool_;
     std::map<std::string, ComposablePool> comp_pools_;
+
+    // global neuron index → pool-local index, built in build_from_neurons.
+    // Used by fill_group_hh_iz_indices for Phase 2 group partitioning.
+    std::unordered_map<size_t, size_t> hh_global_to_local_;
+    std::unordered_map<size_t, size_t> iz_global_to_local_;
 };
 
 } // namespace hodgkin_huxley

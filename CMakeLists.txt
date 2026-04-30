@@ -35,6 +35,9 @@ FetchContent_MakeAvailable(eigen)
 # Find pybind11
 find_package(pybind11 CONFIG REQUIRED)
 
+# OpenMP (optional — enables pool-level parallelism in step_all)
+find_package(OpenMP)
+
 # Option to build tests
 option(BUILD_TESTS "Build C++ tests" OFF)
 

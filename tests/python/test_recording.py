@@ -64,6 +64,40 @@ def _regional_net():
     return rn
 
 
+def _two_pop_delayed(n=4, delay_ms=2.0):
+    """2-population HH network with inter-group delay — for Phase 2 correctness tests."""
+    rn = RegionalNetwork()
+    rn.add_population("A", n, model=NeuronModelSpec.hh_default())
+    rn.add_population("B", n, model=NeuronModelSpec.hh_default())
+    rn.connect("A", "B", "all_to_all", weight=0.3,
+               synapse=SynapseSpec.ampa(), delay=delay_ms)
+    rn.connect("A", "A", "all_to_all", weight=0.2,
+               synapse=SynapseSpec.ampa(), delay=delay_ms)
+    return rn
+
+
+def _two_pop_composable_delayed(n=4, delay_ms=2.0):
+    """2-population composable (STN) network with inter-group delay."""
+    rn = RegionalNetwork()
+    rn.add_population("A", n, model=make_stn())
+    rn.add_population("B", n, model=make_stn())
+    rn.connect("A", "B", "all_to_all", weight=0.3,
+               synapse=SynapseSpec.ampa(), delay=delay_ms)
+    rn.connect("A", "A", "all_to_all", weight=0.2,
+               synapse=SynapseSpec.ampa(), delay=delay_ms)
+    return rn
+
+
+# =============================================================================
+# Fixture: run each parametrized test in serial and Phase 2 modes
+# =============================================================================
+
+@pytest.fixture(params=[False, True], ids=["serial", "phase2"])
+def use_parallel(request):
+    """Yield True when the test should run through the Phase 2 parallel path."""
+    return request.param
+
+
 # =============================================================================
 # Backward-compatibility tests
 # =============================================================================
@@ -191,14 +225,15 @@ def test_spike_count_per_synapse():
 # Gate / calcium tests (composable neurons)
 # =============================================================================
 
-def test_gate_shape_composable():
+def test_gate_shape_composable(use_parallel):
     rn, I_ext = _composable_rn(3)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["E"]})
     cfg = RecordingConfig(["gates"])
     result = rn.simulate(DURATION, DT, I_ext, record=cfg)
     g = result["E"]["gates"]
     n_gates = rn._rnet.network().max_gate_count()
     assert g.shape == (3, n_gates, N_STEPS)
-    # Gate values should be in [0, 1]
     assert g.min() >= 0.0
     assert g.max() <= 1.0
 
@@ -217,8 +252,10 @@ def test_gate_shape_hh_default():
     assert g.max() <= 1.0
 
 
-def test_calcium_shape_composable():
+def test_calcium_shape_composable(use_parallel):
     rn, I_ext = _composable_rn(2, I_val=5.0)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["E"]})
     cfg = RecordingConfig(["calcium"])
     result = rn.simulate(DURATION, DT, I_ext, record=cfg)
     ca = result["E"]["calcium"]
@@ -237,9 +274,11 @@ def test_calcium_zeros_for_hh():
     np.testing.assert_allclose(ca, spec.calcium.Ca_init, atol=1e-10)
 
 
-def test_calcium_increases_composable():
+def test_calcium_increases_composable(use_parallel):
     """Under sustained drive, calcium should rise above zero."""
     rn, I_ext = _composable_rn(1, I_val=10.0)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["E"]})
     cfg = RecordingConfig(["calcium"])
     result = rn.simulate(DURATION, DT, I_ext, record=cfg)
     spec = _stn_spec()
@@ -252,8 +291,10 @@ def test_calcium_increases_composable():
 # g_syn / I_syn tests
 # =============================================================================
 
-def test_g_syn_shape():
+def test_g_syn_shape(use_parallel):
     rn, I_ext = _hh_rn(2)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["E"]})
     n_synapses = rn.num_synapses
     cfg = RecordingConfig(["g_syn"])
     result = rn.simulate(DURATION, DT, I_ext, record=cfg)
@@ -261,21 +302,24 @@ def test_g_syn_shape():
     assert (result["E"]["g_syn"] >= 0).all()
 
 
-def test_I_syn_zero_no_synapses():
+def test_I_syn_zero_no_synapses(use_parallel):
     """Isolated neuron → I_syn ≈ 0 at all times."""
     rn = RegionalNetwork()
     rn.add_population("E", 1, model=NeuronModelSpec.hh_default())
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["E"]})
     cfg = RecordingConfig(["I_syn"])
     result = rn.simulate(DURATION, DT, {"E": 5.0}, record=cfg)
     np.testing.assert_allclose(result["E"]["I_syn"], 0.0, atol=1e-12)
 
 
-def test_I_syn_nonzero_with_synapses():
+def test_I_syn_nonzero_with_synapses(use_parallel):
     """Connected network → post-synaptic neuron should see nonzero I_syn."""
     rn, I_ext = _hh_rn(2, I_val=10.0)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["E"]})
     cfg = RecordingConfig(["I_syn"])
     result = rn.simulate(DURATION, DT, I_ext, record=cfg)
-    # Neuron 1 (post-synaptic) should have some synaptic input
     assert np.any(result["E"]["I_syn"][1] != 0.0)
 
 
@@ -360,8 +404,10 @@ def test_preset_spikes_only():
 # NaN / Inf sanity
 # =============================================================================
 
-def test_all_neuron_metrics_no_nan():
+def test_all_neuron_metrics_no_nan(use_parallel):
     rn, I_ext = _composable_rn(2, I_val=5.0)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["E"]})
     cfg = RecordingConfig.all_neuron_metrics(interval=1)
     result = rn.simulate(DURATION, DT, I_ext, record=cfg)
     for key in result["E"].keys():
@@ -444,3 +490,81 @@ def test_mixed_net_gate_zeros_for_hh_rows():
     # All gate values in valid range
     assert np.all(result["HH"]["gates"] >= 0.0)
     assert np.all(g_stn >= 0.0)
+
+
+# =============================================================================
+# Parallel recording correctness — serial vs Phase 2 output comparison
+# Uses a 2-population network with proper inter-group delay so Phase 2 activates.
+# =============================================================================
+
+_P2_I_EXT = {"A": 8.0, "B": 0.0}
+
+
+def test_parallel_gates_match_serial():
+    """Phase 2 gate recording must match serial to floating-point precision."""
+    spec = _stn_spec()
+    if not spec.gates:
+        pytest.skip("STN model has no gates")
+    rn_s = _two_pop_composable_delayed()
+    res_s = rn_s.simulate(DURATION, DT, _P2_I_EXT, record=RecordingConfig(["V", "gates"]))
+
+    rn_p = _two_pop_composable_delayed()
+    rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+    res_p = rn_p.simulate(DURATION, DT, _P2_I_EXT, record=RecordingConfig(["V", "gates"]))
+
+    for pop in ("A", "B"):
+        np.testing.assert_allclose(
+            res_s[pop]["gates"], res_p[pop]["gates"], atol=1e-10,
+            err_msg=f"gates mismatch in population {pop}",
+        )
+
+
+def test_parallel_calcium_matches_serial():
+    """Phase 2 calcium recording must match serial."""
+    spec = _stn_spec()
+    if not spec.calcium.enabled:
+        pytest.skip("STN model has no calcium dynamics")
+    rn_s = _two_pop_composable_delayed()
+    res_s = rn_s.simulate(DURATION, DT, _P2_I_EXT, record=RecordingConfig(["V", "calcium"]))
+
+    rn_p = _two_pop_composable_delayed()
+    rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+    res_p = rn_p.simulate(DURATION, DT, _P2_I_EXT, record=RecordingConfig(["V", "calcium"]))
+
+    for pop in ("A", "B"):
+        np.testing.assert_allclose(
+            res_s[pop]["calcium"], res_p[pop]["calcium"], atol=1e-10,
+            err_msg=f"calcium mismatch in population {pop}",
+        )
+
+
+def test_parallel_g_syn_matches_serial():
+    """Phase 2 g_syn recording must match serial."""
+    rn_s = _two_pop_delayed()
+    res_s = rn_s.simulate(DURATION, DT, _P2_I_EXT, record=RecordingConfig(["V", "g_syn"]))
+
+    rn_p = _two_pop_delayed()
+    rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+    res_p = rn_p.simulate(DURATION, DT, _P2_I_EXT, record=RecordingConfig(["V", "g_syn"]))
+
+    # g_syn is network-wide (not sliced by population)
+    np.testing.assert_allclose(
+        res_s["A"]["g_syn"], res_p["A"]["g_syn"], atol=1e-10,
+        err_msg="g_syn mismatch",
+    )
+
+
+def test_parallel_I_syn_matches_serial():
+    """Phase 2 I_syn recording must match serial."""
+    rn_s = _two_pop_delayed()
+    res_s = rn_s.simulate(DURATION, DT, _P2_I_EXT, record=RecordingConfig(["V", "I_syn"]))
+
+    rn_p = _two_pop_delayed()
+    rn_p.set_thread_groups({"g0": ["A"], "g1": ["B"]})
+    res_p = rn_p.simulate(DURATION, DT, _P2_I_EXT, record=RecordingConfig(["V", "I_syn"]))
+
+    for pop in ("A", "B"):
+        np.testing.assert_allclose(
+            res_s[pop]["I_syn"], res_p[pop]["I_syn"], atol=1e-10,
+            err_msg=f"I_syn mismatch in population {pop}",
+        )

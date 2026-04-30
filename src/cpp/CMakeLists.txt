@@ -22,6 +22,13 @@ target_include_directories(hodgkin_huxley_core PUBLIC
 
 target_link_libraries(hodgkin_huxley_core PUBLIC Eigen3::Eigen)
 
+# OpenMP is disabled on MinGW/GCC<6 due to ICE with -fopenmp + C++14 generic lambdas.
+# Enabled on Linux (GCC/Clang), macOS (AppleClang), and MSVC.
+if(OpenMP_CXX_FOUND AND NOT MINGW)
+    target_link_libraries(hodgkin_huxley_core PUBLIC OpenMP::OpenMP_CXX)
+    target_compile_definitions(hodgkin_huxley_core PRIVATE HH_USE_OPENMP)
+endif()
+
 # Enable position independent code for shared library linking
 set_target_properties(hodgkin_huxley_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON

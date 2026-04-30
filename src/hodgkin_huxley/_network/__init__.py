@@ -650,6 +650,118 @@ class RegionalNetwork:
     def fast_math(self, enabled: bool) -> None:
         self._rnet.fast_math = enabled
 
+    def set_num_threads(self, n: int = 0) -> None:
+        """Set OpenMP thread count for pool-level parallelism (0 = auto)."""
+        self._rnet.network().set_num_threads(n)
+
+    def num_threads(self) -> int:
+        """Current OpenMP thread count setting (0 = auto)."""
+        return self._rnet.network().num_threads
+
+    # ------------------------------------------------------------------
+    # Thread groups (Phase 2 — delay decomposition parallelism)
+    # ------------------------------------------------------------------
+
+    def set_thread_groups(
+        self, groups: "dict[str, list[str]] | None" = None
+    ) -> None:
+        """
+        Assign populations to thread groups for delay-decomposition parallelism.
+
+        Parameters
+        ----------
+        groups
+            Map of group_name → list of population names, or None to clear.
+            All inter-group synapses must have delay >= dt.
+        """
+        if groups is None:
+            self.clear_thread_groups()
+            return
+        # Validate population names eagerly
+        known = set(self._rnet.population_names())
+        for pops in groups.values():
+            for pop in pops:
+                if pop not in known:
+                    raise ValueError(
+                        f"Population '{pop}' not found in network "
+                        f"(known: {sorted(known)})"
+                    )
+        # Validate no zero-delay cross-group synapses
+        pop_to_group: dict[str, str] = {}
+        for gname, pops in groups.items():
+            for pop in pops:
+                pop_to_group[pop] = gname
+
+        # Check each connection: if pre-group != post-group, delay must be > 0
+        net = self._rnet.network()
+        pre_indices = net.get_synapse_pre_indices()
+        post_indices = net.get_synapse_post_indices()
+        # Build neuron→pop map once (O(N))
+        neuron_pop: dict[int, str] = {}
+        for name in self._rnet.population_names():
+            start = self._rnet.population_start(name)
+            size = self._rnet.population_size(name)
+            for ni in range(start, start + size):
+                neuron_pop[ni] = name
+
+        for si in range(net.num_synapses):
+            delay = net.synapse(si).delay
+            pre_pop = neuron_pop.get(pre_indices[si])
+            post_pop = neuron_pop.get(post_indices[si])
+            if pre_pop is None or post_pop is None:
+                continue
+            pre_grp = pop_to_group.get(pre_pop)
+            post_grp = pop_to_group.get(post_pop)
+            if pre_grp is not None and post_grp is not None and pre_grp != post_grp:
+                if delay <= 0.0:
+                    raise ValueError(
+                        f"Synapse from population '{pre_pop}' to '{post_pop}' "
+                        f"has delay={delay} ms. Inter-group synapses require "
+                        f"delay > 0. Co-group these populations or add a delay."
+                    )
+
+        self._thread_groups = {g: list(pops) for g, pops in groups.items()}
+
+        # Auto-rename specs: ensure each population has a unique spec name so
+        # build_from_neurons creates a separate ComposablePool per population.
+        # Multiple pops sharing the same spec name would otherwise share one pool,
+        # preventing per-group pool stepping.
+        spec_name_to_groups: dict = {}
+        for gname, pops in self._thread_groups.items():
+            for pop in pops:
+                if pop in self._pop_specs:
+                    sname = self._pop_specs[pop].name
+                    spec_name_to_groups.setdefault(sname, set()).add(gname)
+
+        for gname, pops in self._thread_groups.items():
+            for pop in pops:
+                if pop in self._pop_specs:
+                    spec = self._pop_specs[pop]
+                    if len(spec_name_to_groups.get(spec.name, set())) > 1:
+                        # Multiple groups share this spec name — rename to pop-specific
+                        spec.name = pop
+                        self._pop_specs[pop] = spec
+                        self._rnet.update_population_spec(pop, spec)
+
+        # Push integer-keyed groups to C++ for simulate_parallel()
+        cpp_groups: dict[int, list] = {
+            i: list(pops)
+            for i, (_, pops) in enumerate(self._thread_groups.items())
+        }
+        self._rnet.set_thread_groups(cpp_groups)
+        # Store the integer-key map for the parallel simulate path
+        self._thread_groups_cpp = cpp_groups
+
+    def clear_thread_groups(self) -> None:
+        """Remove thread group assignments, returning to serial simulation."""
+        self._thread_groups = {}
+        self._thread_groups_cpp = {}
+        self._rnet.clear_thread_groups()
+
+    def has_thread_groups(self) -> bool:
+        """True if thread groups have been assigned."""
+        return bool(getattr(self, "_thread_groups", {}))
+
     def reset(self) -> None:
         """Reset all neurons to resting state."""
         self._rnet.reset()
@@ -822,6 +934,92 @@ class RegionalNetwork:
             I_ext_list = np.ascontiguousarray(I_ext, dtype=np.float64)
 
         cfg = record if record is not None else RecordingConfig(["V"])
+
+        # Phase 2 parallel path: thread groups + compact StimPlan.
+        # Supports V, all V-derived metrics, and slow metrics (gates, calcium, g_syn, I_syn,
+        # u, spike_events). spike_event_buf only counts intra-group spike arrivals.
+        _p2_all_supported = (RecordingConfig.DERIVED_FROM_V
+                             | RecordingConfig.SLOW_METRICS
+                             | {"V", "u", "spike_events"})
+        _use_phase2 = (
+            self.has_thread_groups()
+            and stim_plan is not None
+            and set(cfg.metrics) <= _p2_all_supported
+            # subsampled V is fine; spike-derived metrics need every step (interval=1)
+            and (cfg.interval == 1
+                 or set(cfg.metrics) <= (_p2_all_supported - RecordingConfig.DERIVED_FROM_V))
+        )
+        if _use_phase2:
+            from ..recording import (MetricsResult, _resolve_neuron_indices,
+                                     _detect_spikes, _isi_mean, _isi_cv,
+                                     _extract_gate_names)
+            n_steps = int(duration / dt)
+            n_rec = (n_steps + cfg.interval - 1) // cfg.interval
+            num_synapses = self._rnet.num_synapses
+            det_thresh = (detection_threshold if detection_threshold is not None
+                          else cfg.spike_threshold)
+            metrics_set = set(cfg.metrics)
+
+            need_V       = cfg.needs_V()
+            need_gates   = "gates"        in metrics_set
+            need_calcium = "calcium"      in metrics_set
+            need_u       = "u"            in metrics_set
+            need_g_syn   = "g_syn"        in metrics_set
+            need_I_syn   = "I_syn"        in metrics_set
+            need_sevents = "spike_events" in metrics_set
+            max_gates = (self._rnet.network().max_gate_count()
+                         if need_gates else 0)
+
+            def _alloc(shape):
+                return np.zeros(shape, dtype=np.float64) if shape else np.empty(0, dtype=np.float64)
+
+            V_buf           = _alloc((num_neurons, n_rec)            if need_V       else ())
+            gate_buf        = _alloc((num_neurons, max_gates, n_rec) if need_gates   else ())
+            calcium_buf     = _alloc((num_neurons, n_rec)            if need_calcium else ())
+            u_buf           = _alloc((num_neurons, n_rec)            if need_u       else ())
+            g_syn_buf       = _alloc((num_synapses, n_rec)           if need_g_syn   else ())
+            I_syn_buf       = _alloc((num_neurons, n_rec)            if need_I_syn   else ())
+            spike_event_buf = _alloc((num_neurons, n_rec)            if need_sevents else ())
+
+            self._rnet._simulate_parallel(
+                stim_plan.I_const, stim_plan.pulses, stim_plan.dbs,
+                duration, dt,
+                V_buf, gate_buf, max_gates, calcium_buf,
+                u_buf, g_syn_buf, I_syn_buf, spike_event_buf,
+                cfg.interval, det_thresh,
+            )
+            if record is None:
+                return {
+                    name: V_buf[start : start + size, :]
+                    for name, (start, size) in pop_info.items()
+                }
+            selected = _resolve_neuron_indices(cfg.neurons, num_neurons, pop_info)
+            time_axis = np.arange(n_rec, dtype=np.float64) * cfg.interval * dt
+            data: dict = {}
+            if "V"           in metrics_set: data["V"]           = V_buf[selected]
+            if need_gates:                   data["gates"]        = gate_buf[selected]
+            if need_calcium:                 data["calcium"]      = calcium_buf[selected]
+            if need_u:                       data["u"]            = u_buf[selected]
+            if need_g_syn:                   data["g_syn"]        = g_syn_buf
+            if need_I_syn:                   data["I_syn"]        = I_syn_buf[selected]
+            if need_sevents:                 data["spike_events"] = spike_event_buf[selected]
+            derived = metrics_set & RecordingConfig.DERIVED_FROM_V
+            if derived:
+                V_sel = V_buf[selected]
+                spikes = _detect_spikes(V_sel, cfg.interval * dt, cfg.spike_threshold)
+                if "spikes"      in metrics_set: data["spikes"]      = spikes
+                if "spike_count" in metrics_set: data["spike_count"] = np.array([len(s) for s in spikes])
+                if "firing_rate" in metrics_set: data["firing_rate"] = np.array(
+                    [len(s) / (duration * 1e-3) for s in spikes])
+                if "mean_V"      in metrics_set: data["mean_V"]      = V_sel.mean(axis=1)
+                if "ISI_mean"    in metrics_set: data["ISI_mean"]    = _isi_mean(spikes)
+                if "ISI_cv"      in metrics_set: data["ISI_cv"]      = _isi_cv(spikes)
+            gate_names = (_extract_gate_names(self._rnet.network(), selected)
+                          if need_gates else None)
+            result_mr = MetricsResult(data, time_axis, duration, dt,
+                                      cfg.interval, selected, gate_names)
+            return PopulationMetricsResult(result_mr, pop_info, record)
+
         result = _run_recording(
             self._rnet.network(),
             duration,

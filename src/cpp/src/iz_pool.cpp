@@ -85,6 +85,44 @@ void IzPool::step_euler(double dt) {
 }
 
 // =============================================================================
+// Per-group subset ops for Phase 2 parallelism (scalar loop over local indices)
+// =============================================================================
+
+void IzPool::gather_currents_subset(const std::vector<size_t>& local_indices,
+                                     const double* I_buf) {
+    for (size_t li : local_indices)
+        I_ext_(li) = I_buf[net_idx_[li]];
+}
+
+void IzPool::step_subset(const std::vector<size_t>& local_indices, double dt) {
+    for (size_t li : local_indices) {
+        double v = v_(li), u = u_(li);
+        if (v >= SPIKE_THRESHOLD) {
+            v  = c_(li);
+            u += d_(li);
+        }
+        double dv = 0.04*v*v + 5.0*v + 140.0 - u + I_ext_(li);
+        double du = a_(li) * (b_(li)*v - u);
+        v = std::min(v + dt * dv, 100.0);
+        u = u + dt * du;
+        v_(li) = v;
+        u_(li) = u;
+    }
+}
+
+void IzPool::scatter_voltages_subset(const std::vector<size_t>& local_indices,
+                                      double* V_buf) const {
+    for (size_t li : local_indices)
+        V_buf[net_idx_[li]] = v_(li);
+}
+
+void IzPool::scatter_recoveries_subset(const std::vector<size_t>& local_indices,
+                                        double* u_buf, size_t n_rec, size_t tr) const {
+    for (size_t li : local_indices)
+        u_buf[net_idx_[li] * n_rec + tr] = u_(li);
+}
+
+// =============================================================================
 // Sync back to polymorphic API objects
 // =============================================================================
 

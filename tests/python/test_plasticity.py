@@ -67,18 +67,25 @@ def _spikes(trace: np.ndarray, threshold: float = 0.0) -> int:
     return int(np.sum(np.diff(above.astype(int)) == 1))
 
 
+@pytest.fixture(params=[False, True], ids=["serial", "phase2"])
+def use_parallel(request):
+    return request.param
+
+
 # ---------------------------------------------------------------------------
 # Section A — DopamineGating
 # ---------------------------------------------------------------------------
 
 class TestDopamineGating:
 
-    def test_no_crash(self):
+    def test_no_crash(self, use_parallel):
         rn = RegionalNetwork()
         rn.add_population("pre", 2, model=NeuronModelSpec.hh_default())
         rn.add_population("post", 2, model=NeuronModelSpec.hh_default())
         rn.connect("pre", "post", "all_to_all", weight=0.3)
         rn.add_intracellular(DopamineGating(da_level=0.5), populations=["post"])
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pre", "post"]})
         result = _run(rn, I_pre=5.0, I_post=0.0, duration=200.0)
         V = result["pre"]["V"]
         assert np.all(np.isfinite(V)), "Voltages should be finite"
@@ -86,7 +93,7 @@ class TestDopamineGating:
     def test_is_intracellular_dynamics(self):
         assert isinstance(DopamineGating(), IntracellularDynamics)
 
-    def test_high_da_increases_i_syn(self):
+    def test_high_da_increases_i_syn(self, use_parallel):
         """Higher DA level → stronger synaptic gain → higher mean I_syn to post."""
         mean_isyn = []
         for da_level in [0.1, 0.9]:
@@ -96,17 +103,21 @@ class TestDopamineGating:
             rn.connect("pre", "post", "all_to_all", weight=1.0)
             rn.add_intracellular(DopamineGating(da_level=da_level, k_decay=0.0001),
                                  populations=["post"])
+            if use_parallel:
+                rn.set_thread_groups({"g0": ["pre", "post"]})
             cfg = RecordingConfig(["I_syn"])
             result = rn.simulate(300.0, DT, {"pre": 8.0, "post": 0.0}, record=cfg)
             mean_isyn.append(float(result["post"]["I_syn"].max()))
         assert mean_isyn[1] > mean_isyn[0], \
             f"High DA should give higher post max I_syn: {mean_isyn}"
 
-    def test_tonic_da_stable(self):
+    def test_tonic_da_stable(self, use_parallel):
         """With very slow decay, DA stays close to initial value."""
         rn = RegionalNetwork()
         rn.add_population("src", 1, model=NeuronModelSpec.hh_default())
         rn.add_intracellular(DopamineGating(da_level=0.7, k_decay=1e-5), populations=["src"])
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["src"]})
         cfg = RecordingConfig(["calcium"])   # substance 0 recorded as 'calcium'
         result = rn.simulate(500.0, DT, {"src": 0.0}, record=cfg)
         da_trace = result["src"]["calcium"][0]
@@ -120,13 +131,15 @@ class TestDopamineGating:
 
 class TestHomeostaticScaling:
 
-    def test_no_crash(self):
+    def test_no_crash(self, use_parallel):
         rn = RegionalNetwork()
         rn.add_population("pre",  2, model=NeuronModelSpec.hh_default())
         rn.add_population("post", 2, model=NeuronModelSpec.hh_default())
         rn.connect("pre", "post", "all_to_all", weight=0.3)
         rn.add_intracellular(HomeostaticScaling(target_rate=20.0, tau=5000.0),
                              populations=["post"])
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pre", "post"]})
         result = _run(rn, I_pre=5.0, I_post=0.0, duration=200.0)
         V = result["pre"]["V"]
         assert np.all(np.isfinite(V)), "Voltages should be finite"
@@ -134,7 +147,7 @@ class TestHomeostaticScaling:
     def test_is_intracellular_dynamics(self):
         assert isinstance(HomeostaticScaling(), IntracellularDynamics)
 
-    def test_synapse_g_finite(self):
+    def test_synapse_g_finite(self, use_parallel):
         """HomeostaticScaling with active synapse should produce finite g_syn."""
         rn = RegionalNetwork()
         rn.add_population("pre",  2, model=NeuronModelSpec.hh_default())
@@ -142,6 +155,8 @@ class TestHomeostaticScaling:
         rn.connect("pre", "post", "all_to_all", weight=0.5)
         rn.add_intracellular(HomeostaticScaling(target_rate=20.0, tau=5000.0),
                              populations=["post"])
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pre", "post"]})
         cfg = RecordingConfig(["g_syn"])
         result = rn.simulate(300.0, DT, {"pre": 6.0, "post": 0.0}, record=cfg)
         g = result["post"]["g_syn"]
@@ -154,17 +169,21 @@ class TestHomeostaticScaling:
 
 class TestSTDP:
 
-    def test_no_crash(self):
+    def test_no_crash(self, use_parallel):
         rn = _two_neuron_rnet(weight=0.5, plasticity=STDPRule())
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pre", "post"]})
         result = _run(rn, I_pre=5.0, duration=200.0)
         assert np.all(np.isfinite(result["pre"]["V"]))
 
-    def test_no_crash_connect_string_pattern(self):
+    def test_no_crash_connect_string_pattern(self, use_parallel):
         rn = RegionalNetwork()
         rn.add_population("pre",  2, model=NeuronModelSpec.hh_default())
         rn.add_population("post", 2, model=NeuronModelSpec.hh_default())
         rn.connect("pre", "post", "all_to_all", weight=0.5,
                    synapse=SynapseSpec.ampa(), plasticity=STDPRule())
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pre", "post"]})
         result = _run(rn, I_pre=5.0, duration=200.0)
         assert np.all(np.isfinite(result["pre"]["V"]))
 
@@ -256,8 +275,10 @@ class TestSTDPLearning:
 
 class TestSTP:
 
-    def test_no_crash(self):
+    def test_no_crash(self, use_parallel):
         rn = _two_neuron_rnet(weight=1.0, plasticity=STPRule())
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pre", "post"]})
         result = _run(rn, I_pre=5.0, duration=500.0)
         assert np.all(np.isfinite(result["pre"]["V"]))
 
@@ -273,9 +294,11 @@ class TestSTP:
         rn.simulate(50.0, DT, {"pre": 5.0, "post": 0.0}, record=cfg)
         assert not rn.network.has_stp
 
-    def test_g_syn_finite(self):
+    def test_g_syn_finite(self, use_parallel):
         """g_syn trace should be finite throughout STP simulation."""
         rn = _two_neuron_rnet(weight=1.0, plasticity=STPRule(U=0.5))
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pre", "post"]})
         cfg = RecordingConfig(["g_syn"])
         result = rn.simulate(500.0, DT, {"pre": 8.0, "post": 0.0}, record=cfg)
         g = result["post"]["g_syn"][0]
@@ -349,7 +372,7 @@ class TestGatedSTDP:
         assert abs(w - 0.5) < 1e-9, \
             f"Zero A_plus/A_minus: weight should not change, got {w:.6f}"
 
-    def test_gated_stdp_with_dopamine(self):
+    def test_gated_stdp_with_dopamine(self, use_parallel):
         """
         Dopamine modulation integrated with STDP.
         A network with DopamineGating + STDP should not crash and produce
@@ -364,6 +387,8 @@ class TestGatedSTDP:
                    synapse=SynapseSpec.ampa(),
                    plasticity=STDPRule(A_plus=0.01, A_minus=0.005,
                                        w_min=0.0, w_max=1.0))
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["pre", "post"]})
         _run(rn, I_pre=7.0, I_post=0.0, duration=300.0)
         w = rn.get_synapse_weights()
         assert np.all(np.isfinite(w)), "Weights should remain finite with DA gating"

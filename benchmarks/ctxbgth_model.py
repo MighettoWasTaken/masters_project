@@ -684,6 +684,10 @@ def simulate_ctxbgth(
     """
     net = build_network(n=n, pd=pd, seed=seed)
 
+    POPULATIONS = ["TH", "STN", "GPe", "GPi", "Str_D2", "Str_D1", "CTX_e", "CTX_i"]
+    groups = {f"g{i}": [name] for i, name in enumerate(POPULATIONS)}
+    net.set_thread_groups(groups)   # Phase 2: one thread per population
+
     # ---- External currents -------------------------------------------------
     I_ext: dict = {
         "TH":  1.2,
@@ -716,8 +720,7 @@ def simulate_ctxbgth(
     gpi_S                 = gpi_beta["spectrum"]
     gpi_f                 = gpi_beta["frequencies"]
 
-    pops_ordered = ("TH", "STN", "GPe", "GPi", "Str_D2", "Str_D1", "CTX_e", "CTX_i")
-    spike_times  = {pop: result[pop]["spikes"] for pop in pops_ordered}
+    spike_times  = {pop: result[pop]["spikes"] for pop in POPULATIONS}
 
     return gpi_alpha_beta_area, gpi_S, gpi_f, spike_times, elapsed
 
@@ -726,7 +729,7 @@ def simulate_ctxbgth(
 # Quick-run entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main():
     time = 1  # seconds
     window_s = 0.25  # time window for rate-over-time reporting (seconds)
 
@@ -764,3 +767,6 @@ if __name__ == "__main__":
             row_rates.append(mean_rate)
         print(f"  {label:>16s} | " + " | ".join(f"{r:>8.1f}" for r in row_rates))
     print("  " + "-" * (len(hdr) - 2))
+
+if __name__ == "__main__":
+    main()

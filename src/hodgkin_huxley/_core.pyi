@@ -1560,6 +1560,21 @@ class RegionalNetwork:
         """
         Push an updated NeuronModelSpec (e.g., with new intracellular) back to C++
         """
+    def set_thread_groups(self, groups: dict[int, list[str]]) -> None:
+        """
+        Assign populations to integer-keyed thread groups for delay-decomposition parallelism.
+        Use RegionalNetwork.set_thread_groups() from Python instead; this is the raw C++ binding.
+        """
+    def clear_thread_groups(self) -> None:
+        """Clear all thread group assignments, returning to serial simulation."""
+    def has_thread_groups(self) -> bool:
+        """Return True if thread groups are currently set."""
+    def _simulate_parallel(self, I_const: numpy.ndarray, pulses: list, dbs: list, duration: float, dt: float, V_buf: numpy.ndarray, interval: int, spike_threshold: float) -> None:
+        """
+        Run a parallel delay-decomposition simulation using stored thread groups.
+        V_buf must be pre-allocated (n_neurons × n_rec, row-major float64).
+        Called by RegionalNetwork.simulate() when has_thread_groups() is True.
+        """
     @property
     def num_neurons(self) -> int:
         ...
@@ -2398,6 +2413,15 @@ class _Network:
     @fast_math.setter
     def fast_math(self, arg1: bool) -> None:
         ...
+    def set_num_threads(self, n: int = 0) -> None:
+        """
+        Set OpenMP thread count for pool-level parallelism (0 = auto).
+        """
+    @property
+    def num_threads(self) -> int:
+        """
+        Current OpenMP thread count setting (0 = auto).
+        """
     @property
     def has_stdp(self) -> bool:
         """

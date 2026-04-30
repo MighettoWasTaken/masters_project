@@ -292,6 +292,11 @@ PYBIND11_MODULE(_core, m) {
         .def_property_readonly("num_synapses", &Network::num_synapses)
         .def_property("fast_math", &Network::fast_math, &Network::set_fast_math,
                       "Use fast polynomial exp (~8 digits) vs full precision. Default: true.")
+        .def("set_num_threads", &Network::set_num_threads,
+             "Set OpenMP thread count for pool-level parallelism (0 = auto).",
+             py::arg("n") = 0)
+        .def_property_readonly("num_threads", &Network::num_threads,
+             "Current OpenMP thread count setting (0 = auto).")
 
         // Neuron access
         .def("neuron", [](Network& net, size_t idx) -> NeuronBase& {
@@ -653,6 +658,72 @@ PYBIND11_MODULE(_core, m) {
         .def("reset", &RegionalNetwork::reset)
         .def("network", py::overload_cast<>(&RegionalNetwork::network),
              py::return_value_policy::reference_internal)
+
+        // Phase 2 thread-group API (task16)
+        .def("set_thread_groups",
+            [](RegionalNetwork& rn,
+               const std::map<int, std::vector<std::string>>& groups) {
+                rn.set_thread_groups(groups);
+            },
+            "Assign populations to thread groups for delay-decomposition parallelism.",
+            py::arg("groups"))
+        .def("clear_thread_groups", &RegionalNetwork::clear_thread_groups,
+             "Remove thread group assignments (returns to serial simulation).")
+        .def("has_thread_groups", &RegionalNetwork::has_thread_groups,
+             "True if thread groups have been assigned.")
+
+        // Phase 2 parallel simulate with full buffer recording; called from Python simulate()
+        .def("_simulate_parallel",
+            [](RegionalNetwork& rn,
+               py::array_t<double, py::array::c_style | py::array::forcecast> I_const_arr,
+               const std::vector<std::tuple<size_t,size_t,size_t,size_t,double>>& pulses,
+               const std::vector<std::tuple<size_t,size_t,size_t,size_t,double>>& dbs_events,
+               double dur, double dt,
+               py::array_t<double> V_buf,
+               py::array_t<double> gate_buf,
+               size_t max_gates,
+               py::array_t<double> calcium_buf,
+               py::array_t<double> u_buf,
+               py::array_t<double> g_syn_buf,
+               py::array_t<double> I_syn_buf,
+               py::array_t<double> spike_event_buf,
+               size_t interval,
+               double spike_threshold) {
+                StimPlan stim;
+                auto ic = I_const_arr.unchecked<1>();
+                stim.I_const.assign(ic.data(0), ic.data(0) + ic.shape(0));
+                for (auto& t : pulses)
+                    stim.pulses.push_back({std::get<0>(t), std::get<1>(t),
+                                           std::get<2>(t), std::get<3>(t), std::get<4>(t)});
+                for (auto& d : dbs_events)
+                    stim.dbs.push_back({std::get<0>(d), std::get<1>(d),
+                                        std::get<2>(d), std::get<3>(d), std::get<4>(d)});
+                size_t n_steps = static_cast<size_t>(dur / dt);
+                size_t n_rec = (n_steps + interval - 1) / interval;
+                rn.simulate_parallel(stim, dur, dt,
+                    V_buf.size()           ? V_buf.mutable_data()           : nullptr,
+                    gate_buf.size()        ? gate_buf.mutable_data()        : nullptr,
+                    max_gates,
+                    calcium_buf.size()     ? calcium_buf.mutable_data()     : nullptr,
+                    u_buf.size()           ? u_buf.mutable_data()           : nullptr,
+                    g_syn_buf.size()       ? g_syn_buf.mutable_data()       : nullptr,
+                    I_syn_buf.size()       ? I_syn_buf.mutable_data()       : nullptr,
+                    spike_event_buf.size() ? spike_event_buf.mutable_data() : nullptr,
+                    n_rec, interval, spike_threshold);
+            },
+            py::arg("I_const"), py::arg("pulses"), py::arg("dbs_events"),
+            py::arg("duration"), py::arg("dt"),
+            py::arg("V_buf"),
+            py::arg("gate_buf"),
+            py::arg("max_gates"),
+            py::arg("calcium_buf"),
+            py::arg("u_buf"),
+            py::arg("g_syn_buf"),
+            py::arg("I_syn_buf"),
+            py::arg("spike_event_buf"),
+            py::arg("interval"),
+            py::arg("spike_threshold") = 0.0)
+
         .def("__repr__", [](const RegionalNetwork& rn) {
             return "<RegionalNetwork populations=" + std::to_string(rn.num_populations()) +
                    " neurons=" + std::to_string(rn.num_neurons()) +

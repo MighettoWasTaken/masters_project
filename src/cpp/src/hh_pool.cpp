@@ -233,6 +233,86 @@ void HHPool::step_rk4(double dt) {
 }
 
 // =============================================================================
+// Per-group subset ops for Phase 2 parallelism (scalar loop over local indices)
+// =============================================================================
+
+void HHPool::gather_currents_subset(const std::vector<size_t>& local_indices,
+                                     const double* I_buf) {
+    for (size_t li : local_indices)
+        I_ext_(li) = I_buf[net_idx_[li]];
+}
+
+void HHPool::scatter_voltages_subset(const std::vector<size_t>& local_indices,
+                                      double* V_buf) const {
+    for (size_t li : local_indices)
+        V_buf[net_idx_[li]] = V_(li);
+}
+
+namespace {
+// Scalar HH rate functions and derivatives — mirrors the vectorized logic.
+inline void hh_scalar_derivs(
+    double V, double m, double h, double n,
+    double Cm, double gNa, double gK, double gL,
+    double ENa, double EK, double EL, double I,
+    double& dV, double& dm, double& dh, double& dn)
+{
+    double Vp40 = V + 40.0;
+    double am = (std::abs(Vp40) < 1e-7)
+                  ? 1.0
+                  : 0.1 * Vp40 / (1.0 - std::exp(-0.1 * Vp40));
+    double bm = 4.0 * std::exp(-(V + 65.0) / 18.0);
+    double ah = 0.07 * std::exp(-0.05 * (V + 65.0));
+    double bh = 1.0 / (1.0 + std::exp(-0.1 * (V + 35.0)));
+    double Vp55 = V + 55.0;
+    double an = (std::abs(Vp55) < 1e-7)
+                  ? 0.1
+                  : 0.01 * Vp55 / (1.0 - std::exp(-0.1 * Vp55));
+    double bn = 0.125 * std::exp(-0.0125 * (V + 65.0));
+
+    dV = (I - gNa*m*m*m*h*(V-ENa) - gK*n*n*n*n*(V-EK) - gL*(V-EL)) / Cm;
+    dm = am*(1.0-m) - bm*m;
+    dh = ah*(1.0-h) - bh*h;
+    dn = an*(1.0-n) - bn*n;
+}
+inline double clamp01(double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
+} // namespace
+
+void HHPool::step_subset(const std::vector<size_t>& local_indices, double dt) {
+    const double dt2 = dt * 0.5;
+    const double dt6 = dt / 6.0;
+
+    for (size_t li : local_indices) {
+        const double Cm  = C_m_(li),  gNa = g_Na_(li), gK = g_K_(li),  gL = g_L_(li);
+        const double ENa = E_Na_(li), EK  = E_K_(li),  EL = E_L_(li),  I  = I_ext_(li);
+
+        double V0 = V_(li), m0 = m_(li), h0 = h_(li), n0 = n_(li);
+        double k1V, k1m, k1h, k1n;
+        hh_scalar_derivs(V0, m0, h0, n0, Cm, gNa, gK, gL, ENa, EK, EL, I,
+                         k1V, k1m, k1h, k1n);
+
+        double k2V, k2m, k2h, k2n;
+        hh_scalar_derivs(V0+dt2*k1V, clamp01(m0+dt2*k1m), clamp01(h0+dt2*k1h), clamp01(n0+dt2*k1n),
+                         Cm, gNa, gK, gL, ENa, EK, EL, I,
+                         k2V, k2m, k2h, k2n);
+
+        double k3V, k3m, k3h, k3n;
+        hh_scalar_derivs(V0+dt2*k2V, clamp01(m0+dt2*k2m), clamp01(h0+dt2*k2h), clamp01(n0+dt2*k2n),
+                         Cm, gNa, gK, gL, ENa, EK, EL, I,
+                         k3V, k3m, k3h, k3n);
+
+        double k4V, k4m, k4h, k4n;
+        hh_scalar_derivs(V0+dt*k3V, clamp01(m0+dt*k3m), clamp01(h0+dt*k3h), clamp01(n0+dt*k3n),
+                         Cm, gNa, gK, gL, ENa, EK, EL, I,
+                         k4V, k4m, k4h, k4n);
+
+        V_(li) = V0 + dt6*(k1V + 2*k2V + 2*k3V + k4V);
+        m_(li) = clamp01(m0 + dt6*(k1m + 2*k2m + 2*k3m + k4m));
+        h_(li) = clamp01(h0 + dt6*(k1h + 2*k2h + 2*k3h + k4h));
+        n_(li) = clamp01(n0 + dt6*(k1n + 2*k2n + 2*k3n + k4n));
+    }
+}
+
+// =============================================================================
 // Sync back to polymorphic API objects
 // =============================================================================
 

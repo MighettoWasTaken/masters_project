@@ -37,6 +37,11 @@ def make_rnet(pop_sizes: dict, neuron_type="HH"):
     return rn
 
 
+@pytest.fixture(params=[False, True], ids=["serial", "phase2"])
+def use_parallel(request):
+    return request.param
+
+
 # ---------------------------------------------------------------------------
 # Construction and parameter access
 # ---------------------------------------------------------------------------
@@ -302,7 +307,7 @@ def test_detach_nonexistent_does_not_raise():
 # Stimulation applied to correct neurons
 # ---------------------------------------------------------------------------
 
-def test_stimulated_population_receives_current():
+def test_stimulated_population_receives_current(use_parallel):
     """
     STN gets DBS; GPe does not. STN neurons should be more depolarised.
     We compare the mean voltage of STN vs GPe after a short high-amplitude stim.
@@ -310,6 +315,8 @@ def test_stimulated_population_receives_current():
     rn = make_rnet({"STN": 4, "GPe": 4})
     dbs = DBSStimulator(frequency=130.0, amplitude=50.0, pulse_width=0.06)
     rn.attach_stimulator("STN", dbs)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["STN"], "g1": ["GPe"]})
     traces = rn.simulate(50.0, DT, {})
     # Mean voltage over time for each population
     stn_mean = traces["STN"].mean()
@@ -319,17 +326,21 @@ def test_stimulated_population_receives_current():
     )
 
 
-def test_unstimulated_neurons_unaffected_by_dbs():
+def test_unstimulated_neurons_unaffected_by_dbs(use_parallel):
     """
     With NO synapses, GPe neurons are unaffected by DBS on STN.
     Their traces must be identical to the no-DBS baseline.
     """
     rn_base = make_rnet({"STN": 2, "GPe": 2})
+    if use_parallel:
+        rn_base.set_thread_groups({"g0": ["STN"], "g1": ["GPe"]})
     traces_base = rn_base.simulate(20.0, DT, {})
 
     rn_dbs = make_rnet({"STN": 2, "GPe": 2})
     dbs = DBSStimulator(frequency=130.0, amplitude=300.0, pulse_width=0.06)
     rn_dbs.attach_stimulator("STN", dbs)
+    if use_parallel:
+        rn_dbs.set_thread_groups({"g0": ["STN"], "g1": ["GPe"]})
     traces_dbs = rn_dbs.simulate(20.0, DT, {})
 
     np.testing.assert_allclose(
@@ -338,14 +349,18 @@ def test_unstimulated_neurons_unaffected_by_dbs():
     )
 
 
-def test_dbs_does_affect_stimulated_population():
+def test_dbs_does_affect_stimulated_population(use_parallel):
     """Stimulated STN traces must differ from no-DBS baseline."""
     rn_base = make_rnet({"STN": 2})
+    if use_parallel:
+        rn_base.set_thread_groups({"g0": ["STN"]})
     traces_base = rn_base.simulate(50.0, DT, {})
 
     rn_dbs = make_rnet({"STN": 2})
     dbs = DBSStimulator(frequency=130.0, amplitude=300.0, pulse_width=0.06)
     rn_dbs.attach_stimulator("STN", dbs)
+    if use_parallel:
+        rn_dbs.set_thread_groups({"g0": ["STN"]})
     traces_dbs = rn_dbs.simulate(50.0, DT, {})
 
     assert not np.allclose(traces_base["STN"], traces_dbs["STN"]), (
@@ -353,7 +368,7 @@ def test_dbs_does_affect_stimulated_population():
     )
 
 
-def test_all_neurons_in_population_receive_same_dbs():
+def test_all_neurons_in_population_receive_same_dbs(use_parallel):
     """
     DBS is broadcast to ALL neurons in the target population uniformly.
     Starting from identical initial conditions (no synapses), all neurons
@@ -364,6 +379,8 @@ def test_all_neurons_in_population_receive_same_dbs():
     rn = make_rnet({"STN": 5})
     dbs = DBSStimulator(frequency=100.0, amplitude=200.0, pulse_width=0.1)
     rn.attach_stimulator("STN", dbs)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["STN"]})
     traces = rn.simulate(100.0, DT, {})
     stn = traces["STN"]  # shape (5, num_steps)
     for i in range(1, 5):
@@ -440,19 +457,21 @@ def test_option1_generate_trace_in_simulate():
 # Integration: DBS on STN neuron model
 # ---------------------------------------------------------------------------
 
-def test_dbs_on_composable_stn_neurons():
+def test_dbs_on_composable_stn_neurons(use_parallel):
     """DBS 130 Hz on STN (composable) should not crash and should affect voltage."""
     rn = RegionalNetwork()
     rn.add_population("STN", 4, model=make_stn())
     dbs = DBSStimulator(frequency=130.0, amplitude=300.0, pulse_width=0.06)
     rn.attach_stimulator("STN", dbs)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["STN"]})
     traces = rn.simulate(100.0, DT, {})
     assert "STN" in traces
     assert traces["STN"].shape == (4, int(100.0 / DT))
     assert not np.any(np.isnan(traces["STN"])), "NaN in STN traces"
 
 
-def test_dbs_drives_firing_in_silent_neurons():
+def test_dbs_drives_firing_in_silent_neurons(use_parallel):
     """
     HH neurons are silent at rest (no external input → 0 spikes).
     High-amplitude DBS should evoke multiple spikes.
@@ -464,12 +483,16 @@ def test_dbs_drives_firing_in_silent_neurons():
 
     # Baseline: no input → silence
     rn_base = make_rnet({"A": 2})
+    if use_parallel:
+        rn_base.set_thread_groups({"g0": ["A"]})
     traces_base = rn_base.simulate(duration, dt, {})
 
     # With DBS: 130 Hz, 100 µA/cm², 0.5 ms wide pulses
     rn_dbs = make_rnet({"A": 2})
     dbs = DBSStimulator(frequency=130.0, amplitude=100.0, pulse_width=0.5)
     rn_dbs.attach_stimulator("A", dbs)
+    if use_parallel:
+        rn_dbs.set_thread_groups({"g0": ["A"]})
     traces_dbs = rn_dbs.simulate(duration, dt, {})
 
     def count_crossings(trace_row):
@@ -488,7 +511,7 @@ def test_dbs_drives_firing_in_silent_neurons():
 # Multi-population: only targeted population is stimulated
 # ---------------------------------------------------------------------------
 
-def test_multi_population_only_target_stimulated():
+def test_multi_population_only_target_stimulated(use_parallel):
     """
     In a 3-population network with no synapses, attaching DBS only to one
     population must leave the other two populations' traces unchanged.
@@ -499,6 +522,8 @@ def test_multi_population_only_target_stimulated():
         rn.add_population("STN",  3, neuron_type="HH")
         rn.add_population("GPe",  4, neuron_type="HH")
         rn.add_population("Thal", 2, neuron_type="HH")
+        if use_parallel:
+            rn.set_thread_groups({"g0": ["STN"], "g1": ["GPe"], "g2": ["Thal"]})
 
     dbs = DBSStimulator(frequency=130.0, amplitude=200.0, pulse_width=0.06)
     rn_dbs.attach_stimulator("STN", dbs)
@@ -528,10 +553,12 @@ def test_multi_population_only_target_stimulated():
     (200.0, 500.0, 0.06),
     (0.0,   999.0, 0.5),   # off
 ])
-def test_no_nan_inf_in_trace(freq, amp, pw):
+def test_no_nan_inf_in_trace(freq, amp, pw, use_parallel):
     dbs = DBSStimulator(frequency=freq, amplitude=amp, pulse_width=pw)
     rn = make_rnet({"A": 2})
     rn.attach_stimulator("A", dbs)
+    if use_parallel:
+        rn.set_thread_groups({"g0": ["A"]})
     traces = rn.simulate(100.0, DT, {})
     assert not np.any(np.isnan(traces["A"])), f"NaN with freq={freq} amp={amp} pw={pw}"
     assert not np.any(np.isinf(traces["A"])), f"Inf with freq={freq} amp={amp} pw={pw}"

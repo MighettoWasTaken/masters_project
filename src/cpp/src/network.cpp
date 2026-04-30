@@ -4,6 +4,13 @@
 #include <cmath>
 #include <algorithm>
 #include <numeric>
+#include <atomic>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#ifdef HH_USE_OPENMP
+#  include <omp.h>
+#endif
 
 namespace hodgkin_huxley {
 
@@ -364,6 +371,18 @@ void Network::cache_voltages() {
     for (size_t i = 0; i < neurons_.size(); ++i) {
         V_cache_[i] = neurons_[i]->membrane_potential();
     }
+}
+
+// =============================================================================
+// Thread control
+// =============================================================================
+
+void Network::set_num_threads(int n) {
+    num_threads_ = n;
+    pool_mgr_.set_num_threads(n);
+#ifdef HH_USE_OPENMP
+    if (n > 0) omp_set_num_threads(n);
+#endif
 }
 
 // =============================================================================
@@ -1033,6 +1052,422 @@ void Network::simulate_with_descriptors(
                 if (spike_detected_[j]) syn_spike_accum[sa_.post[j]] += 1.0;
         }
     }
+
+    pool_mgr_.sync_all_to_neurons(neurons_);
+}
+
+// =============================================================================
+// Phase 2 delay-decomposition parallel simulation
+//
+// Each thread group owns a disjoint set of neurons and their pre-synapses.
+// Cross-group communication happens only through the existing per-synapse delay
+// ring buffers (sa_.spike_buf) which are already partitioned by pre-neuron.
+//
+// Synchronisation: std::atomic<size_t> step_done[gid] — incremented (with
+// release ordering) after each step. Group B at step t waits for each source
+// group A to reach step_done[A] >= t (acquire) before reading g[k] for
+// inter-group A→B synapses (those values were written during A's step t-1).
+//
+// Note: STDP / STP weight updates are skipped in this path (they require a
+// network-wide barrier each step). Support can be added in a follow-on once
+// a per-step barrier primitive is introduced (see task16.md §16.2 for the
+// SpikeTransport abstraction that will generalise this to CUDA P2P in task17).
+// =============================================================================
+
+void Network::simulate_with_descriptors_parallel(
+    double duration, double dt,
+    const StimPlan& stim,
+    const std::map<int, std::vector<size_t>>& group_neurons,
+    const std::map<int, std::vector<std::string>>& group_pools,
+    double* V_buf,
+    double* gate_buf,        size_t max_gates,
+    double* calcium_buf,
+    double* u_buf,
+    double* g_syn_buf,
+    double* I_syn_buf,
+    double* spike_event_buf,
+    size_t  interval,
+    size_t  n_rec,
+    double  spike_threshold
+) {
+    spike_threshold_ = spike_threshold;
+    const size_t num_steps = static_cast<size_t>(duration / dt);
+    const size_t n_neurons = neurons_.size();
+
+    if (stim.I_const.size() != n_neurons)
+        throw std::invalid_argument("StimPlan::I_const size must match number of neurons");
+
+    // --- Pre-simulate preparation (same as serial path) ---
+    sort_synapses_by_pre();
+    build_synapse_groups();
+    if (pools_dirty_) {
+        pool_mgr_.build_from_neurons(neurons_, fast_math_);
+        pools_dirty_ = false;
+    }
+    ensure_buffers();
+    update_decay_factors(dt);   // once on main thread — dt is constant for this run
+
+    // --- Build GroupDef structs ---
+    // Map neuron global index → group id
+    std::unordered_map<size_t, int> neuron_gid;
+    for (const auto& kv : group_neurons)
+        for (size_t ni : kv.second)
+            neuron_gid[ni] = kv.first;
+
+    const size_t n_groups = group_neurons.size();
+    std::vector<GroupDef> groups(n_groups);
+
+    for (const auto& kv : group_neurons) {
+        int gid = kv.first;
+        GroupDef& g = groups[gid];
+        g.id = gid;
+        g.neuron_indices = kv.second;
+        auto pit = group_pools.find(gid);
+        if (pit != group_pools.end()) g.pool_names = pit->second;
+    }
+
+    // Partition synapse type lists by pre-neuron group
+    auto assign_pre = [&](const std::vector<size_t>& src, std::vector<size_t> GroupDef::* member) {
+        for (size_t k : src) {
+            auto it = neuron_gid.find(sa_.pre[k]);
+            if (it != neuron_gid.end())
+                (groups[it->second].*member).push_back(k);
+        }
+    };
+    assign_pre(syn_groups_.exp_decay,      &GroupDef::pre_exp_decay);
+    assign_pre(syn_groups_.alpha_func,     &GroupDef::pre_alpha_func);
+    assign_pre(syn_groups_.double_exp,     &GroupDef::pre_double_exp);
+    assign_pre(syn_groups_.voltage_gated,  &GroupDef::pre_voltage_gated);
+
+    // Build pre_all (union of all pre-synapse type lists) for spike detection Phase 1
+    for (size_t k = 0; k < sa_.size(); ++k) {
+        auto it = neuron_gid.find(sa_.pre[k]);
+        if (it != neuron_gid.end())
+            groups[it->second].pre_all.push_back(k);
+    }
+
+    // Build post_syn (synapse indices where post[k] in this group) — I_syn accumulation
+    for (size_t k = 0; k < sa_.size(); ++k) {
+        auto it = neuron_gid.find(sa_.post[k]);
+        if (it != neuron_gid.end())
+            groups[it->second].post_syn.push_back(k);
+    }
+
+    // Build src_group_ids for each group
+    for (auto& g : groups) {
+        std::unordered_set<int> srcs;
+        for (size_t k : g.post_syn) {
+            auto it = neuron_gid.find(sa_.pre[k]);
+            if (it != neuron_gid.end() && it->second != g.id)
+                srcs.insert(it->second);
+        }
+        g.src_group_ids.assign(srcs.begin(), srcs.end());
+    }
+
+    // Build consumer_group_ids (groups that read this group's g[k] values)
+    // Inverse of src_group_ids: if B has A in src_group_ids, then A has B in consumer_group_ids
+    for (int b = 0; b < (int)n_groups; ++b)
+        for (int src : groups[b].src_group_ids)
+            groups[src].consumer_group_ids.push_back(b);
+
+    // Build intra_syn: synapses where both pre and post are in the same group
+    for (size_t k = 0; k < sa_.size(); ++k) {
+        auto pre_it  = neuron_gid.find(sa_.pre[k]);
+        auto post_it = neuron_gid.find(sa_.post[k]);
+        if (pre_it != neuron_gid.end() && post_it != neuron_gid.end()
+                && pre_it->second == post_it->second)
+            groups[pre_it->second].intra_syn.push_back(k);
+    }
+
+    // Fill hh_local_indices / iz_local_indices for each group
+    for (auto& g : groups)
+        pool_mgr_.fill_group_hh_iz_indices(g.neuron_indices,
+                                            g.hh_local_indices,
+                                            g.iz_local_indices);
+
+    // --- Initial V_cache scatter (t=0 needs pre-existing pool state) ---
+    pool_mgr_.scatter_all_voltages(V_cache_.data());
+
+    const bool has_gmod = pool_mgr_.has_synapse_g_mods();
+
+    // Two-counter synchronization to prevent write-after-read race on g[k]:
+    //   step_done[A]: incremented after A's Phase U2 (full step t complete).
+    //     B waits for step_done[A] >= t before reading g[k] in Phase A of step t.
+    //   read_done[B]: incremented after B's Phase A (done reading g[k]).
+    //     A waits for read_done[B] >= t+1 before writing g[k] in Phase U2 of step t.
+    std::vector<std::atomic<size_t>> step_done(n_groups);
+    for (auto& s : step_done) s.store(0, std::memory_order_relaxed);
+    std::vector<std::atomic<size_t>> read_done(n_groups);
+    for (auto& s : read_done) s.store(0, std::memory_order_relaxed);
+
+    // Local aliases for hot-loop access (avoids repeated member dereference)
+    double* const V_cache      = V_cache_.data();
+    double* const I_buf        = I_syn_buffer_.data();
+    double* const gscale       = synapse_g_scale_.data();
+    const double* const I_const = stim.I_const.data();
+    const size_t* const pre_arr  = sa_.pre.data();
+    const size_t* const post_arr = sa_.post.data();
+    const double* const E_arr    = sa_.E_syn.data();
+    double* const g_arr          = sa_.g.data();
+
+    // --- Launch one std::thread per group ---
+    std::vector<std::thread> threads;
+    threads.reserve(n_groups);
+
+    for (int gid = 0; gid < static_cast<int>(n_groups); ++gid) {
+        threads.emplace_back([&, gid]() {
+            const GroupDef& grp = groups[gid];
+
+            // Thread-local per-step stimulus cache (for I_syn = I_total - I_stim)
+            std::vector<double> grp_I_stim_cache(n_neurons, 0.0);
+            // Thread-local spike-event accumulator (intra-group only)
+            std::vector<double> grp_spike_accum(n_neurons, 0.0);
+
+            for (size_t t = 0; t < num_steps; ++t) {
+
+                // Phase W: wait for source groups to complete step t-1
+                // (ensures g[k] for inter-group synapses is from step t-1)
+                for (int src : grp.src_group_ids) {
+                    while (step_done[src].load(std::memory_order_acquire) < t)
+                        std::this_thread::yield();
+                }
+
+                // Phase R: record (from previous step's scatter / accumulation)
+                if (t % interval == 0) {
+                    size_t tr = t / interval;
+
+                    if (V_buf)
+                        for (size_t i : grp.neuron_indices)
+                            V_buf[i * n_rec + tr] = V_cache[i];
+
+                    if (gate_buf && max_gates > 0)
+                        pool_mgr_.scatter_gates_for_names(
+                            grp.pool_names, gate_buf, max_gates, n_rec, tr);
+
+                    if (calcium_buf)
+                        pool_mgr_.scatter_calcium_for_names(
+                            grp.pool_names, calcium_buf, n_rec, tr);
+
+                    if (u_buf)
+                        pool_mgr_.scatter_recoveries_for_iz(
+                            grp.iz_local_indices, u_buf, n_rec, tr);
+
+                    if (g_syn_buf)
+                        for (size_t k : grp.post_syn)
+                            g_syn_buf[k * n_rec + tr] = g_arr[k];
+
+                    if (spike_event_buf) {
+                        for (size_t i : grp.neuron_indices) {
+                            spike_event_buf[i * n_rec + tr] = grp_spike_accum[i];
+                            grp_spike_accum[i] = 0.0;
+                        }
+                    }
+                }
+
+                // Phase I: seed I_syn from compact descriptors for own neurons
+                for (size_t i : grp.neuron_indices)
+                    I_buf[i] = grp_I_stim_cache[i] = I_const[i];
+
+                for (const auto& p : stim.pulses) {
+                    if (t >= p.onset_step && t < p.end_step) {
+                        for (size_t i : grp.neuron_indices)
+                            if (i >= p.neuron_start && i < p.neuron_end) {
+                                I_buf[i] += p.amplitude;
+                                grp_I_stim_cache[i] += p.amplitude;
+                            }
+                    }
+                }
+                for (const auto& d : stim.dbs) {
+                    if (d.isi_steps == 0) continue;
+                    if (t % d.isi_steps < d.pw_steps) {
+                        for (size_t i : grp.neuron_indices)
+                            if (i >= d.neuron_start && i < d.neuron_end) {
+                                I_buf[i] += d.amplitude;
+                                grp_I_stim_cache[i] += d.amplitude;
+                            }
+                    }
+                }
+
+                // Phase A: I_syn accumulation — post_syn: post[k] in this group
+                // g[k] for inter-group synapses is from src group's step t-1 (wait above)
+                if (has_gmod) {
+                    for (size_t k : grp.post_syn)
+                        I_buf[post_arr[k]] += g_arr[k] * gscale[post_arr[k]]
+                                            * (E_arr[k] - V_cache[post_arr[k]]);
+                } else {
+                    for (size_t k : grp.post_syn)
+                        I_buf[post_arr[k]] += g_arr[k] * (E_arr[k] - V_cache[post_arr[k]]);
+                }
+                // Signal: done reading inter-group g[k] values for step t
+                read_done[gid].fetch_add(1, std::memory_order_release);
+
+                // Record I_syn = synaptic current (total minus external stimulus)
+                if (I_syn_buf && t % interval == 0) {
+                    size_t tr = t / interval;
+                    for (size_t i : grp.neuron_indices)
+                        I_syn_buf[i * n_rec + tr] = I_buf[i] - grp_I_stim_cache[i];
+                }
+
+                // Phase G: gather currents for all pools in this group
+                pool_mgr_.gather_currents_for_names(grp.pool_names, I_buf);
+                pool_mgr_.gather_currents_for_hh(grp.hh_local_indices, I_buf);
+                pool_mgr_.gather_currents_for_iz(grp.iz_local_indices, I_buf);
+
+                // Phase S: step all pools in this group
+                pool_mgr_.step_for_names(grp.pool_names, dt);
+                pool_mgr_.step_for_hh(grp.hh_local_indices, dt);
+                pool_mgr_.step_for_iz(grp.iz_local_indices, dt);
+
+                if (has_gmod) {
+                    for (size_t i : grp.neuron_indices) gscale[i] = 1.0;
+                    pool_mgr_.scatter_synapse_g_scale_for_names(grp.pool_names, gscale);
+                }
+
+                // Phase V: scatter voltages for all pools in this group → V_cache
+                pool_mgr_.scatter_voltages_for_names(grp.pool_names, V_cache);
+                pool_mgr_.scatter_voltages_for_hh(grp.hh_local_indices, V_cache);
+                pool_mgr_.scatter_voltages_for_iz(grp.iz_local_indices, V_cache);
+
+                // Phase U1: spike detection for own pre-synapses
+                for (size_t k : grp.pre_all) {
+                    double Vpre = V_cache[pre_arr[k]];
+                    bool spiked = (Vpre > spike_threshold_) && (sa_.V_pre_prev[k] <= spike_threshold_);
+                    sa_.V_pre_prev[k] = Vpre;
+
+                    if (sa_.delay[k] > 0.0) {
+                        if (!sa_.delay_init[k]) {
+                            size_t steps = static_cast<size_t>(std::round(sa_.delay[k] / dt));
+                            if (steps > 0) {
+                                sa_.spike_buf[k].assign(steps, false);
+                                sa_.buf_head[k] = 0;
+                                sa_.delay_init[k] = true;
+                            }
+                        }
+                        if (sa_.delay_init[k]) {
+                            bool delayed = sa_.spike_buf[k][sa_.buf_head[k]];
+                            sa_.spike_buf[k][sa_.buf_head[k]] = spiked;
+                            sa_.buf_head[k] = (sa_.buf_head[k] + 1) % sa_.spike_buf[k].size();
+                            spiked = delayed;
+                        }
+                    }
+                    spike_detected_[k] = spiked ? 1 : 0;
+                }
+
+                // Spike-event accumulation: count intra-group spike arrivals
+                // (inter-group spikes omitted — spike_detected_ from other groups
+                //  is not safe to read without additional synchronization)
+                if (spike_event_buf) {
+                    for (size_t k : grp.intra_syn)
+                        if (spike_detected_[k]) grp_spike_accum[post_arr[k]] += 1.0;
+                }
+
+                // Phase W2: wait until all consumer groups have finished reading g[k]
+                // (read_done[consumer] >= t+1) before overwriting g[k] in Phase U2
+                for (int cid : grp.consumer_group_ids) {
+                    while (read_done[cid].load(std::memory_order_acquire) < t + 1)
+                        std::this_thread::yield();
+                }
+
+                // Phase U2a: EXP_DECAY
+                for (size_t k : grp.pre_exp_decay) {
+                    if (spike_detected_[k]) sa_.S[k] += sa_.delta_S[k];
+                    sa_.S[k] *= sa_.decay_S[k];
+                    if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
+                    const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                    sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+                }
+
+                // Phase U2b: ALPHA_FUNC
+                for (size_t k : grp.pre_alpha_func) {
+                    if (spike_detected_[k]) sa_.A[k] += sa_.delta_A[k];
+                    double inv = sa_.inv_tau_A[k];
+                    double dS  = (sa_.A[k] - sa_.S[k]) * inv;
+                    double dA  = -sa_.A[k] * inv;
+                    sa_.S[k] += dt * dS;
+                    sa_.A[k] += dt * dA;
+                    if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
+                    const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                    sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+                }
+
+                // Phase U2c: DOUBLE_EXP
+                for (size_t k : grp.pre_double_exp) {
+                    if (spike_detected_[k]) {
+                        sa_.S[k] += sa_.delta_S[k];
+                        sa_.A[k] += sa_.delta_A[k];
+                    }
+                    sa_.S[k] *= sa_.decay_S[k];
+                    sa_.A[k] *= sa_.decay_A[k];
+                    double g_eff = sa_.norm[k] * (sa_.S[k] - sa_.A[k]);
+                    if (g_eff < 0.0) g_eff = 0.0;
+                    const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                    sa_.g[k] = spec.g * sa_.weight[k] * g_eff;
+                }
+
+                // Phase U2d: VOLTAGE_GATED (TANH_GATE, BOLTZMANN_GATE, ALPHA_BETA, CUSTOM_EXPR)
+                using UF = SynapseSpec::UpdateForm;
+                using CF = SynapseSpec::CurrentForm;
+                for (size_t k : grp.pre_voltage_gated) {
+                    double Vpre  = V_cache[pre_arr[k]];
+                    double Vpost = V_cache[post_arr[k]];
+                    const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                    double S = sa_.S[k];
+
+                    if (spec.update_form == UF::TANH_GATE) {
+                        double rate_open = spec.tanh_amp
+                                           * (1.0 + std::tanh((Vpre - spec.tanh_vh) / spec.tanh_k));
+                        double rate = rate_open + 1.0 / spec.tau_decay;
+                        double S_inf = rate_open / rate;
+                        S = S_inf + (S - S_inf) * std::exp(-dt * rate);
+                    } else if (spec.update_form == UF::BOLTZMANN_GATE) {
+                        double S_inf = boltzmann_scalar(Vpre, spec.s_inf);
+                        double tau_s = compute_tau_scalar(Vpre, spec.tau);
+                        if (tau_s < 1e-10) tau_s = 1e-10;
+                        S = S_inf + (S - S_inf) * std::exp(-dt / tau_s);
+                    } else if (spec.update_form == UF::ALPHA_BETA) {
+                        double a = compute_rate_scalar(Vpre, spec.alpha);
+                        double b = compute_rate_scalar(Vpre, spec.beta);
+                        double rate = a + b;
+                        double S_inf = (rate > 1e-10) ? a / rate : S;
+                        S = S_inf + (S - S_inf) * std::exp(-dt * rate);
+                    } else if (spec.update_form == UF::CUSTOM_EXPR) {
+                        if (!spec.dS_dt_vm.empty()) {
+                            if (!spec.dA_dt_vm.empty()) {
+                                double A_k = sa_.A[k];
+                                double dS = vm_eval_scalar_3arg(spec.dS_dt_vm, Vpre, S, A_k);
+                                double dA = vm_eval_scalar_3arg(spec.dA_dt_vm, Vpre, S, A_k);
+                                S = std::max(0.0, std::min(1.0, S + dt * dS));
+                                sa_.A[k] = A_k + dt * dA;
+                            } else {
+                                double dS = vm_eval_scalar_2arg(spec.dS_dt_vm, Vpre, S);
+                                S = std::max(0.0, std::min(1.0, S + dt * dS));
+                            }
+                        }
+                    }
+                    sa_.S[k] = S;
+
+                    if (spec.current_form == CF::CUSTOM_EXPR && !spec.current_vm.empty()) {
+                        sa_.g[k] = vm_eval_scalar_3arg(spec.current_vm, Vpost, S, sa_.A[k])
+                                   * sa_.weight[k];
+                    } else {
+                        double gS = spec.g * sa_.weight[k];
+                        for (int p = 0; p < spec.power; ++p) gS *= S;
+                        if (spec.current_form == CF::MG_BLOCK) {
+                            double mg = 1.0 + spec.mg_conc
+                                             * std::exp(-spec.mg_scale * Vpost) / spec.mg_denom;
+                            gS /= mg;
+                        }
+                        sa_.g[k] = gS;
+                    }
+                }
+
+                // Phase D: signal this step complete
+                step_done[gid].fetch_add(1, std::memory_order_release);
+            }
+        }); // end thread lambda
+    }
+
+    for (auto& thr : threads) thr.join();
 
     pool_mgr_.sync_all_to_neurons(neurons_);
 }

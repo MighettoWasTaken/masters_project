@@ -110,6 +110,26 @@ public:
     // Called by Python add_intracellular() after appending an IntracellularSpec.
     void update_population_spec(const std::string& name, const NeuronModelSpec& spec);
 
+    // --- Phase 2: thread-group API ---
+    // groups: group_id → list of population names; each inter-group synapse must have delay >= dt.
+    void set_thread_groups(const std::map<int, std::vector<std::string>>& groups);
+    void clear_thread_groups();
+    bool has_thread_groups() const { return !group_populations_.empty(); }
+
+    // Run a parallel simulation using stored thread groups with full buffer recording.
+    // All buffer pointers may be nullptr to skip recording that metric.
+    // spike_event_buf only counts intra-group spike arrivals (inter-group omitted).
+    void simulate_parallel(const StimPlan& stim, double duration, double dt,
+                           double* V_buf,
+                           double* gate_buf,        size_t max_gates,
+                           double* calcium_buf,
+                           double* u_buf,
+                           double* g_syn_buf,
+                           double* I_syn_buf,
+                           double* spike_event_buf,
+                           size_t n_rec, size_t interval,
+                           double spike_threshold = 0.0);
+
     // Delegation
     size_t num_neurons() const;
     size_t num_synapses() const;
@@ -124,6 +144,9 @@ private:
     std::vector<Population> populations_;
     std::map<std::string, size_t> pop_index_;
     std::map<std::string, NeuronModelSpec> pop_specs_;  // per-population stored spec (task14)
+
+    // Phase 2 thread groups: group_id → list of population names
+    std::map<int, std::vector<std::string>> group_populations_;
 
     void validate_population(const std::string& name) const;
     void generate_connections(const Population& src, const Population& dst,
