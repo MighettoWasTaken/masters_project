@@ -1,38 +1,98 @@
 # Task 17: CUDA GPU Acceleration
 
-## Priority: 3 — Depends on task16 (PoolBase interface), task13 (CUDAPrinter)
+## Priority: 3 — Depends on task13 (CUDAPrinter for SymPy → `__device__`)
 
-## Overview
-
-Add an optional CUDA backend for GPU-accelerated simulation of large networks (>1000 neurons). The CPU path (Eigen pools + SoA synapses) remains the default; CUDA activates only when explicitly requested or when the network exceeds a configurable threshold. The primary bottleneck at scale is the neuron pool `step()` function and synaptic current accumulation; these are the first targets for GPU offload.
-
-The CUDAPrinter from task13 generates `__device__` functions from user-defined SymPy expressions, so custom neuron equations work on GPU without any additional user action.
-
-Expected speedup: 50–200× vs C++ CPU for networks >5000 neurons.
+## Status: Not started
 
 ---
 
-## 17.1 Architecture
+## Overview
 
-### Build Configuration
+Add an optional CUDA backend for GPU-accelerated simulation of large networks.
+The CPU path (Eigen pools + SoA synapses) remains the default and is never
+affected by this task.  CUDA activates **only when explicitly requested** by the
+user — no automatic threshold, no silent fallback.
 
-```cmake
-option(USE_CUDA "Enable CUDA GPU backend" OFF)
-if(USE_CUDA)
-    enable_language(CUDA)
-    find_package(CUDAToolkit REQUIRED)
-    target_compile_definitions(hodgkin_huxley_core PRIVATE HH_USE_CUDA)
-endif()
+Target scale: the fruit fly connectome (~135K neurons, ~50M synapses) on a
+single consumer 24 GB GPU, with a clear path to multi-GPU for larger models
+via the delay-decomposition abstraction already established in task16.
+
+Expected speedup at scale: 50–200× vs C++ CPU for networks >5 000 neurons.
+
+> **Environment note:** conda is required for CUDA work — the CUDA toolkit,
+> cuDNN, and NCCL are not pip/UV-installable.  Always build with the `rebuild`
+> conda env active (`conda install -c nvidia cuda-toolkit cudnn`).  The UV
+> `.venv` is for pure-Python testing on non-GPU machines only.
+
+---
+
+## 17.1 Design Constraints and Resolutions
+
+These constraints were established before implementation to avoid expensive
+redesigns later.
+
+### C1 — Step-to-step dependency ("GPU bubbling")
+
+Each time step depends on the previous; parallelism is **within** a step (all N
+neurons simultaneously), not across steps.  This is not a problem: at N ≥ ~500
+neurons a single step saturates a modern GPU.  Below that threshold GPU overhead
+exceeds any gain — the GPU path should be disabled (or warn) for small networks.
+The sequential structure of the time loop is unchanged; only what executes inside
+each step changes.
+
+### C2 — Izhikevich voltage resets and other conditionals
+
+`if (v >= 30) { v = c; u += d; }` causes warp divergence in naive CUDA.
+Resolution: replace with predicated assignment — identical to the Eigen `select`
+pattern already in `IzPool`:
+
+```cuda
+bool fired = v[i] >= 30.0;
+v[i] = fired ? c : v[i];
+u[i] = fired ? u[i] + d : u[i];
 ```
 
-> **Environment note:** conda is the required environment manager for CUDA work — cuDNN, NCCL, and CUDA toolkit packages are not pip/UV installable and must be managed via conda (`conda install -c nvidia cuda-toolkit cudnn`). The project `.venv` (UV-managed) is for pure-Python testing on other machines only; it cannot support the CUDA build. Always build with the `rebuild` conda env active.
+This compiles to `SETP` + `SEL` — one predicated execution path, no true
+divergence, one extra instruction per thread.  All other conditionals in the
+simulation (spike detection, synapse gating) follow the same pattern.
 
-### Device Model
+### C3 — Recording without CPU↔GPU round-trips
 
-Devices are first-class objects following PyTorch conventions. The `Device` struct is the canonical way to specify compute targets; `Backend` is kept as a legacy alias.
+Recording cannot accumulate full traces in VRAM (see §17.5 for the VRAM budget
+— a 135K-neuron 1 s simulation at dt=0.01 ms would need 108 GB for V alone).
+
+**Required strategy: async streaming to pinned host memory.**  Every
+`record_interval` steps, the simulation kernel writes a slice into a small
+on-device staging buffer; a secondary CUDA stream fires a `cudaMemcpyAsync` to
+pinned host memory concurrently with the next compute batch.  Double-buffering
+the staging buffer eliminates any synchronization stall.
+
+This is the **only** recording path for the GPU backend.  VRAM usage for
+recording is bounded at `2 × N × record_interval × 8` bytes regardless of
+simulation length.
+
+### C4 — VRAM minimization / no CPU↔GPU round-trips during the hot loop
+
+All simulation state must be in VRAM for the entire loop.  Data that crosses the
+PCIe bus mid-loop kills throughput.
+
+Rules:
+- Upload all neuron/synapse state **once** before the loop starts.
+- Free all setup temporaries (unsorted weight lists, index maps used to build
+  CSR) **immediately after** the on-device CSR structure is built.
+- Spike delay buffers live **on device** as ring buffers (see §17.6); no
+  per-step spike vector upload from CPU.
+- The only intentional PCIe traffic during the loop is the async recording
+  stream — and it runs on a separate CUDA stream so it never stalls compute.
+
+---
+
+## 17.2 Device Model
+
+Devices are first-class objects following PyTorch conventions.
 
 ```cpp
-// device.hpp — used by task17 (single-GPU) and task19 (multi-GPU)
+// src/cpp/include/hodgkin_huxley/device.hpp
 struct Device {
     enum class Type { CPU, CUDA };
     Type type  = Type::CPU;
@@ -44,69 +104,127 @@ struct Device {
     std::string str() const;   // "cpu", "cuda:0", "cuda:1", ...
 };
 
-// Global device utilities
-int  device_count();                   // number of available CUDA devices
-bool is_available(Device::Type type);  // is any CUDA device present?
-
-// Network device assignment
-void   Network::to(Device d);
-Device Network::device() const;
-
-// Legacy compatibility (maps to .to() internally)
-enum class Backend { CPU, CUDA };
-void    Network::set_backend(Backend b);
-Backend Network::backend() const;
-
-static constexpr size_t CUDA_AUTO_THRESHOLD = 1000;
+int  cuda_device_count();          // 0 if CUDA unavailable / not built
+bool cuda_is_available();          // true iff at least one CUDA device present
 ```
 
-### PoolBase Interface
-
-Introduced in task16 (OpenMP refactor), `PoolBase` is the virtual interface that CPU and CUDA pools both implement:
-
 ```cpp
-class PoolBase {
-public:
-    virtual ~PoolBase() = default;
-    virtual void step(double dt,
-                      const double* I_ext,
-                      const double* I_syn,
-                      size_t n) = 0;
-    virtual void get_V(double* out) const = 0;
-    virtual void reset() = 0;
-};
+// On RegionalNetwork / Network
+void   to(Device d);               // move to device; raises if !cuda_is_available()
+Device device() const;             // current device
 ```
 
 ---
 
-## 17.2 CUDA Kernels
+## 17.3 Python API
 
-### Neuron Pool Kernel (one thread per neuron)
+```python
+import hodgkin_huxley as hh
+
+# --- Device query (PyTorch-style) ---
+hh.cuda.is_available()       # bool — standard guard for CUDA-conditional code
+hh.cuda.device_count()       # int
+hh.cuda.get_device_name(0)   # str — "NVIDIA RTX 4090" etc.
+
+# --- Device objects ---
+dev_gpu  = hh.device("cuda")     # default GPU (index 0)
+dev_gpu0 = hh.device("cuda:0")   # explicit index
+dev_cpu  = hh.device("cpu")
+
+# --- Assign network to device (user-explicit, never automatic) ---
+rn = hh.RegionalNetwork()
+# ... build network ...
+if hh.cuda.is_available():
+    rn.to(hh.device("cuda:0"))
+
+# Device is retained for the lifetime of the object
+print(rn.device())               # hh.device("cuda:0")
+
+# simulate() dispatches based on rn.device() — no extra arguments
+result = rn.simulate(2000.0, 0.01, {"A": 10.0})
+
+# --- Move back to CPU (e.g. to inspect state or use serial tools) ---
+rn.to(hh.device("cpu"))
+```
+
+**No user action is required for custom SymPy equations** — CUDAPrinter (task13)
+generates `__device__` functions automatically when the CUDA path is active.
+
+---
+
+## 17.4 VRAM Budget Analysis
+
+At the fruit fly connectome scale (135K neurons, 50M synapses, 1 s simulation,
+dt = 0.01 ms, record_interval = 100 steps):
+
+| Item | Formula | Size |
+|---|---|---|
+| Neuron state (V + ~15 gates/vars) | 135K × 16 × 8 B | ~17 MB |
+| Synapse CSR arrays (weight, delay, pre, post, g_syn) | 50M × 24 B | ~1.2 GB |
+| I_syn scratch | 135K × 8 B | ~1 MB |
+| Delay ring buffers (on-device, max 5 ms delay) | 50M × 500 B | ~25 GB ⚠ |
+| Recording staging (double-buffered, async) | 2 × 135K × 100 × 8 B | ~216 MB |
+| **Total without delay buffers** | | **~1.4 GB** |
+
+The delay ring buffer calculation above uses a per-synapse-per-step byte flag,
+which is the Phase 2 cross-group buffer layout.  On a single GPU this collapses:
+since all neurons run in the same kernel, the delay buffer can be stored as a
+**per-neuron circular spike history** (1 bit per neuron per step) rather than
+per-synapse:
+
+| Item (revised delay) | Formula | Size |
+|---|---|---|
+| Spike history ring (5 ms @ dt=0.01 ms = 500 steps) | 135K × 500 bits | ~8 MB |
+| **Total (revised)** | | **~1.4 GB** |
+
+This comfortably fits on a 24 GB consumer GPU.  The simulation state of the
+entire fruit fly connectome is viable on a single GPU.  Recording is the only
+variable that could grow without bound — the async streaming strategy caps it.
+
+---
+
+## 17.5 CUDA Kernels
+
+### Neuron Pool Kernel
+
+One thread per neuron.  All state in registers / global memory; no cross-thread
+dependencies within a step.
 
 ```cuda
 __global__ void hh_pool_step_kernel(
-    double* V, double* m, double* h, double* n,
-    const double* I_ext, const double* I_syn,
+    double* __restrict__ V,
+    double* __restrict__ m, double* __restrict__ h, double* __restrict__ n,
+    const double* __restrict__ I_ext, const double* __restrict__ I_syn,
     HHParams params, double dt, size_t N)
 {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    // RK4 step entirely in registers — no cross-thread dependencies
+    // Euler step in registers; RK4 after validation
+    // ...
 }
 ```
 
 Grid: `<<<(N + 255) / 256, 256>>>`.
 
-For composable neurons, the `__device__` gate functions generated by `CUDAPrinter` (task13) are called directly per thread.
+For Izhikevich neurons, voltage reset uses predicated assignment (§17.1 C2) —
+no warp divergence.
+
+For composable neurons, `__device__` gate functions generated by CUDAPrinter
+(task13) are called directly per thread — no JIT, no runtime compilation at
+simulate time.
 
 ### Synaptic Current Accumulation
 
-Multiple pre-synaptic neurons contribute to the same post-synaptic neuron — requires atomics:
+One thread per synapse.  Multiple pre-synaptic neurons → same post-synaptic
+neuron requires atomic accumulation.
 
 ```cuda
 __global__ void isyn_accumulate_kernel(
-    const size_t* post, const double* g, const double* E_syn,
-    const double* V, double* I_syn, size_t n_synapses)
+    const size_t* __restrict__ post,
+    const double* __restrict__ g,
+    const double* __restrict__ E_syn,
+    const double* __restrict__ V,
+    double* I_syn, size_t n_synapses)
 {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_synapses) return;
@@ -114,15 +232,18 @@ __global__ void isyn_accumulate_kernel(
 }
 ```
 
-Note: `atomicAdd` for `double` requires sm_60 (Pascal) or newer. Older GPUs fall back to segmented reduce.
+`atomicAdd(double*)` requires sm_60 (Pascal) or newer — document minimum GPU
+requirement.
 
-### Synapse Conductance Decay
+### Synapse Conductance Update
 
-Embarrassingly parallel — one thread per synapse:
+Embarrassingly parallel — one thread per synapse.
 
 ```cuda
 __global__ void synapse_decay_kernel(
-    double* g, const double* decay_factors, size_t n_synapses)
+    double* __restrict__ g,
+    const double* __restrict__ decay_factors,
+    size_t n_synapses)
 {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_synapses) return;
@@ -132,121 +253,132 @@ __global__ void synapse_decay_kernel(
 
 ---
 
-## 17.3 Memory Management
+## 17.6 Delay Buffers on Device
 
-All simulation state transferred to device at simulation start; results transferred back at recording intervals or end.
+Spike history is stored as a **per-neuron circular buffer of binary spike
+flags** (`uint8_t fired[N][max_delay_steps]`), indexed by
+`step % max_delay_steps`.  For a 5 ms max delay at dt=0.01 ms this is a 500-slot
+ring per neuron — 135K × 500 bytes ≈ 64 MB.
 
-```cpp
-class CUDASimContext {
-public:
-    CUDASimContext(size_t n_neurons, size_t n_synapses);
-    ~CUDASimContext();
+The `isyn_accumulate_kernel` reads from `fired[pre[s]][(step - delay_steps[s])
+% capacity]` directly in device memory.  No CPU involvement per step.
 
-    void upload_neuron_state(const NeuronState& state);
-    void upload_synapse_state(const SynArrays& sa);
-    void download_V(double* host_V);
-    void download_I_syn(double* host_I_syn);
-
-private:
-    double *d_V_, *d_m_, *d_h_, *d_n_;
-    double *d_g_, *d_E_syn_, *d_decay_;
-    size_t *d_pre_, *d_post_;
-    double *d_I_syn_, *d_I_ext_;
-};
-```
-
-**Transfer strategy:**
-- Upload once at `simulate()` start
-- Stay on device throughout hot loop
-- Download only when recording buffers require it (every `interval` steps)
-- Use `cudaMemcpyAsync` + streams to overlap CPU post-processing with device computation
+Compare to the Phase 2 ring buffer design (task16): that uses per-synapse
+buffers for cross-group isolation.  On single GPU the per-neuron design is more
+memory-efficient since all synapses from the same pre-neuron share the same
+spike history.
 
 ---
 
-## 17.4 Delay Buffers on GPU
+## 17.7 Stream Concurrency
 
-**Starting approach:** maintain spike history on CPU, transfer pre-synaptic spike vector to device each step. Cost: N_neurons bytes per step — negligible for typical networks. Implement on-device ring buffers only if profiling shows this is a bottleneck.
+The GPU simulation uses **two permanent CUDA streams**:
+
+- **Stream 0 (compute)**: all neuron step, synapse, and spike-detection kernels.
+- **Stream 1 (record)**: async `cudaMemcpyAsync` from staging buffer to pinned
+  host memory, fired every `record_interval` steps.
+
+These streams run concurrently — PCIe transfer overlaps with compute at no
+throughput cost.
+
+**Optional — multi-kernel concurrency for small networks:**
+When `N < occupancy_threshold` (profiler-determined), each population group's
+kernel is launched on its own compute stream.  The GPU's hardware scheduler
+packs multiple groups in-flight simultaneously, improving SM utilization.
+At N ≥ ~10K per group this gives no benefit (each group saturates the GPU
+alone), so it auto-disables above threshold.  This is an internal optimization,
+invisible to the user.
 
 ---
 
-## 17.5 Python API
+## 17.8 Phase 2 / Multi-GPU Bridge
+
+Phase 2 delay-decomposition (task16) is **the correct partition primitive for
+multi-GPU**.  Each GPU holds one or more population groups.  Inter-GPU spike
+communication travels through delay buffers over NVLink (~600 GB/s) or PCIe.
+
+This is deferred to task19, but task17 must not close the door on it:
+
+- The `Device` struct (§17.2) is designed to extend to multi-device assignment.
+- `CUDASimContext` is scoped per-device (not global) so multiple instances can
+  coexist.
+- The on-device delay ring buffer layout (§17.6) is the same layout used for
+  inter-GPU ring buffers in task19 — only the backing memory location changes
+  (device-local vs NVLink-mapped peer memory).
+
+The user-facing multi-GPU API (task19):
 
 ```python
-import hodgkin_huxley as hh
-
-# Device specification (PyTorch-style)
-device = hh.device("cuda")      # default GPU (index 0)
-device = hh.device("cuda:0")    # explicit GPU 0
-device = hh.device("cpu")
-
-# Device utilities
-hh.device_count()                # number of available CUDA devices
-hh.is_available("cuda")          # bool
-
-# Assign entire network to a device
-net = hh.RegionalNetwork()
-# ... build network normally ...
-net.to(hh.device("cuda:0"))
-print(net.device())              # hh.device("cuda:0")
-
-# Auto-select (GPU if N > CUDA_AUTO_THRESHOLD and CUDA available)
-result = net.simulate(2000.0, 0.01, ...)  # transparently uses GPU if threshold met
-
-# Legacy API (still supported; prefer .to())
-net.set_backend("cuda")
-net.set_backend("cpu")
-print(net.backend())             # "cuda" or "cpu"
-
-# Multi-GPU population assignment: see task19
-# rn.assign("STN", device=hh.device("cuda:1"))
-# rn.assign("GPe", device=hh.device("cuda:1"))
+# Not implemented in task17 — shown for design reference
+rn.assign("CTX_e", device=hh.device("cuda:0"))
+rn.assign("STN",   device=hh.device("cuda:1"))
+rn.simulate(...)  # inter-device communication via delay buffers over NVLink
 ```
 
-No user-facing change is required for custom SymPy equations — the CUDAPrinter (task13) generates `__device__` functions automatically when the CUDA path is active.
+---
+
+## 17.9 Limitations and Non-Goals
+
+- CUDA support is an opt-in build option; the default CPU build is completely
+  unaffected.
+- Windows: CUDA Toolkit requires MSVC + nvcc; document the exact conda setup.
+- Minimum GPU: sm_60 (Pascal, GTX 1080 / Tesla P100) for `atomicAdd(double*)`.
+- Mixed precision (float32 pools, float64 accumulation) is out of scope.
+- STDP / STP weight updates on GPU: not in scope for task17 (cross-synapse
+  dependency patterns complicate kernel design); document as limitation.
+- Multi-GPU: task19.  The architecture here supports it; the implementation
+  does not.
+- The `auto` device selection mode (choose GPU when N > threshold) is
+  intentionally **not implemented** — the user always opts in explicitly.
 
 ---
 
-## 17.6 Limitations and Non-Goals
-
-- CUDA support is a separate build option; default CPU build is unaffected
-- Windows CUDA Toolkit requires MSVC + nvcc; document setup carefully
-- Mixed-precision (float32 pools, float64 accumulation) is out of scope for this task
-- Multi-GPU distribution across multiple CUDA devices: planned for task19, which builds on the `Device` struct and `SpikeTransport` abstraction established here and in task16
-
----
-
-## 17.7 Implementation Checklist
+## 17.10 Implementation Checklist
 
 ### Build System
 - [ ] Add `USE_CUDA` CMake option with `enable_language(CUDA)` guard
-- [ ] Separate compilation: `.cu` files with nvcc, `.cpp` files with host compiler
-- [ ] CI: add optional CUDA build job (skip on machines without GPU)
+- [ ] Separate compilation: `.cu` files via nvcc, `.cpp` files via host compiler
+- [ ] `HH_USE_CUDA` compile definition; all CUDA code guarded behind it
+- [ ] CI: optional CUDA build job, skipped on machines without GPU
 
-### C++ Abstraction
-- [ ] Define `Device` struct and `device_count()` / `is_available()` in `device.hpp`
-- [ ] Implement `Network::to(Device)` and `Network::device()`
-- [ ] Verify `PoolBase` virtual interface from task16 is in place
-- [ ] Implement `CUDAHHPool`, `CUDAIzPool`, `CUDAComposablePool` implementing `PoolBase`
-- [ ] Add `Backend` enum and `Network::set_backend()` / `Network::backend()` (legacy, delegates to `to()`)
+### C++ Device Abstraction
+- [ ] `device.hpp` — `Device` struct, `cuda_device_count()`, `cuda_is_available()`
+- [ ] `Network::to(Device)`, `Network::device()`
+- [ ] `CUDASimContext` — owns all device pointers, scoped per simulation run
 
 ### CUDA Kernels
-- [ ] Implement `hh_pool_step_kernel` (Euler first, RK4 after validation)
-- [ ] Implement `isyn_accumulate_kernel` with `atomicAdd`
-- [ ] Implement `synapse_decay_kernel`
-- [ ] Implement `CUDASimContext` with upload/download methods
-- [ ] Wire `CUDAPrinter` output (task13) into CUDA pool compilation for composable neurons
+- [ ] `hh_pool_step_kernel` — Euler (validate), then RK4
+- [ ] `iz_pool_step_kernel` — with predicated voltage reset (no branching)
+- [ ] `isyn_accumulate_kernel` — `atomicAdd`, sm_60 guard
+- [ ] `synapse_decay_kernel`
+- [ ] `spike_detect_kernel` — writes per-neuron spike flags to on-device ring buffer
+- [ ] On-device delay ring buffer: `fired[N][max_delay_steps]`, indexed by step mod capacity
+- [ ] Recording staging: double-buffered device array + `cudaMemcpyAsync` to pinned host
+
+### Stream Setup
+- [ ] Allocate stream 0 (compute) and stream 1 (record) at simulation start
+- [ ] Recording: async copy on stream 1, every `record_interval` steps
+- [ ] Optional multi-kernel concurrency: per-group compute streams when N < occupancy threshold
+
+### Simulation Loop Dispatch
+- [ ] `RegionalNetwork::simulate()` detects `device().type == CUDA` and routes to GPU path
+- [ ] GPU path: upload all state once → hot loop (all kernels on device) → final download
+- [ ] No CPU↔GPU data movement inside the hot loop except stream 1 recording copies
+- [ ] Free all setup temporaries (unsorted weight/index buffers) immediately after CSR build
 
 ### Python Bindings
-- [ ] Bind `hh.device()` factory function (parses "cpu", "cuda", "cuda:N")
-- [ ] Bind `hh.device_count()` and `hh.is_available()`
-- [ ] Bind `Network.to(device)` and `Network.device()`
+- [ ] `hh.cuda` submodule: `is_available()`, `device_count()`, `get_device_name(n)`
+- [ ] `hh.device(str)` factory — parses "cpu", "cuda", "cuda:N"
+- [ ] `RegionalNetwork.to(device)`, `RegionalNetwork.device()`
 
-### Integration
-- [ ] `Network::simulate_with_descriptors()`: dispatch to CUDA path when `device().type == CUDA`
-- [ ] Recording download: async transfer every `interval` steps
-- [ ] Delay handling: CPU-managed spike vectors, upload each step
+### Validation
+- [ ] CPU vs CUDA produce identical V traces for HH network (small, atol=1e-6)
+- [ ] CPU vs CUDA identical for Izhikevich network (validates predicated reset)
+- [ ] CPU vs CUDA identical for composable neuron with CUSTOM_EXPR gate
+- [ ] Recording correctness: async-streamed traces match full in-memory traces
+- [ ] VRAM accounting: verify setup temporaries are freed before hot loop
 
-### Tests
-- [ ] Verify CPU and CUDA produce identical voltage traces for HH neuron (small network)
-- [ ] Verify synaptic transmission accuracy on GPU
-- [ ] Benchmark: speedup at N=100, 1000, 5000, 10000
+### Benchmarks
+- [ ] Speedup vs CPU serial: N = 500, 2K, 10K, 50K, 135K neurons
+- [ ] VRAM usage at each N (verify budget analysis in §17.4)
+- [ ] Async recording overhead: record_interval sweep (1, 10, 100, 1000 steps)
