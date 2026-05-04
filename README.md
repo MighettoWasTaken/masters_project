@@ -17,6 +17,8 @@ This project provides modular, reusable components for computational neuroscienc
 - Three synapse types: exponential, alpha-function, double-exponential, with receptor presets (AMPA, NMDA, GABA-A) and voltage-dependent kinetic synapses
 - Synaptic delays via circular ring buffers
 - Population-based `RegionalNetwork` with five connectivity patterns and heterogeneity support
+- Synaptic plasticity: STDP (spike-timing dependent), STP (short-term depression/facilitation), dopamine-gated STDP
+- Phase-2 delay-decomposition parallelism — one `std::thread` per population group, inter-group spikes via SPSC ring buffers; 2–3× speedup at N>1000
 - DBS stimulator (`DBSStimulator`) and flexible pulse stimulator (`PulseStimulator`)
 - Compact `StimPlan` descriptor path — avoids dense I_ext matrix allocation
 - Configurable recording system (`RecordingConfig`) with spike detection, ISI statistics, and gate/calcium traces
@@ -42,7 +44,7 @@ Creates a virtual environment and installs the library in editable mode. `cmake`
 
 ## Verification
 
-After installation, run these three commands to verify everything works:
+After installation, run these four commands to verify everything works:
 
 ### 1. Run the test suite
 
@@ -50,7 +52,7 @@ After installation, run these three commands to verify everything works:
 uv run pytest tests/python/
 ```
 
-Runs 15 test files covering all neuron models, synapse types, the recording system, DBS/pulse stimulators, and spectral analysis. Expected output: all tests pass.
+Runs 22 test files covering all neuron models, synapse types, plasticity rules, parallel simulation, the recording system, DBS/pulse stimulators, spectral analysis, and SymPy codegen. Expected output: all tests pass.
 
 ### 2. Run the network performance benchmark
 
@@ -60,7 +62,15 @@ uv run python examples/benchmark_network.py
 
 Benchmarks the C++ backend against a pure-NumPy reference implementation across network sizes (10–200 neurons). Produces timing, speedup, and memory plots saved to `examples/figs/`. Typical speedup: 50–250× depending on network size.
 
-### 3. Run the CTX-BG-TH model
+### 3. Run the threading benchmark
+
+```bash
+uv run python examples/benchmark_network_threading.py
+```
+
+Benchmarks serial C++, Phase-2 threaded C++, and pure-NumPy across four network topologies (Chain, Ring, All-to-All, Star). Produces plots saved to `examples/figs/benchmark_threading_*.png`. Typical NumPy/C++ speedup: 30–250× serial; Phase-2 adds 1.5–3× on top for large N.
+
+### 4. Run the CTX-BG-TH model
 
 ```bash
 uv run python benchmarks/ctxbgth_model.py
@@ -199,6 +209,8 @@ The composable ion-channel framework builds arbitrary conductance-based neurons 
 | Eigen-vectorized neuron pools (HHPool, IzPool, ComposablePool) | Done |
 | Euler, RK4, RK45 adaptive integration | Done |
 | Calcium dynamics + Nernst potential | Done |
+| Generalized intracellular substances (`IntracellularDynamics`) | Done |
+| Substance-to-channel/gate modulation (`Modulation`) | Done |
 | DBS stimulator with `current_at()` zero-copy path | Done |
 | Pulse stimulator (monophasic / biphasic, trains, bursts) | Done |
 | Compact StimPlan descriptor path (no dense I_ext matrix) | Done |
@@ -206,6 +218,12 @@ The composable ion-channel framework builds arbitrary conductance-based neurons 
 | Multitaper spectral analysis (beta-band power) | Done |
 | Noise injection (`NoiseInjector`) | Done |
 | CTX-BG-TH benchmark reproduction | Done |
+| STDP (spike-timing dependent plasticity) | Done |
+| STP (short-term depression / facilitation) | Done |
+| Dopamine-gated STDP via intracellular substance modulation | Done |
+| Weight recording (`record_weights`) | Done |
+| Phase-1 OpenMP pool parallelism (`set_num_threads`) | Done |
+| Phase-2 delay-decomposition threading (`set_thread_groups`) | Done |
 
 ---
 
@@ -230,6 +248,7 @@ masters_project/
 │   │   │   ├── synapse.hpp              # Exponential, Alpha, DoubleExp synapses
 │   │   │   ├── network.hpp              # Network class + StimPlan descriptors
 │   │   │   ├── regional_network.hpp     # RegionalNetwork class
+│   │   │   ├── parallel_sim.hpp         # SimGroup, CrossGroupBuffer, ParallelSimState
 │   │   │   └── dbs_stimulator.hpp       # DBSStimulator
 │   │   └── src/                         # C++ implementations
 │   ├── python/
@@ -241,16 +260,19 @@ masters_project/
 │       ├── spectral.py          # Multitaper spectral analysis
 │       └── noise.py             # NoiseInjector
 ├── tests/
-│   └── python/                  # 15 test files
+│   └── python/                  # 22 test files
 ├── examples/
-│   ├── benchmark_network.py         # C++ vs NumPy timing benchmark
-│   ├── benchmark_network_averaged.py # Averaged benchmark + plots
+│   ├── benchmark_network.py             # C++ vs NumPy timing benchmark
+│   ├── benchmark_network_threading.py   # Serial vs Phase-2 threading vs NumPy
+│   ├── benchmark_parallel_scaling.py    # Parallel speedup scaling by topology
+│   ├── benchmark_network_averaged.py    # Averaged benchmark + plots
 │   └── verify_neuron.py / verify_izhikevich.py
 └── benchmarks/
-    ├── ctxbgth_model.py             # Full CTX-BG-TH model (8 populations)
-    ├── compare_models.py            # Library vs benchmark comparison
-    ├── variable_span.py             # Variable span readability metric
-    └── flexibility_metric.py        # Configuration space metric
+    ├── ctxbgth_model.py                 # Full CTX-BG-TH model (8 populations)
+    ├── benchmark_parallel_ctxbgth.py    # CTX-BG-TH parallel speedup benchmark
+    ├── compare_models.py                # Library vs benchmark comparison
+    ├── variable_span.py                 # Variable span readability metric
+    └── flexibility_metric.py            # Configuration space metric
 ```
 
 ---
@@ -263,6 +285,7 @@ The C++ backend achieves 50–250× speedup over pure NumPy through:
 - **Fast polynomial exp** — degree-7 Taylor/Horner approximation (~8-digit accuracy)
 - **Compact StimPlan** — descriptor-based I_ext evaluation eliminates 128 MB dense matrix at tmax=2000 ms, dt=0.01 ms
 - **Zero-copy NumPy buffers** — caller-allocated output arrays, GIL-free C++ execution
+- **Phase-2 delay-decomposition threading** — one `std::thread` per population group; inter-group spikes travel through per-synapse SPSC ring buffers sized to the synaptic delay; 1.5–3× additional speedup for N>1000 with realistic inter-population delays
 
 ---
 

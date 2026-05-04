@@ -30,7 +30,7 @@ All foundational features required to reproduce the Hahn/Kumaravelu CTX-BG-TH Pa
 
 ---
 
-### Phase 2 — API Cleanup and Unified Equation System (Current)
+### Phase 2 — API Cleanup and Unified Equation System (Complete)
 
 task12 (structural cleanup) has no dependencies and should be done first to clear the surface before any new feature work. task13 (SymPy equation system) is the highest-priority feature and unblocks everything else in phases 2–4.
 
@@ -48,29 +48,33 @@ task14 delivered: `CalciumSpec` / `Ca_` / `E_Ca_` replaced by a general `std::ve
 
 ---
 
-### Phase 3 — Synaptic Plasticity (After Phase 2)
+### Phase 3 — Synaptic Plasticity (Complete)
 
 Synaptic learning rules using SymPy update-rule expressions (task13) and optionally intracellular substances (task14) for neuromodulator-gated plasticity.
 
-| Task | Title | Priority | Dependencies |
-|------|-------|----------|--------------|
-| [task15](../task15.md) | Plasticity Support (STDP, STP) | 2 | task13 (SymPy update rules), task14 (for gated plasticity) |
+| Task | Title | Priority | Status |
+|------|-------|----------|--------|
+| [task15](../task15.md) | Plasticity Support (STDP, STP) | 2 | **Complete** |
+
+task15 delivered: STDP with configurable A+/A− windows and τ+/τ−; short-term depression and facilitation (STP) expressed as SymPy update rules; dopamine-gated STDP via intracellular substance modulation; per-synapse weight recording (`record_weights`); plasticity rules thread-safe under Phase-2 delay-decomposition.
 
 **Key outcomes:** STDP, short-term depression/facilitation, dopamine-gated STDP, weight recording.
 
 ---
 
-### Phase 4 — Performance Scaling (Parallel with Phase 3)
+### Phase 4 — Performance Scaling (In Progress)
 
-Infrastructure for simulating networks with >1000 neurons efficiently. task16 (OpenMP) can begin as soon as the codebase is stable post-task13; task17 (CUDA) depends on both task16 (PoolBase interface) and task13 (CUDAPrinter). task19 (Multi-GPU) depends on task17's `Device` model and task16's `SpikeTransport` abstraction — target for extremely large models (N > 50,000) or full-scale cortical column simulations where single-GPU memory is a bottleneck.
+Infrastructure for simulating networks with >1000 neurons efficiently. task16 (CPU parallelism) is complete. task17 (CUDA) depends on task16 (PoolBase interface) and task13 (CUDAPrinter). task19 (Multi-GPU) depends on task17's `Device` model and task16's `SpikeTransport` abstraction — target for extremely large models (N > 50,000) or full-scale cortical column simulations where single-GPU memory is a bottleneck.
 
-| Task | Title | Priority | Dependencies |
-|------|-------|----------|--------------|
-| [task16](../task16.md) | CPU Parallelism (OpenMP) | 3 | None |
-| [task17](../task17.md) | CUDA GPU Acceleration | 3 | task16 (PoolBase), task13 (CUDAPrinter) |
-| [task19](../task19.md) | Multi-GPU Parallelism | 3 | task17 (Device API), task16 (SpikeTransport) |
+| Task | Title | Priority | Status |
+|------|-------|----------|--------|
+| [task16](../task16.md) | CPU Parallelism | 3 | **Complete** |
+| [task17](../task17.md) | CUDA GPU Acceleration | 3 | Not started |
+| [task19](../task19.md) | Multi-GPU Parallelism | 3 | Not started |
 
-**Key outcomes:** 2–4× speedup via OpenMP on multi-core CPU; 50–200× speedup via CUDA for N>1000; custom SymPy equations work transparently on GPU; near-linear multi-GPU scaling for N>50,000 via CUDA P2P or NCCL.
+task16 delivered: **Phase-1 OpenMP** — parallel pool stepping (`set_num_threads(n)`); all HHPool/IzPool/ComposablePool steps run in `omp parallel sections` / `parallel for`. **Phase-2 delay-decomposition** — `set_thread_groups({"g0": ["popA"], "g1": ["popB"], ...})` assigns populations to `std::thread` groups; inter-group spikes travel through per-synapse SPSC ring buffers (sized to the synaptic delay) with two-counter step synchronization; serial path completely unmodified when no groups are set. Plasticity (STDP/STP), SymPy CUSTOM_EXPR gates, and intracellular dynamics all work correctly under Phase-2 parallelism. Benchmarks: `examples/figs/benchmark_threading_*.png` (serial vs Phase-2 vs NumPy across 4 topologies); `benchmarks/figures/parallel_ctxbgth_*.png` (CTX-BG-TH scaling).
+
+**Key outcomes:** Phase-1 OpenMP pool parallelism; Phase-2 delay-decomposition threading with 1.5–3× additional speedup for N>1000; zero overhead on serial path; SpikeTransport abstraction ready for task17 CUDA backend; 50–250× NumPy/C++ speedup maintained.
 
 ---
 
