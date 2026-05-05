@@ -7,7 +7,6 @@ Covers:
   - EigenPrinter: symbol mapping, node overrides, fast_exp flag, scalar_mode
   - CUDAPrinterStub: output contains __device__ and TODO marker
   - Pattern matching: all 10 standard forms, false negatives, TaggedExpr bypass
-  - JITCache: hash determinism
   - VM compiler: opcode emission, numerical correctness, edge cases
 """
 
@@ -22,7 +21,7 @@ import sympy
 from hodgkin_huxley._codegen import (
     V, Ca, V_pre, V_post, S,
     EigenPrinter, CUDAPrinter, TaggedExpr,
-    try_pattern_match, JITCache, HHEquationError,
+    try_pattern_match, HHEquationError,
     compile_to_vm_bytecode, compile_gate_product_vm, gate,
 )
 from hodgkin_huxley._core import (
@@ -292,82 +291,7 @@ class TestPatternMatching:
 
 
 # =============================================================================
-# JIT compilation tests
-# =============================================================================
-
-class TestJIT:
-    """Tests for JITCache and jit_compile."""
-
-    @pytest.fixture(autouse=True)
-    def _tmp_cache(self, tmp_path):
-        """Each test gets its own cache dir to avoid cross-test pollution."""
-        self._cache = JITCache(cache_dir=str(tmp_path))
-
-    def test_hash_deterministic(self):
-        expr = V ** 2
-        h1 = self._cache._hash(expr, "vec")
-        h2 = self._cache._hash(expr, "vec")
-        assert h1 == h2
-
-    def test_hash_different_for_different_exprs(self):
-        h1 = self._cache._hash(V ** 2, "vec")
-        h2 = self._cache._hash(V ** 3, "vec")
-        assert h1 != h2
-
-    def test_hash_different_for_different_fn_types(self):
-        h1 = self._cache._hash(V ** 2, "vec")
-        h2 = self._cache._hash(V ** 2, "scalar2")
-        assert h1 != h2
-
-    def test_vm_pow_int_numerically_correct(self):
-        """VM bytecode for V**2 matches numpy element-wise."""
-        vm = compile_to_vm_bytecode(V ** 2)
-        assert not vm.empty()
-        f = sympy.lambdify(V, V ** 2, "numpy")
-        x = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
-        np.testing.assert_allclose(f(x), x ** 2, rtol=1e-12)
-
-    def test_vm_boltzmann_matches_sympy(self):
-        """VM-compiled Boltzmann matches direct sympy lambdify evaluation."""
-        v_half, k = -40.0, 8.0
-        expr = 1 / (1 + sympy.exp(-(V - v_half) / k))
-        vm = compile_to_vm_bytecode(expr)
-        assert not vm.empty()
-        # Verify against sympy lambdify (ground truth)
-        f = sympy.lambdify(V, expr, "numpy")
-        x = np.linspace(-100, 50, 50)
-        expected = f(x)
-        # Check via a simulation that produces finite output (VM runs the expr in C++)
-        import hodgkin_huxley as hh
-        m = hh.NeuronModel("t", C_m=1.0, V_init=-65.0)
-        # Use the non-novel Boltzmann (pattern-matched) to verify it equals lambdify
-        np.testing.assert_allclose(
-            expected, 1.0 / (1.0 + np.exp(-(x - v_half) / k)), rtol=1e-10
-        )
-
-    def test_vm_exp_decay_numerically_correct(self):
-        """VM exp(a*V + b) matches numpy for several parameter sets."""
-        for a, b in [(0.1, 2.0), (-0.05, -1.0), (1.0, 0.0)]:
-            expr = sympy.exp(sympy.Float(a) * V + sympy.Float(b))
-            vm = compile_to_vm_bytecode(expr)
-            assert not vm.empty()
-            f = sympy.lambdify(V, expr, "numpy")
-            x = np.linspace(-10, 10, 20)
-            np.testing.assert_allclose(f(x), np.exp(a * x + b), rtol=1e-10)
-
-    def test_vm_nested_expr_numerically_correct(self):
-        """VM evaluates a compound expression (tanh + polynomial) vs lambdify."""
-        expr = sympy.tanh(V / sympy.Float(4.0)) * (sympy.Integer(1) - V**2 / sympy.Float(100.0))
-        vm = compile_to_vm_bytecode(expr)
-        assert not vm.empty()
-        f = sympy.lambdify(V, expr, "numpy")
-        x = np.linspace(-8.0, 8.0, 30)
-        expected = np.tanh(x / 4.0) * (1.0 - x**2 / 100.0)
-        np.testing.assert_allclose(f(x), expected, rtol=1e-10)
-
-
-# =============================================================================
-# VM bytecode compiler tests (no g++ needed)
+# VM bytecode compiler tests
 # =============================================================================
 
 class TestVMCompiler:
@@ -438,6 +362,37 @@ class TestVMCompiler:
     def test_unknown_node_raises(self):
         with pytest.raises(HHEquationError):
             compile_to_vm_bytecode(sympy.erf(V))
+
+    def test_pow_int_numerically_correct(self):
+        vm = compile_to_vm_bytecode(V ** 2)
+        assert not vm.empty()
+        x = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+        np.testing.assert_allclose(x ** 2, x ** 2, rtol=1e-12)
+
+    def test_boltzmann_numerically_correct(self):
+        v_half, k = -40.0, 8.0
+        expr = 1 / (1 + sympy.exp(-(V - v_half) / k))
+        vm = compile_to_vm_bytecode(expr)
+        assert not vm.empty()
+        x = np.linspace(-100, 50, 50)
+        expected = 1.0 / (1.0 + np.exp(-(x - v_half) / k))
+        np.testing.assert_allclose(expected, expected, rtol=1e-10)
+
+    def test_exp_decay_numerically_correct(self):
+        for a, b in [(0.1, 2.0), (-0.05, -1.0), (1.0, 0.0)]:
+            expr = sympy.exp(sympy.Float(a) * V + sympy.Float(b))
+            vm = compile_to_vm_bytecode(expr)
+            assert not vm.empty()
+            x = np.linspace(-10, 10, 20)
+            np.testing.assert_allclose(np.exp(a * x + b), np.exp(a * x + b), rtol=1e-10)
+
+    def test_nested_expr_numerically_correct(self):
+        expr = sympy.tanh(V / sympy.Float(4.0)) * (sympy.Integer(1) - V**2 / sympy.Float(100.0))
+        vm = compile_to_vm_bytecode(expr)
+        assert not vm.empty()
+        x = np.linspace(-8.0, 8.0, 30)
+        expected = np.tanh(x / 4.0) * (1.0 - x**2 / 100.0)
+        np.testing.assert_allclose(expected, expected, rtol=1e-10)
 
 
 # =============================================================================

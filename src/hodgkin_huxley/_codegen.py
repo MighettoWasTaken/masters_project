@@ -6,28 +6,22 @@ SymPy expression compilation infrastructure for the hodgkin-huxley library.
 
 Provides:
   - Pre-defined SymPy symbols (V, Ca, V_pre, V_post, S, ...)
-  - EigenPrinter  — generates Eigen C++ from SymPy (vectorized, SIMD)
+  - EigenPrinter  — generates Eigen C++ from SymPy (vectorized, SIMD); reserved for task17 GPU codegen
   - CUDAPrinter   — stub placeholder (task17)
   - Pattern matching catalog (10 forms: 6 tau + 4 rate + Boltzmann)
   - TaggedExpr    — SymPy expr with pre-matched parameter metadata
-  - JITCache / jit_compile — disk-cached g++ compilation pipeline
-  - HHEquationError — raised when JIT compilation fails
+  - compile_to_vm_bytecode — cross-platform VM bytecode for all custom expressions
+  - HHEquationError — raised when expression compilation fails
 
 Insertion points for future tasks:
-  - task17: replace CUDAPrinter stub with full nvcc pipeline
+  - task17: replace CUDAPrinter stub with full nvcc pipeline (EigenPrinter already available)
   - task13 extension: add more patterns to PATTERN_CATALOG as new forms are added
 """
 
 from __future__ import annotations
 
-import ctypes
-import hashlib
 import math as _math
-import os
-import pathlib
-import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -883,297 +877,28 @@ def try_pattern_match(expr, dep_sym=None):
 
 
 # =============================================================================
-# JIT preambles
-# =============================================================================
-
-# Inline fast_exp for Eigen ArrayXd — mirrors kinetics.hpp::fast_exp exactly.
-# Uses range reduction by 32 + degree-7 Horner polynomial + 5 squarings.
-_FAST_EXP_VEC_IMPL = """\
-static inline Eigen::ArrayXd hh_fast_exp(const Eigen::ArrayXd& src) {
-    Eigen::ArrayXd r = src * (1.0 / 32.0);
-    Eigen::ArrayXd y = r * (1.0 / 5040.0) + (1.0 / 720.0);
-    y = y * r + (1.0 / 120.0);
-    y = y * r + (1.0 / 24.0);
-    y = y * r + (1.0 / 6.0);
-    y = y * r + 0.5;
-    y = y * r + 1.0;
-    y = y * r + 1.0;
-    y *= y; y *= y; y *= y; y *= y; y *= y;  // 5 squarings: (exp(x/32))^32 = exp(x)
-    return y;
-}
-"""
-
-# Scalar version for scalar2 JIT functions
-_FAST_EXP_SCALAR_IMPL = """\
-static inline double hh_fast_exp(double x) {
-    double r = x * (1.0 / 32.0);
-    double y = r * (1.0 / 5040.0) + (1.0 / 720.0);
-    y = y * r + (1.0 / 120.0);
-    y = y * r + (1.0 / 24.0);
-    y = y * r + (1.0 / 6.0);
-    y = y * r + 0.5;
-    y = y * r + 1.0;
-    y = y * r + 1.0;
-    y *= y; y *= y; y *= y; y *= y; y *= y;
-    return y;
-}
-"""
-
-_VEC_PREAMBLE_TEMPLATE = """\
-#include <Eigen/Core>
-#include <cstdint>
-#include <algorithm>
-using Eigen::ArrayXd;
-
-{fast_exp_impl}
-"""
-
-_SCALAR2_PREAMBLE_TEMPLATE = """\
-#include <cmath>
-#include <algorithm>
-
-{fast_exp_impl}
-"""
-
-
-def _generate_vec_src(expr, hash_str: str, use_fast_exp: bool) -> str:
-    """Generate a complete C++ source for a vectorized gate function."""
-    fast_exp_impl = _FAST_EXP_VEC_IMPL if use_fast_exp else ""
-    preamble = _VEC_PREAMBLE_TEMPLATE.format(fast_exp_impl=fast_exp_impl)
-    printer = EigenPrinter(use_fast_exp=use_fast_exp, scalar_mode=False)
-    body = printer.doprint(expr)
-    return (
-        preamble +
-        f"extern \"C\" void fn_{hash_str}(const double* V_in, double* out, int n) {{\n"
-        f"    Eigen::Map<const ArrayXd> V_(V_in, n);\n"
-        f"    Eigen::Map<ArrayXd> out_(out, n);\n"
-        f"    out_ = {body};\n"
-        f"}}\n"
-    )
-
-
-def _generate_scalar2_src(expr, hash_str: str, use_fast_exp: bool,
-                           arg0_name: str = "V_pre_",
-                           arg1_name: str = "S_") -> str:
-    """Generate a scalar2 C++ source: double fn(double arg0, double arg1)."""
-    fast_exp_impl = _FAST_EXP_SCALAR_IMPL if use_fast_exp else ""
-    preamble = _SCALAR2_PREAMBLE_TEMPLATE.format(fast_exp_impl=fast_exp_impl)
-    printer = EigenPrinter(use_fast_exp=use_fast_exp, scalar_mode=True)
-    body = printer.doprint(expr)
-    return (
-        preamble +
-        f"extern \"C\" double fn_{hash_str}(double {arg0_name}, double {arg1_name}) {{\n"
-        f"    return {body};\n"
-        f"}}\n"
-    )
-
-
-# =============================================================================
-# Eigen header discovery
-# =============================================================================
-
-def _find_eigen_include() -> str:
-    """
-    Return the path to Eigen headers, or raise HHEquationError if not found.
-    """
-    # 1. Environment variable
-    env_path = os.environ.get("EIGEN3_INCLUDE_DIR")
-    if env_path and pathlib.Path(env_path, "Eigen", "Core").exists():
-        return env_path
-
-    # 2. pkg-config
-    try:
-        result = subprocess.run(
-            ["pkg-config", "--cflags", "eigen3"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            for flag in result.stdout.split():
-                if flag.startswith("-I"):
-                    path = flag[2:]
-                    if pathlib.Path(path, "Eigen", "Core").exists():
-                        return path
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    # 3. Common install locations
-    candidates = [
-        "/usr/include/eigen3",
-        "/usr/local/include/eigen3",
-        "/opt/homebrew/include/eigen3",
-        "/usr/include",
-        "/usr/local/include",
-    ]
-    for path in candidates:
-        if pathlib.Path(path, "Eigen", "Core").exists():
-            return path
-
-    # 4. Python package (scikit-build or similar may bundle Eigen)
-    try:
-        import importlib.resources as ilr
-        pkg_path = pathlib.Path(str(ilr.files("hodgkin_huxley")) if hasattr(ilr, "files") else "")
-        for parent in [pkg_path, pkg_path.parent, pkg_path.parent.parent]:
-            for sub in ["eigen3", "Eigen3", "eigen"]:
-                candidate = parent / sub
-                if (candidate / "Eigen" / "Core").exists():
-                    return str(candidate)
-    except Exception:
-        pass
-
-    raise HHEquationError(
-        source="",
-        stderr=(
-            "Could not locate Eigen3 headers. Set EIGEN3_INCLUDE_DIR environment variable "
-            "to the directory containing Eigen/Core, or install Eigen3 via your package "
-            "manager (e.g., `apt install libeigen3-dev` or `brew install eigen`)."
-        )
-    )
-
-
-# =============================================================================
 # HHEquationError
 # =============================================================================
 
 class HHEquationError(Exception):
     """
-    Raised when JIT compilation of a SymPy expression fails.
+    Raised when compilation of a SymPy expression fails.
 
     Attributes
     ----------
     source : str
-        The generated C++ source that was passed to the compiler.
+        The expression source string (or generated code) that triggered the error.
     stderr : str
-        Compiler stderr output (or other error message).
+        Error message or diagnostic output.
     """
     def __init__(self, source: str, stderr: str):
         self.source = source
         self.stderr = stderr
         super().__init__(
-            f"JIT compilation failed.\n"
-            f"--- compiler stderr ---\n{stderr}\n"
-            f"--- generated source ---\n{source}"
+            f"Expression compilation failed.\n"
+            f"--- error ---\n{stderr}\n"
+            f"--- source ---\n{source}"
         )
-
-
-# =============================================================================
-# JIT cache
-# =============================================================================
-
-_DEFAULT_CACHE_DIR = pathlib.Path.home() / ".cache" / "hodgkin_huxley"
-
-
-class JITCache:
-    """
-    Disk-backed cache for JIT-compiled SymPy expressions.
-
-    Expressions are hashed by their SymPy `srepr` string + fn_type. Compiled
-    shared libraries are stored as ``<hash>.so`` under `cache_dir`. Function
-    pointers are kept in-process in ``_loaded`` so that reloads are avoided
-    across multiple simulate() calls within the same process.
-    """
-
-    def __init__(self, cache_dir: pathlib.Path | str | None = None):
-        self.cache_dir = pathlib.Path(cache_dir or _DEFAULT_CACHE_DIR)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._loaded: dict[str, int] = {}  # hash_str → raw function pointer (int)
-
-    def compile(
-        self,
-        expr,
-        fn_type: str = "vec",
-        use_fast_exp: bool = True,
-    ) -> int:
-        """
-        Compile a SymPy expression to a shared library and return the raw
-        function pointer as a Python ``int``.
-
-        Parameters
-        ----------
-        expr : sympy.Expr
-            The expression to compile.
-        fn_type : str
-            ``"vec"``     — void(*)(const double* in, double* out, int n)
-            ``"scalar2"`` — double(*)(double arg0, double arg1)
-        use_fast_exp : bool
-            When True, ``exp(x)`` uses the fast_exp approximation from
-            ``kinetics.hpp`` (range-reduction + degree-7 Taylor).
-        """
-        hash_str = self._hash(expr, fn_type)
-        if hash_str in self._loaded:
-            return self._loaded[hash_str]
-
-        so_path = self.cache_dir / f"{hash_str}.so"
-        if not so_path.exists():
-            self._compile_to_disk(expr, fn_type, use_fast_exp, hash_str, so_path)
-
-        ptr = self._load_fn(so_path, hash_str)
-        self._loaded[hash_str] = ptr
-        return ptr
-
-    @staticmethod
-    def _hash(expr, fn_type: str) -> str:
-        key = sympy.srepr(expr) + "|" + fn_type
-        return hashlib.sha256(key.encode()).hexdigest()[:16]
-
-    def _compile_to_disk(self, expr, fn_type: str, use_fast_exp: bool,
-                         hash_str: str, so_path: pathlib.Path) -> None:
-        if fn_type == "vec":
-            src = _generate_vec_src(expr, hash_str, use_fast_exp)
-        elif fn_type == "scalar2":
-            src = _generate_scalar2_src(expr, hash_str, use_fast_exp)
-        else:
-            raise ValueError(f"Unknown fn_type: {fn_type!r}. Expected 'vec' or 'scalar2'.")
-
-        cpp_path = self.cache_dir / f"{hash_str}.cpp"
-        cpp_path.write_text(src)
-
-        eigen_include = _find_eigen_include()
-
-        cmd = [
-            "g++", "-O3", "-fPIC", "-shared", "-std=c++17",
-            f"-I{eigen_include}",
-            "-o", str(so_path),
-            str(cpp_path),
-        ]
-        if sys.platform != "win32":
-            cmd.insert(1, "-march=native")
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if result.returncode != 0:
-            raise HHEquationError(source=src, stderr=result.stderr)
-
-    def _load_fn(self, so_path: pathlib.Path, hash_str: str) -> int:
-        lib = ctypes.CDLL(str(so_path))
-        fn_name = f"fn_{hash_str}"
-        fn = getattr(lib, fn_name)
-        # Cast to void* to extract the raw address as a Python int
-        ptr = ctypes.cast(fn, ctypes.c_void_p).value
-        if ptr is None:
-            raise HHEquationError(
-                source="",
-                stderr=f"Could not extract function pointer for symbol '{fn_name}' from {so_path}"
-            )
-        return ptr
-
-
-# Module-level singleton cache — shared across all compile() calls
-_GLOBAL_JIT_CACHE = JITCache()
-
-
-def jit_compile(
-    expr,
-    fn_type: str = "vec",
-    use_fast_exp: bool = True,
-    cache: JITCache | None = None,
-) -> int:
-    """
-    Compile ``expr`` to a shared library and return its function pointer.
-
-    Convenience wrapper around the global JITCache. See ``JITCache.compile``
-    for parameter documentation.
-    """
-    c = cache or _GLOBAL_JIT_CACHE
-    return c.compile(expr, fn_type=fn_type, use_fast_exp=use_fast_exp)
 
 
 # =============================================================================

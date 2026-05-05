@@ -236,7 +236,7 @@ The internal `_emit_vm(expr, constants, instructions)` does a depth-first walk, 
 | Case | Path |
 |---|---|
 | Gate kinetics — standard form recognized | Pattern-matched C++ path (no VM) |
-| Gate kinetics — non-standard, < threshold | JIT-compiled `.so` (see Part 3) |
+| Gate kinetics — non-standard | VM bytecode via `compile_to_vm_bytecode()` |
 | Synapse `CUSTOM_EXPR` dS_dt | `compile_to_vm_bytecode(dS_dt, V_pre, {S: PUSH_S, A: PUSH_A})` |
 | Synapse `CUSTOM_EXPR` dA_dt | `compile_to_vm_bytecode(dA_dt, V_pre, {S: PUSH_S, A: PUSH_A})` |
 | Synapse `CUSTOM_EXPR` current | `compile_to_vm_bytecode(current, V_post, {S: PUSH_S, A: PUSH_A})` |
@@ -278,7 +278,7 @@ Converts SymPy expressions to C++ strings. Two modes:
 
 **Scalar** (for `__device__` functions and scalar C contexts):
 - Standard `std::exp`, `std::tanh`, etc.
-- Used by JIT cache for function types that run per-neuron (not per-pool)
+- Reserved for task17 CUDA codegen (`__device__` functions)
 
 ### `TaggedExpr` (`_codegen.py`)
 
@@ -324,25 +324,163 @@ Extracts `v_half`, `k` via `Poly` coefficient comparison.
 
 When a match is found, the corresponding C++ struct (`BoltzmannParams`, `TauParams`, `RateFuncParams`) is populated directly with no runtime VM evaluation.
 
-### JIT Compilation Pipeline (`_codegen.py`)
+### Expression Fallback Path (`_codegen.py`)
 
-Used for gate kinetics that fail pattern matching. Two function types:
+All expressions that fail pattern matching — for both gate kinetics and synapse ODEs — compile to VM bytecode via `compile_to_vm_bytecode()`. No `g++` subprocess or Eigen headers are required at runtime; the VM interpreter runs entirely in the pre-compiled C++ core.
 
-| fn_type | Signature | Use |
-|---------|-----------|-----|
-| `"vec"` | `void(double*, double*, int)` | Eigen pool — takes pointer to V array, writes output array |
-| `"scalar2"` | `double(double, double)` | Per-neuron scalar — `f(V, x)` for tau, rate funcs |
+**Post-task13.5 change**: A `JITCache` / `jit_compile` pipeline (g++ subprocess, Eigen header discovery, `.so` loading via `ctypes`) was originally present but never wired into the gate fallback path — gates already used the VM exclusively. The dead code was removed to ensure cross-platform compatibility (no dependency on a system compiler or Eigen headers at runtime). `EigenPrinter` is retained for task17 CUDA codegen.
 
-Pipeline:
-1. `srepr(expr)` → SHA-256 hash → check `~/.cache/hodgkin_huxley/<hash>.so`
-2. Cache miss: generate C++ source with preamble (includes `<cmath>`, `<Eigen/Dense>`) + EigenPrinter output
-3. Compile: `g++ -O3 -fPIC -shared -std=c++17 -I<eigen_include> -o <hash>.so <hash>.cpp`
-4. Load `.so` via `ctypes.CDLL`, resolve function pointer, cache in memory
-5. On failure: raise `HHEquationError` with generated source and compiler stderr
+---
 
-The `JITCache` class manages both disk and in-memory caching. Re-entrant across processes (disk cache shared).
+### Supported SymPy Expression Forms by Entry Point
 
-**Divergence from task13.md**: task13 planned JIT for both gates and synapses. Synapse `CUSTOM_EXPR` uses the VM instead of JIT — faster to compile (no subprocess), sufficient for per-timestep scalar evaluation in the tight loop.
+#### VM-supported node types (applies to all VM paths below)
+
+Any expression composed entirely of:
+
+| SymPy construct | VM opcode(s) |
+|---|---|
+| Numeric literal (`Integer`, `Float`, `Rational`, any `.is_number`) | `PUSH_CONST` |
+| Primary dependent symbol (`V`, `Ca`, `S`, `A`, `X`, ...) | `PUSH_DEP` |
+| Extra symbols passed via `extra_syms` (`S`, `A`, substance names) | `PUSH_S`, `PUSH_A`, `PUSH_X(n)` |
+| `a + b + ...` | `PUSH` each term, repeated `ADD` |
+| `a * b * ...` | `PUSH` each factor, repeated `MUL` |
+| `-x` (negation, i.e. `Mul(-1, x)`) | `NEG` |
+| `1 / x` (i.e. `Pow(x, -1)`) | `RCP` |
+| `x ** n` for integer `n` | `POW_INT(n)` |
+| `sqrt(x)` (i.e. `Pow(x, Rational(1,2))`) | `POW_HALF` |
+| `x ** y` for general float `y` | `POW_GEN` |
+| `exp(x)` | `EXP` |
+| `log(x)` | `LOG` |
+| `tanh(x)` | `TANH` |
+| `sin(x)` | `SIN` |
+| `cos(x)` | `COS` |
+| `Abs(x)` | `ABS` |
+
+Unsupported nodes (`erf`, `asin`, `atan`, etc.) raise `HHEquationError` at build time.
+
+---
+
+#### `NeuronModel.add_gate()` / `GateSpec()`
+
+All four arguments accept `Boltzmann` / `Tau.*` / `RateFunc.*` shorthand (return `TaggedExpr`, zero pattern-matching cost), raw SymPy expressions (pattern-matched first, VM fallback), or pre-built C++ structs.
+
+**`inf` — steady-state activation** — primary symbol `V` (or `Ca` if `dependency="calcium"`)
+
+| Pattern | Route |
+|---|---|
+| `1 / (1 + exp((v_half - V) / k))` (Boltzmann) | `BoltzmannParams` — C++ fast path |
+| Anything else | VM (primary: `V` or `Ca`) |
+
+**`tau` — time constant** — primary symbol `V`
+
+| Pattern | Route |
+|---|---|
+| Scalar numeric | `TauParams(CONSTANT, tau0)` |
+| `tau0 + tau1 / (1 + exp((v_half - V) / k))` | `TauParams(BOLTZMANN, ...)` |
+| `a*exp(b*V) + c*exp(d*V)` | `TauParams(DOUBLE_EXP_SUM, ...)` |
+| `tau0 + a*exp(b*V) + c*exp(d*V)` | `TauParams(OFFSET_DOUBLE_EXP, ...)` |
+| `a*exp(b*V)` (single exponential) | `TauParams(SCALED_EXP, ...)` |
+| `1 / (alpha(V) + beta(V))` where each is a recognized rate func | `TauParams(COMPOUND_AB, ...)` |
+| Anything else | VM (primary: `V`) |
+
+**`alpha` / `beta` — rate functions** — primary symbol `V`
+
+| Pattern | Route |
+|---|---|
+| `(a + b*V) / (exp(c + d*V) - 1)` (HH-style) | `RateFuncParams(LINEAR_OVER_EXP, ...)` |
+| `a*exp(b*V)` | `RateFuncParams(EXP_DECAY, ...)` |
+| `(a + b*V) / (1 - exp(c + d*V))` | `RateFuncParams(LINEAR_OVER_EXPM1, ...)` |
+| `a / (1 + exp(b*V + c))` | `RateFuncParams(SIGMOID, ...)` |
+| Anything else | VM (primary: `V`) |
+
+**`expr` — full custom ODE** `dx/dt = f(V, x)` — always VM
+
+| Symbol | Meaning |
+|---|---|
+| `V` (or `Ca` for calcium-dependent) | `PUSH_DEP` |
+| `x` | `PUSH_S` (the gate variable itself) |
+
+---
+
+#### `SynapseModel()` general constructor
+
+`dS_dt`, `dA_dt`, `current` are pattern-matched first; fall through to VM if unrecognized.
+
+**`dS_dt` / `dA_dt` — ODE pattern matching** (priority order)
+
+| Pattern | Route |
+|---|---|
+| `dS_dt = c*S` (c < 0, no `dA_dt`) | `EXP_DECAY`, `tau_S = -1/c` |
+| `dS_dt = (A-S)*k`, `dA_dt = -A*k` (same `k`) | `ALPHA_FUNC` |
+| `dS_dt = -S*k1`, `dA_dt = -A*k2` (k1 ≠ k2, both > 0) | `DOUBLE_EXP` |
+| Anything else | `CUSTOM_EXPR` VM |
+
+**`dS_dt` / `dA_dt` when VM** — available symbols:
+
+| Symbol | Meaning |
+|---|---|
+| `V_pre` | `PUSH_DEP` |
+| `S` | `PUSH_S` |
+| `A` | `PUSH_A` |
+
+**`current`** — available symbols:
+
+| Symbol | Meaning |
+|---|---|
+| `V_post` | `PUSH_DEP` |
+| `S` | `PUSH_S` |
+| `A` | `PUSH_A` |
+
+---
+
+#### `IntracellularDynamics(ode=..., nernst=...)`
+
+**`ode` — dX/dt** — pattern-matched first, VM fallback
+
+| Pattern | Route |
+|---|---|
+| `-k * X` (k > 0, X only) | `DECAY` — C++ fast path |
+| `eps * (-I_source - k * X)` (ε, k > 0) | `DRIVEN_DECAY` — C++ fast path |
+| Same + standard Nernst form | `DRIVEN_DECAY_NERNST` — C++ fast path |
+| Anything else | `CUSTOM_EXPR` VM |
+
+**`ode` when VM** — available symbols:
+
+| Symbol | Meaning |
+|---|---|
+| `I_source` | `PUSH_DEP` (sum of source channel currents) |
+| `X` (e.g. `sympy.Symbol("Ca")`) | `PUSH_S` |
+| Other substance names | `PUSH_X(n)` via `extra_syms` |
+
+**`nernst` — reversal potential as f(X)** — primary symbol `X`
+
+| Pattern | Route |
+|---|---|
+| `(R*T / (z*F)) * log(X_o / X)` with numeric constants | Standard Nernst params — C++ fast path |
+| Anything else | VM (primary: `X`) |
+
+---
+
+#### `Modulation(..., expr=...)`
+
+`expr` is always compiled to VM. Primary symbol is the substance's own `sympy.Symbol` (e.g. `Ca`), mapped to `PUSH_DEP`. No other variables are available — modulation functions are scalar functions of the substance concentration only.
+
+---
+
+#### `compile_gate_product_vm()` (channel conductance gating)
+
+Used internally when `add_channel(gates=...)` receives a SymPy expression instead of a `{gate_name: power}` dict. Supports a restricted subset:
+
+| Construct | Support |
+|---|---|
+| `gate("m")` | Single gate reference |
+| `gate("m") ** n` (integer `n`) | Gate raised to integer power |
+| `gate("m") ** 3 * gate("h")` | Product of gate terms |
+| `scalar * gate(...)` | Numeric coefficient |
+| Sum of above | Sum of gate products |
+
+`V`, `Ca`, and general SymPy functions are **not** available here — only gate symbols, their integer powers, products, sums, and scalar coefficients.
 
 ### `NeuronModel` Builder (`_equations/__init__.py`)
 
@@ -359,7 +497,7 @@ spec = model.to_spec()  # returns NeuronModelSpec
 `to_spec()` workflow per gate:
 1. Check if `inf` is `TaggedExpr` → use `params` directly
 2. Try pattern matching catalog
-3. Fall back to `compile_to_vm_bytecode()` for VM path, or JIT if the expression needs vectorized Eigen evaluation
+3. Fall back to `compile_to_vm_bytecode()` (VM path — cross-platform, no compiler required)
 
 **Divergence from task13.md**: task13 planned `GateSpec(inf=sympy_expr)` direct assignment. The `NeuronModel` builder was implemented instead — it is more ergonomic for multi-gate, multi-channel models and naturally groups gates with their parent channel.
 
@@ -406,7 +544,7 @@ if isinstance(synapse, SynapseModel):
 | task13.md plan | What was actually built |
 |---|---|
 | Full `CUDAPrinter` implementation | Stub only — CUDA codegen deferred to task17 |
-| JIT for both gate kinetics and synapse ODEs | JIT for gates only; synapse `CUSTOM_EXPR` uses VM bytecode (no subprocess, better for tight loops) |
+| JIT for both gate kinetics and synapse ODEs | VM bytecode exclusively for all custom expressions — no `g++` subprocess, no Eigen headers required at runtime; cross-platform |
 | `GateSpec(inf=sympy_expr)` direct field assignment | `NeuronModel` builder with `add_gate()`/`add_channel()` API |
 | Task13 only (no synapse overhaul) | Major synapse architecture overhaul added (unified SynapseSpec, SoA redesign, SynapseGroups) — this was not in task13 at all |
 | `KineticSynapseSpec` extended with new forms | `KineticSynapseSpec` removed; new `SynapseSpec` covers all 7 forms |
@@ -430,7 +568,7 @@ if isinstance(synapse, SynapseModel):
 | `src/cpp/src/regional_network.cpp` | Updated routing to unified `SynapseSpec` |
 | `src/python/bindings.cpp` | Renamed bindings, added new fields and UpdateForm values, bound `SynapseBase` view |
 | `src/cpp/CMakeLists.txt` | Added `synapse_base.cpp`, `synapse_spec.cpp` to library sources |
-| `src/hodgkin_huxley/_codegen.py` | `A` symbol, `PUSH_A` VM opcode, `vm_eval_scalar_3arg` call path, `compile_to_vm_bytecode` extra_syms |
+| `src/hodgkin_huxley/_codegen.py` | `A` symbol, `PUSH_A` VM opcode, `vm_eval_scalar_3arg` call path, `compile_to_vm_bytecode` extra_syms; JIT pipeline (`JITCache`, `jit_compile`, `_find_eigen_include`) removed post-task13.5 — VM used exclusively |
 | `src/hodgkin_huxley/_equations/__init__.py` | `SynapseModel` builder, pattern matching, `KineticSynapseModel` alias |
 | `src/hodgkin_huxley/_network/__init__.py` | `SynapseModel` → `SynapseSpec` conversion in `connect()` and `add_connection()` |
 | `src/hodgkin_huxley/__init__.py` | Export `SynapseModel`, `A`, `SynapseSpec`, `SynapseUpdateForm`, `SynapseCurrentForm` |

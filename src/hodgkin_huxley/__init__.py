@@ -91,7 +91,6 @@ from ._codegen import (
     compile_gate_product_vm,
     compile_to_vm_bytecode,
     gate,
-    jit_compile,
     substance,
     try_pattern_match,
     w,
