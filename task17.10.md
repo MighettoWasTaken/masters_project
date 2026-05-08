@@ -1,120 +1,111 @@
-# Task 17.10: Python Device API + pybind11 Bindings
+# Task 17.10: VRAM Recording Pipeline — Async Streaming to Pinned Host
 
-**Role:** Team lead  
+**Role:** VRAM / memory engineer  
 **Status:** Not started  
-**Depends on:** 17.1 (Device struct), 17.3 (RegionalNetwork::to(Device))  
-**Unlocks:** 17.11 (tests use Python API), 17.12 (benchmarks use Python API)
+**Depends on:** 17.3 (pinned buffers), 17.6 (CudaHHPool/CudaIzPool device arrays), 17.7 (DeviceSynapseArrays), 17.8 (CudaComposablePool `device_ptr_*` accessors)  
+**Unlocks:** 17.11 (tests verify recording output)
 
 ---
 
 ## What to implement
 
-### `src/python/bindings.cpp` — bind `Device`
+On CPU, recording is done by calling `scatter_gates`, `scatter_calcium`, etc. every `interval` steps — they write directly into numpy-backed buffers. On CUDA, pool state lives on-device; copying every step is too slow. Use double-buffering and a dedicated copy stream.
+
+### Design
+
+Two streams per simulation:
+- `compute_stream_`: runs step kernels (already in each CUDA pool)
+- `copy_stream_`: runs `cudaMemcpyAsync` for recording
+
+Double-buffer on host (pinned):
+- `rec_buf_A_[metric][t]`, `rec_buf_B_[metric][t]` — ping-pong between intervals
+
+### `src/cpp/include/hodgkin_huxley/cuda_recording.hpp` (new)
 
 ```cpp
-py::class_<Device>(m, "Device")
-    .def_static("cpu",  &Device::cpu,  "CPU device")
-    .def_static("cuda", &Device::cuda, py::arg("index") = 0, "CUDA device by index")
-    .def_readonly("type",  &Device::type)
-    .def_readonly("index", &Device::index)
-    .def("__repr__", [](const Device& d){ return d.str(); })
-    .def("__eq__", &Device::operator==);
+#pragma once
+#ifdef HH_USE_CUDA
+#include <cuda_runtime.h>
+#include <vector>
+#include <cstddef>
 
-py::enum_<Device::Type>(m, "DeviceType")
-    .value("CPU",  Device::Type::CPU)
-    .value("CUDA", Device::Type::CUDA);
+namespace hodgkin_huxley {
 
-m.def("cuda_device_count", &cuda_device_count,
-      "Returns number of available CUDA devices (0 if no CUDA build).");
-m.def("cuda_is_available", &cuda_is_available);
+struct CudaRecordingBuffers {
+    // Pinned host double-buffers for async recording
+    double* V_ping    = nullptr;   // [N * rec_steps/2 + 1]
+    double* V_pong    = nullptr;
+    double* gate_ping = nullptr;   // [N * n_gates * rec_steps/2 + 1]
+    double* gate_pong = nullptr;
+    double* ca_ping   = nullptr;
+    double* ca_pong   = nullptr;
+
+    size_t N, n_gates, n_substances, rec_steps;
+    cudaStream_t copy_stream  = nullptr;
+    cudaEvent_t  copy_done_A, copy_done_B;
+
+    void init(size_t N, size_t n_gates, size_t n_subst, size_t rec_steps);
+    void destroy();
+
+    // Called every interval steps from compute_stream_ after scatter_voltages:
+    // schedules copy of device V → current ping buffer on copy_stream_
+    void record_step(int t_rec,
+                     const double* d_V, size_t N,
+                     const double** d_gates, size_t n_gates,
+                     const double* d_ca);
+
+    // Blocks until all async copies done; assembles final output buffers
+    void finalize(double* out_V, double* out_gates, double* out_ca);
+};
+
+} // namespace hodgkin_huxley
+#endif
 ```
 
-### `src/python/bindings.cpp` — bind `RegionalNetwork::to()`
+### Integration in `Network::simulate_with_descriptors`
 
-On the `_RegionalNetwork` binding:
+After the existing `#ifdef HH_USE_CUDA` check, when building recording buffers:
 
 ```cpp
-.def("to", &RegionalNetwork::to, py::arg("device"),
-     "Move all pool state to the given device. Call before simulate().")
-.def("current_device", &RegionalNetwork::current_device)
+#ifdef HH_USE_CUDA
+CudaRecordingBuffers cuda_rec;
+if (pool_mgr_.on_cuda() && V_buf != nullptr) {
+    cuda_rec.init(N, max_gates, n_subst, n_rec);
+}
+#endif
 ```
 
-### `src/hodgkin_huxley/_network/__init__.py` — Python-side `.to()`
+In the hot loop, replace the CPU `scatter_gates` calls with:
 
-```python
-def to(self, device: "Device") -> "RegionalNetwork":
-    """
-    Move simulation to device. Returns self for chaining.
-
-    rn.to(hh.Device.cuda(0))
-    rn.to(hh.Device.cpu())
-    """
-    if device.type == DeviceType.CUDA and not cuda_is_available():
-        raise RuntimeError(
-            "CUDA device requested but this build was not compiled with HH_USE_CUDA "
-            "or no CUDA devices are present."
-        )
-    self._rnet.to(device)
-    return self
+```cpp
+#ifdef HH_USE_CUDA
+if (pool_mgr_.on_cuda()) {
+    cuda_rec.record_step(t_rec, d_V_device, N, d_gates_device, n_gates, d_ca_device);
+} else
+#endif
+{
+    // existing CPU recording path
+}
 ```
 
-### `src/hodgkin_huxley/__init__.py`
+After the loop:
 
-Add to imports from `._core`:
-```python
-Device,
-DeviceType,
-cuda_device_count,
-cuda_is_available,
+```cpp
+#ifdef HH_USE_CUDA
+if (pool_mgr_.on_cuda()) {
+    cuda_rec.finalize(V_buf, gate_buf, calcium_buf);
+    cuda_rec.destroy();
+}
+#endif
 ```
 
-Add to `__all__`:
-```python
-"Device",
-"DeviceType",
-"cuda_device_count",
-"cuda_is_available",
-```
+### VRAM budget note
 
-### `src/hodgkin_huxley/_core.pyi` — type stubs
+For large networks (135K neurons, 50M synapses — fruit fly scale):
+- V state: 135K × 8B = ~1 MB/snapshot, trivial
+- Spike delay ring: see task 17.7 — using per-neuron ring (135K × 500 bits ≈ 8 MB) avoids the per-synapse explosion
 
-```python
-class DeviceType(enum.Enum):
-    CPU: DeviceType
-    CUDA: DeviceType
-
-class Device:
-    type: DeviceType
-    index: int
-    @staticmethod
-    def cpu() -> Device: ...
-    @staticmethod
-    def cuda(index: int = 0) -> Device: ...
-    def __repr__(self) -> str: ...
-    def __eq__(self, other: object) -> bool: ...
-
-def cuda_device_count() -> int: ...
-def cuda_is_available() -> bool: ...
-```
-
-Add `.to(device: Device) -> RegionalNetwork` and `.current_device() -> Device` stubs to `RegionalNetwork`.
-
-### Convenience string parsing (optional but recommended)
-
-Add a module-level `device(spec: str) -> Device` function in `__init__.py`:
-
-```python
-def device(spec: str) -> Device:
-    """Parse 'cpu', 'cuda', 'cuda:0', 'cuda:1', ... into a Device."""
-    if spec == "cpu":
-        return Device.cpu()
-    if spec.startswith("cuda"):
-        idx = int(spec.split(":")[-1]) if ":" in spec else 0
-        return Device.cuda(idx)
-    raise ValueError(f"Unknown device spec: {spec!r}")
-```
-
-Add `"device"` to `__all__`.
+Mitigation already established in 17.7: store only the **spike events** (1 bit per pre-neuron per step) rather than per-synapse bits. This task adds a comment in `cuda_recording.hpp` referencing the design.
 
 ---
 
@@ -122,15 +113,27 @@ Add `"device"` to `__all__`.
 
 | File | Change |
 |---|---|
-| `src/python/bindings.cpp` | Bind `Device`, `DeviceType`, `cuda_device_count`, `cuda_is_available`, `to()`, `current_device()` |
-| `src/hodgkin_huxley/_network/__init__.py` | Python `to()` with availability check |
-| `src/hodgkin_huxley/__init__.py` | Export `Device`, `DeviceType`, `cuda_device_count`, `cuda_is_available`, `device` |
-| `src/hodgkin_huxley/_core.pyi` | Stubs for all new bindings |
+| `src/cpp/include/hodgkin_huxley/cuda_recording.hpp` | New — double-buffer recording struct |
+| `src/cpp/src/cuda_recording.cu` | `init`, `record_step`, `finalize` implementations |
+| `src/cpp/src/network.cpp` | Integrate `CudaRecordingBuffers` into `simulate_with_descriptors` |
+| `src/cpp/CMakeLists.txt` | Add `src/cuda_recording.cu` to CUDA sources list |
+
+---
+
+## Baseline tests (before PR to testing branch)
+
+Requires: 17.4 (Python API) and 17.8 (CudaComposablePool with device_ptr_* accessors) merged.
+
+- [ ] `pip install -e .` completes without error
+- [ ] `pytest tests/python/ -x -q` — all existing tests pass
+- [ ] Single HH population, 200ms on CUDA with recording enabled: `result["V"].shape == (n_neurons, n_rec_steps)`, all values finite
+- [ ] Recorded V traces (CUDA) match CPU reference traces within `atol=1e-6`
+- [ ] `record_every=10` produces the correct number of recorded steps
+- [ ] `cuda_rec.finalize()` does not hang; `cudaStreamSynchronize` completes
 
 ---
 
 ## Contract for downstream tasks
 
-- Tests (17.11) use `hh.Device.cuda(0)`, `rn.to(hh.Device.cuda(0))`, `hh.cuda_is_available()`.
-- Benchmarks (17.12) use `hh.device("cuda:0")` shorthand.
-- On non-CUDA builds, `Device.cuda()` must construct without error; `rn.to(Device.cuda(0))` raises `RuntimeError` at the Python level with a clear message.
+- Task 17.11's correctness tests compare `cuda_rec.finalize()` output against CPU reference V traces — the values must match to within floating-point tolerance.
+- Task 17.12's benchmarks measure the overhead of recording vs. no recording on GPU — use `CudaRecordingBuffers::copy_done_*` events for precise timing.

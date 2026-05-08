@@ -14,6 +14,7 @@ add_library(hodgkin_huxley_core STATIC
     src/composable_pool.cpp
     src/dbs_stimulator.cpp
     src/network/pool_manager.cpp
+    src/device.cpp
 )
 
 target_include_directories(hodgkin_huxley_core PUBLIC

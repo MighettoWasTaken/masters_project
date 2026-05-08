@@ -1,123 +1,95 @@
-# Task 17.5: CudaHHPool + CudaIzPool
+# Task 17.5: CUDAPrinter — SymPy → `__device__` Codegen
 
-**Role:** CUDA engineer  
+**Role:** Codegen engineer  
 **Status:** Not started  
-**Depends on:** 17.1 (PoolBase virtual methods), 17.2 (CMake CUDA wired up)  
-**Unlocks:** 17.9 (recording interacts with CUDA pool memory)
+**Depends on:** 17.1 (parallel track — no runtime dependency)  
+**Unlocks:** 17.9 (CudaComposablePool CUSTOM_EXPR uses generated device functions)
 
 ---
 
 ## What to implement
 
-Two new pool classes in the CUDA sources created by 17.2.
+The stub `CUDAPrinter` class already exists in `src/hodgkin_huxley/_codegen.py`. Flesh it out to produce valid CUDA `__device__` scalar C code from a SymPy expression.
 
-### `src/cpp/include/hodgkin_huxley/cuda_hh_pool.hpp` (new)
+### `src/hodgkin_huxley/_codegen.py` — `CUDAPrinter`
 
-```cpp
-#pragma once
-#ifdef HH_USE_CUDA
-#include "hodgkin_huxley/pool/pool_base.hpp"
-#include "hodgkin_huxley/neuron.hpp"
+Current stub (locate by class name):
 
-namespace hodgkin_huxley {
-
-class CudaHHPool : public PoolBase {
-public:
-    explicit CudaHHPool(size_t capacity, int device_id = 0);
-    ~CudaHHPool() override;
-
-    // PoolBase overrides
-    void scatter_voltages(double* V_buf) const override;   // cudaMemcpyAsync → pinned
-    void gather_currents(const double* I_buf) override;    // cudaMemcpyAsync ← pinned
-    void step(double dt) override;                         // launch HH kernel
-    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>&) const override;
-
-    bool is_cuda()               const override { return true; }
-    int  device_id()             const override { return device_id_; }
-    void synchronize()                 override;  // cudaStreamSynchronize(stream_)
-    bool requires_pinned_memory() const override { return true; }
-    void migrate_to_device(int new_id)  override;
-
-    size_t size() const override { return n_; }
-
-    // Build-time: populate from CPU neuron objects (called by PoolManager)
-    void add(size_t net_idx, const HHNeuron::Parameters& p,
-             const HHNeuron::State& s);
-
-private:
-    int    device_id_;
-    size_t n_ = 0;
-    size_t capacity_;
-    cudaStream_t stream_ = nullptr;
-
-    // Device SoA arrays — one double* per state variable
-    double* d_V_   = nullptr;
-    double* d_m_   = nullptr;
-    double* d_h_   = nullptr;
-    double* d_n_   = nullptr;
-    double* d_I_   = nullptr;   // gathered currents
-    double* d_net_idx_ = nullptr;  // size_t array for scatter/gather indexing
-
-    // Per-neuron fixed parameters (constant memory or device arrays)
-    double* d_gNa_ = nullptr;
-    double* d_gK_  = nullptr;
-    double* d_gL_  = nullptr;
-    double* d_ENa_ = nullptr;
-    double* d_EK_  = nullptr;
-    double* d_EL_  = nullptr;
-    double* d_Cm_  = nullptr;
-
-    void alloc(size_t cap);
-    void free_device();
-};
-
-} // namespace hodgkin_huxley
-#endif // HH_USE_CUDA
+```python
+class CUDAPrinter:
+    """Stub — generates __device__ scalar C code from a SymPy expression."""
+    pass
 ```
 
-### `src/cpp/src/cuda_hh_pool.cu`
+Replace with:
 
-Implement `CudaHHPool`. Key kernel:
+```python
+class CUDAPrinter:
+    """
+    Converts a SymPy scalar expression to a CUDA __device__ function body.
 
-```cuda
-__global__ void hh_step_kernel(
-    double* V, double* m, double* h, double* n,
-    const double* I_ext,
-    const double* gNa, const double* gK, const double* gL,
-    const double* ENa, const double* EK,  const double* EL,
-    const double* Cm,
-    double dt, int N)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
+    Differences from EigenPrinter:
+    - No Eigen types — all variables are plain C doubles.
+    - exp/log/sqrt map to standard C99 math (double precision throughout).
+    - Output is a complete __device__ inline function string ready to paste
+      into a .cu file.
+    """
 
-    double v = V[i];
-    double mi = m[i], hi = h[i], ni = n[i];
+    def __init__(self, symbol_map: dict[str, str] | None = None):
+        self._sym_map = symbol_map or {}
 
-    // Standard HH alpha/beta rate functions (same formulas as hh_pool.cpp)
-    double alpha_m = (v == -40.0) ? 1.0 : 0.1*(v+40.0)/(1.0-exp(-(v+40.0)/10.0));
-    double beta_m  = 4.0*exp(-(v+65.0)/18.0);
-    double alpha_h = 0.07*exp(-(v+65.0)/20.0);
-    double beta_h  = 1.0/(1.0+exp(-(v+35.0)/10.0));
-    double alpha_n = (v == -55.0) ? 0.1 : 0.01*(v+55.0)/(1.0-exp(-(v+55.0)/10.0));
-    double beta_n  = 0.125*exp(-(v+65.0)/80.0);
+    def doprint(self, expr) -> str:
+        """Return C scalar expression string (no semicolon)."""
+        from sympy.printing.c import C99CodePrinter
+        import re
+        printer = C99CodePrinter()
+        code = printer.doprint(expr)
+        for sym, cname in self._sym_map.items():
+            code = re.sub(r'\b' + re.escape(sym) + r'\b', cname, code)
+        return code
 
-    double I_Na = gNa[i]*mi*mi*mi*hi*(v-ENa[i]);
-    double I_K  = gK[i]*ni*ni*ni*ni*(v-EK[i]);
-    double I_L  = gL[i]*(v-EL[i]);
-
-    V[i] = v + dt*(I_ext[i] - I_Na - I_K - I_L) / Cm[i];
-    m[i] = mi + dt*(alpha_m*(1.0-mi) - beta_m*mi);
-    h[i] = hi + dt*(alpha_h*(1.0-hi) - beta_h*hi);
-    n[i] = ni + dt*(alpha_n*(1.0-ni) - beta_n*ni);
-}
+    def print_device_fn(self, fn_name: str, params: list[str],
+                        expr, return_type: str = "double") -> str:
+        """Return a complete CUDA __device__ inline function."""
+        body = self.doprint(expr)
+        param_str = ", ".join(params)
+        return (
+            f"__device__ __forceinline__ {return_type} {fn_name}"
+            f"({param_str}) {{\n"
+            f"    return {body};\n"
+            f"}}"
+        )
 ```
 
-`scatter_voltages` uses `cudaMemcpyAsync(V_buf + net_idx[0], d_V_, n_*sizeof(double), cudaMemcpyDeviceToHost, stream_)` — but net_idx may not be contiguous, so use a gather kernel or `cudaMemcpy2D` pattern. Simpler: a small kernel that writes `V_buf[d_net_idx_[i]] = d_V_[i]`.
+### Helper: `compile_gate_cuda(gate_spec, fn_prefix) -> str`
 
-### `CudaIzPool` — same pattern
+```python
+def compile_gate_cuda(gate_spec, fn_prefix: str) -> str:
+    """
+    Generate CUDA __device__ functions for a gate's inf and tau expressions.
 
-Follow identical structure for `cuda_iz_pool.hpp` / `cuda_iz_pool.cu`. The Izhikevich step is simpler (2 state variables: V, u; reset condition handled with `__ballot_sync` or conditional write).
+    Returns a string with two __device__ functions:
+      {fn_prefix}_inf(double V) -> double
+      {fn_prefix}_tau(double V) -> double
+
+    Raises HHEquationError if expressions contain unsupported SymPy nodes.
+    """
+    printer = CUDAPrinter({"V": "V"})
+    inf_code = printer.print_device_fn(
+        f"{fn_prefix}_inf", ["double V"], gate_spec.inf_expr
+    )
+    tau_code = printer.print_device_fn(
+        f"{fn_prefix}_tau", ["double V"], gate_spec.tau_expr
+    )
+    return inf_code + "\n" + tau_code
+```
+
+### Exports
+
+`CUDAPrinter` is already in `__init__.py` imports and `__all__`. Add `compile_gate_cuda` to:
+- `_codegen.py` module-level exports
+- `__init__.py` `from ._codegen import (...)` block
+- `__init__.py` `__all__`
 
 ---
 
@@ -125,16 +97,25 @@ Follow identical structure for `cuda_iz_pool.hpp` / `cuda_iz_pool.cu`. The Izhik
 
 | File | Change |
 |---|---|
-| `src/cpp/include/hodgkin_huxley/cuda_hh_pool.hpp` | New class declaration |
-| `src/cpp/src/cuda_hh_pool.cu` | Kernel + PoolBase overrides |
-| `src/cpp/include/hodgkin_huxley/cuda_iz_pool.hpp` | New class declaration |
-| `src/cpp/src/cuda_iz_pool.cu` | Kernel + PoolBase overrides |
+| `src/hodgkin_huxley/_codegen.py` | Implement `CUDAPrinter`, add `compile_gate_cuda` |
+| `src/hodgkin_huxley/__init__.py` | Add `compile_gate_cuda` to imports and `__all__` |
+
+---
+
+## Baseline tests (before PR to testing branch)
+
+- [ ] `pip install -e .` completes without error
+- [ ] `pytest tests/python/ -x -q` — all existing tests pass
+- [ ] `CUDAPrinter().doprint(sympy.exp(-V/10))` returns a valid C string containing `exp`
+- [ ] `CUDAPrinter({"V": "v_in"}).doprint(V)` returns `"v_in"`
+- [ ] `print_device_fn(...)` output starts with `__device__ __forceinline__`
+- [ ] `compile_gate_cuda(gate_spec, "m")` returns a string containing `m_inf` and `m_tau`
+- [ ] Output of `doprint` contains no Python or Eigen-specific syntax
 
 ---
 
 ## Contract for downstream tasks
 
-- `requires_pinned_memory()` returns `true` — task 17.3 uses this to allocate `V_cache_pinned_`.
-- `synchronize()` calls `cudaStreamSynchronize(stream_)` — task 17.3's hot loop calls this after `step_all()`.
-- `scatter_voltages(double* V_buf)` writes into the pinned host buffer via `cudaMemcpyAsync`; caller must call `synchronize()` before reading.
-- Use forward Euler to match the CPU `HHPool` implementation exactly — correctness tests in 17.11 compare against CPU traces.
+- Task 17.9 calls `compile_gate_cuda(gate_spec, fn_prefix)` to generate `__device__` functions for each non-pattern-matched gate in a `NeuronModelSpec`.
+- Output must be valid C99/CUDA scalar code — no Eigen, no Python, no `std::` types.
+- `CUDAPrinter.print_device_fn()` is the primitive; task 17.9 calls it directly for synapse and intracellular ODE expressions.

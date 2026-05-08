@@ -12,6 +12,7 @@
 #include "hodgkin_huxley/ion_channels.hpp"
 #include "hodgkin_huxley/composable_neuron.hpp"
 #include "hodgkin_huxley/dbs_stimulator.hpp"
+#include "hodgkin_huxley/device.hpp"
 
 namespace py = pybind11;
 using namespace hodgkin_huxley;
@@ -1124,6 +1125,27 @@ PYBIND11_MODULE(_core, m) {
                    "Hz amp=" + std::to_string(p.amplitude) +
                    " PW=" + std::to_string(p.pulse_width) + "ms>";
         });
+
+    // =========================================================================
+    // Device (task17.1)
+    // =========================================================================
+    auto devCls = py::class_<Device>(m, "Device");
+    py::enum_<Device::Type>(devCls, "Type")
+        .value("CPU",  Device::Type::CPU)
+        .value("CUDA", Device::Type::CUDA)
+        .export_values();
+    devCls
+        .def_static("cpu",  &Device::cpu)
+        .def_static("cuda", &Device::cuda, py::arg("index") = 0)
+        .def_readonly("type",  &Device::type)
+        .def_readonly("index", &Device::index)
+        .def("__repr__", [](const Device& d){ return d.str(); })
+        .def("__eq__",   &Device::operator==);
+
+    m.def("cuda_device_count", &cuda_device_count,
+          "Number of available CUDA devices (0 if not built with HH_USE_CUDA).");
+    m.def("cuda_is_available",  &cuda_is_available,
+          "True if at least one CUDA device is present and accessible.");
 
     // Module version
     m.attr("__version__") = "0.7.0";

@@ -64,6 +64,13 @@ public:
 
     /// Number of intracellular substances this pool tracks.
     virtual int n_substances() const { return 0; }
+
+    // --- CUDA interface (task17) ---
+    virtual bool is_cuda()                const { return false; }
+    virtual int  device_id()              const { return -1; }
+    virtual void synchronize()                  {}
+    virtual bool requires_pinned_memory() const { return false; }
+    virtual void migrate_to_device(int /*new_device_id*/) {}
 };
 
 } // namespace hodgkin_huxley

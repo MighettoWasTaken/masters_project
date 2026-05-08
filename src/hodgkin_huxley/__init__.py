@@ -26,6 +26,7 @@ from ._core import (
     ChannelSpec,
     ConnectivityPattern,
     DBSParameters,
+    Device,
     IntegrationMethod,
     IzhikevichType,
     NeuronModelSpec,
@@ -38,6 +39,8 @@ from ._core import (
     WeightDistType,
     WeightDistribution,
     __version__,
+    cuda_device_count,
+    cuda_is_available,
 )
 
 # Backward-compat aliases for old enum names
@@ -151,6 +154,10 @@ __all__ = [
     "TaggedExpr",
     "EigenPrinter",
     "CUDAPrinter",
+    # Device API (task17)
+    "Device",
+    "cuda_device_count",
+    "cuda_is_available",
     # DBS stimulator
     "DBSStimulator",
     "DBSParameters",

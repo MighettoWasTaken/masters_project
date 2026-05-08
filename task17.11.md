@@ -2,7 +2,7 @@
 
 **Role:** Test engineer  
 **Status:** Not started  
-**Depends on:** 17.5, 17.6, 17.7, 17.8, 17.9, 17.10 (full CUDA stack)  
+**Depends on:** 17.4 (Python API), 17.6, 17.7, 17.8, 17.9, 17.10 (full CUDA stack)  
 **Unlocks:** 17.12 (benchmarks run after correctness confirmed)
 
 ---
@@ -24,6 +24,8 @@ pytestmark = pytest.mark.skipif(
 ---
 
 ### Section A — Device API (`TestDeviceAPI`)
+
+These tests require task 17.4 (Python API) merged. The basic `Device` struct tests already live in `tests/python/test_device.py` (task 17.1). This section extends them with network-level CUDA dispatch tests.
 
 | Test | What it checks |
 |---|---|
@@ -84,6 +86,17 @@ Tolerance is relaxed for networks with synapses due to order-of-operations diffe
 | `test_no_cuda_raises_clear_error` | (non-CUDA build) `rn.to(Device.cuda(0))` raises `RuntimeError` |
 | `test_large_network_no_oom` | 500 HH + 500 Iz neurons, 500 synapses each, 1000ms; no CUDA OOM |
 | `test_plasticity_cuda_fallback` | Network with STDP synapses, `.to(cuda)`; either works or raises `NotImplementedError` (no silent wrong answer) |
+
+---
+
+## Baseline tests (before PR to testing branch)
+
+Requires: all of 17.4–17.10 merged.
+
+- [ ] `pip install -e .` completes without error
+- [ ] `pytest tests/python/ -x -q` — all existing tests pass
+- [ ] `pytest tests/python/test_cuda.py -v` on a CUDA machine — all sections pass with no skip beyond `pytestmark`
+- [ ] On non-CUDA build: `pytest tests/python/test_cuda.py -v` — all tests correctly skip (no errors)
 
 ---
 
