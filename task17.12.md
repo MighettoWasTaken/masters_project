@@ -2,7 +2,7 @@
 
 **Role:** Test engineer  
 **Status:** Not started  
-**Depends on:** 17.11 (correctness confirmed before benchmarking)  
+**Depends on:** 17.11 (CUDA correctness confirmed before benchmarking)  
 **Unlocks:** Nothing — final deliverable
 
 ---
@@ -90,6 +90,19 @@ All plots saved to `benchmarks/figures/`. Print a summary table to stdout with c
 | `benchmarks/benchmark_cuda_ctxbgth.py` | New — CTX-BG-TH GPU vs CPU benchmark |
 | `benchmarks/benchmark_cuda_scaling.py` | New — scaling study |
 | `benchmarks/benchmark_cuda_memory.py` | New — VRAM profiling |
+
+---
+
+## Baseline tests (before PR to testing branch)
+
+Requires: 17.11 (all CUDA correctness tests passing) merged.
+
+- [ ] `pip install -e .` completes without error
+- [ ] `pytest tests/python/ -x -q` — all existing tests pass
+- [ ] `python benchmarks/benchmark_cuda_ctxbgth.py` runs to completion (or exits cleanly if no CUDA), produces `benchmarks/figures/cuda_ctxbgth_time.png`
+- [ ] `python benchmarks/benchmark_cuda_scaling.py` runs to completion, produces scaling plots
+- [ ] `python benchmarks/benchmark_cuda_memory.py` runs to completion, produces VRAM usage plot
+- [ ] On non-CUDA build: all benchmark scripts exit 0 with a "no CUDA" message (no exceptions)
 
 ---
 
