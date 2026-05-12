@@ -565,7 +565,7 @@ def plot_timing(results: Dict, figs_dir: Path):
         ax.loglog(sc, data["serial"], "o-",  color=COLOR_SERIAL,
                   linewidth=2, markersize=6, label="C++ serial")
         ax.loglog(sc, data["phase2"], "s-",  color=COLOR_PHASE2,
-                  linewidth=2, markersize=6, label="C++ Phase-2")
+                  linewidth=2, markersize=6, label="C++ delay-parallel")
         if data["numpy"]:
             ax.loglog(sn, data["numpy"], "D--", color=COLOR_NUMPY,
                       linewidth=2, markersize=6, label="NumPy")
@@ -577,8 +577,8 @@ def plot_timing(results: Dict, figs_dir: Path):
         ax.grid(True, which="both", alpha=0.3)
 
     fig.suptitle(
-        f"Network Simulation: Serial vs Phase-2 Threading vs NumPy\n"
-        f"({N_POP} populations, {DELAY_MS} ms inter-group delay)",
+        f"Network Simulation: Serial vs Delay-Parallel Threading vs NumPy\n"
+        f"({N_POP} populations, {DELAY_MS} ms inter-group delay, one thread group per population)",
         fontsize=14, fontweight="bold",
     )
     fig.tight_layout()
@@ -590,30 +590,21 @@ def plot_timing(results: Dict, figs_dir: Path):
 
 def plot_speedup(results: Dict, figs_dir: Path):
     """
-    1×3 speedup panels:
+    1×2 speedup panels:
       [0] NumPy / serial
       [1] NumPy / Phase-2
-      [2] serial / Phase-2  (threading gain)
     """
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     markers = ["o", "s", "^", "D"]
     colors  = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
 
-    ax_np_s  = axes[0]
-    ax_np_p  = axes[1]
-    ax_p2_s  = axes[2]
+    ax_np_s = axes[0]
+    ax_np_p = axes[1]
 
     for idx, (topo_name, data) in enumerate(results.items()):
-        sc = data["sizes_cpp"]
         sn = data["sizes_numpy"]
         mk = f"{markers[idx]}-"
         col = colors[idx]
-
-        # Phase-2 threading speedup (serial / phase2) — always available
-        sp_p2 = [s / p if p > 0 else 0.0
-                 for s, p in zip(data["serial"], data["phase2"])]
-        ax_p2_s.plot(sc, sp_p2, mk, color=col,
-                     linewidth=2, markersize=7, label=topo_name)
 
         if data["numpy"] and sn:
             n_pts = len(data["numpy"])
@@ -629,9 +620,8 @@ def plot_speedup(results: Dict, figs_dir: Path):
                          linewidth=2, markersize=7, label=topo_name)
 
     panel_cfg = [
-        (ax_np_s,  "NumPy vs C++ Serial",     "Speedup  (NumPy / serial)"),
-        (ax_np_p,  "NumPy vs C++ Phase-2",    "Speedup  (NumPy / Phase-2)"),
-        (ax_p2_s,  "Phase-2 Threading Gain",  "Speedup  (serial / Phase-2)"),
+        (ax_np_s, "NumPy vs C++ Serial",  "Speedup  (NumPy / serial)"),
+        (ax_np_p, "NumPy vs C++ Delay-Parallel", "Speedup  (NumPy / delay-parallel)"),
     ]
     for ax, title, ylabel in panel_cfg:
         ax.axhline(y=1.0, color="gray", linestyle=":", alpha=0.7, label="Parity")
@@ -642,7 +632,7 @@ def plot_speedup(results: Dict, figs_dir: Path):
         ax.legend(fontsize=9)
         ax.grid(True, which="both", alpha=0.3)
 
-    fig.suptitle("Speedup Comparison: Threading vs Python Baseline",
+    fig.suptitle("Speedup Comparison: Delay-Parallel Threading vs Python Baseline",
                  fontsize=14, fontweight="bold")
     fig.tight_layout()
     out = figs_dir / "benchmark_threading_speedup.png"
@@ -670,7 +660,7 @@ def plot_isolation(syn_data: Dict, neuron_data: Dict, figs_dir: Path):
     ax.legend(fontsize=9)
     ax.grid(True, which="both", alpha=0.3)
 
-    # --- Top-right: synapse scaling, speedup (NumPy/serial and NumPy/Phase-2) ---
+    # --- Top-right: synapse scaling, speedup (NumPy/serial and NumPy/delay-parallel) ---
     ax = axes[0, 1]
     sp_np_s = [n / s if s > 0 else 0.0
                for n, s in zip(syn_data["numpy"], syn_data["serial"])]
@@ -681,7 +671,7 @@ def plot_isolation(syn_data: Dict, neuron_data: Dict, figs_dir: Path):
                 label="NumPy / serial")
     ax.semilogx(syn_data["synapse_counts"], sp_np_p, "s-",
                 color=COLOR_PHASE2, linewidth=2, markersize=6,
-                label="NumPy / Phase-2")
+                label="NumPy / delay-parallel")
     ax.axhline(y=1.0, color="gray", linestyle=":", alpha=0.7)
     ax.set_xlabel("Number of synapses")
     ax.set_ylabel("Speedup")
@@ -706,7 +696,7 @@ def plot_isolation(syn_data: Dict, neuron_data: Dict, figs_dir: Path):
     ax.legend(fontsize=9)
     ax.grid(True, which="both", alpha=0.3)
 
-    # --- Bottom-right: neuron scaling, speedup (NumPy/serial and NumPy/Phase-2) ---
+    # --- Bottom-right: neuron scaling, speedup (NumPy/serial and NumPy/delay-parallel) ---
     ax = axes[1, 1]
     if neuron_data["numpy"]:
         n_pts = len(neuron_data["numpy"])
@@ -721,7 +711,7 @@ def plot_isolation(syn_data: Dict, neuron_data: Dict, figs_dir: Path):
                     label="NumPy / serial")
         ax.semilogx(neuron_data["numpy_N_totals"], sp_np_p_n, "s-",
                     color=COLOR_PHASE2, linewidth=2, markersize=6,
-                    label="NumPy / Phase-2")
+                    label="NumPy / delay-parallel")
     ax.axhline(y=1.0, color="gray", linestyle=":", alpha=0.7)
     ax.set_xlabel("Total neurons")
     ax.set_ylabel("Speedup")
@@ -730,7 +720,7 @@ def plot_isolation(syn_data: Dict, neuron_data: Dict, figs_dir: Path):
     ax.legend(fontsize=9)
     ax.grid(True, which="both", alpha=0.3)
 
-    fig.suptitle("Isolating Scaling: Neurons vs Synapses  (Threading Benchmark)",
+    fig.suptitle("Isolating Scaling: Neurons vs Synapses  (Delay-Parallel Threading)",
                  fontsize=14, fontweight="bold")
     fig.tight_layout()
     out = figs_dir / "benchmark_threading_isolation.png"
