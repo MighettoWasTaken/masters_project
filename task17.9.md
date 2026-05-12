@@ -1,115 +1,111 @@
-# Task 17.9: VRAM Recording Pipeline — Async Streaming to Pinned Host
+# Task 17.9: CudaComposablePool — CUSTOM_EXPR Gates + Intracellular + Modulation
 
-**Role:** VRAM / memory engineer  
+**Role:** CUDA engineer + Codegen engineer  
 **Status:** Not started  
-**Depends on:** 17.3 (pinned buffers), 17.5, 17.7 (device arrays accessible)  
-**Unlocks:** 17.11 (tests verify recording output)
+**Depends on:** 17.5 (CUDAPrinter — `__device__` codegen), 17.8 (CudaComposablePool structure + `is_custom_gate_` skip path)  
+**Unlocks:** 17.10 (recording pipeline can now rely on fully functional composable pool)
 
 ---
 
 ## What to implement
 
-On CPU, recording is done by calling `scatter_gates`, `scatter_calcium`, etc. every `interval` steps — they write directly into numpy-backed buffers. On CUDA, pool state lives on-device; copying every step is too slow. Use double-buffering and a dedicated copy stream.
+Task 17.8 built the device memory layout and pattern-matched gate kernels for `CudaComposablePool`, but skips any gate where `is_custom_gate_[g] == true`. This task fills that gap by generating `__device__` functions at build time and dispatching to them, and adds support for intracellular substance dynamics and synapse-conductance modulation.
 
-### Design
+### `src/cpp/src/cuda_composable_pool.cu` — custom gate dispatch
 
-Two streams per simulation:
-- `compute_stream_`: runs step kernels (already in each CUDA pool)
-- `copy_stream_`: runs `cudaMemcpyAsync` for recording
+After the pattern-matched gate loop in `launch_gate_kernels()`, add a second pass for custom gates:
 
-Double-buffer on host (pinned):
-- `rec_buf_A_[metric][t]`, `rec_buf_B_[metric][t]` — ping-pong between intervals
-
-### `src/cpp/include/hodgkin_huxley/cuda_recording.hpp` (new)
-
-```cpp
-#pragma once
-#ifdef HH_USE_CUDA
-#include <cuda_runtime.h>
-#include <vector>
-#include <cstddef>
-
-namespace hodgkin_huxley {
-
-struct CudaRecordingBuffers {
-    // Pinned host double-buffers for async recording
-    double* V_ping   = nullptr;   // [N * rec_steps/2 + 1]
-    double* V_pong   = nullptr;
-    double* gate_ping = nullptr;  // [N * n_gates * rec_steps/2 + 1]
-    double* gate_pong = nullptr;
-    double* ca_ping  = nullptr;
-    double* ca_pong  = nullptr;
-    // ... one pair per recorded metric
-
-    size_t N, n_gates, n_substances, rec_steps;
-    cudaStream_t copy_stream = nullptr;
-    cudaEvent_t  copy_done_A, copy_done_B;
-
-    void init(size_t N, size_t n_gates, size_t n_subst, size_t rec_steps);
-    void destroy();
-
-    // Called every interval steps from compute_stream_ after scatter_voltages:
-    // schedule copy of device V → current ping buffer on copy_stream_
-    void record_step(int t_rec,
-                     const double* d_V, size_t N,
-                     const double** d_gates, size_t n_gates,
-                     const double* d_ca);
-
-    // Block until all async copies done; assemble final output buffers
-    void finalize(double* out_V, double* out_gates, double* out_ca);
-};
-
-} // namespace hodgkin_huxley
-#endif
-```
-
-### Integration in `Network::simulate_with_descriptors`
-
-After the existing `#ifdef HH_USE_CUDA` check, when building recording buffers:
-
-```cpp
-#ifdef HH_USE_CUDA
-CudaRecordingBuffers cuda_rec;
-if (pool_mgr_.on_cuda() && V_buf != nullptr) {
-    cuda_rec.init(N, max_gates, n_subst, n_rec);
-}
-#endif
-```
-
-In the hot loop, replace the CPU `scatter_gates` calls with:
-
-```cpp
-#ifdef HH_USE_CUDA
-if (pool_mgr_.on_cuda()) {
-    cuda_rec.record_step(t_rec, d_V_device, N, d_gates_device, n_gates, d_ca_device);
-} else
-#endif
+```cuda
+// Custom gate kernel — calls generated __device__ functions by gate index
+__global__ void gate_step_custom(
+    double* gate, const double* V,
+    int gate_idx, int N, double dt,
+    const double* inf_lut,   // unused — here for ABI consistency
+    const double* tau_lut)
 {
-    // existing CPU recording path
+    // This kernel is never called directly — instead, one specialized kernel
+    // per custom gate is JIT-compiled (see below) or pre-generated per model.
+    // The generic fallback below is used when no pre-generated kernel exists.
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    // inf and tau computed by __device__ fn pointers set per-gate at alloc time
+    // (compile-time specialization path described in the codegen section below)
 }
 ```
 
-After the loop:
+### Build-time `__device__` function generation
+
+When `CudaComposablePool` is constructed with a `NeuronModelSpec` that contains `CUSTOM_EXPR` gates, the pool constructor calls `compile_gate_cuda()` (task 17.5) to generate device function strings, then writes and compiles a per-model `.cu` file:
 
 ```cpp
+// In CudaComposablePool constructor, per CUSTOM_EXPR gate g:
 #ifdef HH_USE_CUDA
-if (pool_mgr_.on_cuda()) {
-    cuda_rec.finalize(V_buf, gate_buf, calcium_buf);
-    cuda_rec.destroy();
+if (spec_.gates[g].is_custom()) {
+    std::string device_fns = compile_gate_cuda(spec_.gates[g], gate_fn_prefix(g));
+    // Write to ~/.cache/hodgkin_huxley/cuda/model_<hash>.cu
+    // Compile via nvrtc (CUDA runtime compilation) → device function pointer
+    // Store in custom_gate_fns_[g] for launch_gate_kernels()
 }
 #endif
 ```
 
-### VRAM budget note
+Use NVRTC (`nvrtc.h`) for runtime compilation of custom gate kernels. NVRTC is included with the CUDA Toolkit — no additional dependency.
 
-For large networks (135K neurons, 50M synapses — fruit fly scale):
-- V state: 135K × 8B = ~1 MB/snapshot, trivial
-- Synapse state (g, A arrays): 50M × 2 × 8B = ~800 MB for g+A
-- Spike delay ring: 50M × max_delay × 1B — at 5ms delay, dt=0.01ms → 500 steps ring × 50M = 25 GB — **do not store full ring**
+```cpp
+struct CustomGateFn {
+    CUmodule  module   = nullptr;
+    CUfunction inf_fn  = nullptr;  // __device__ double {prefix}_inf(double V)
+    CUfunction tau_fn  = nullptr;  // __device__ double {prefix}_tau(double V)
+};
+CustomGateFn custom_gate_fns_[MAX_CUSTOM_GATES];
+```
 
-Mitigation: store only the **spike events** (1 bit per pre-neuron per step) rather than per-synapse bits. The delay ring becomes an [N × max_delay_steps] bit-packed array, then fan out to synapses at read time. At 135K neurons, 500-step ring: 135K × 500 bits = ~8 MB — feasible.
+Add to private members of `CudaComposablePool`:
+```cpp
+CustomGateFn* custom_gate_fns_ = nullptr;   // [n_custom_gates]
+```
 
-Add this design note as a comment in `cuda_synapse.hpp` (task 17.6) and implement the N-indexed ring here if task 17.6 used the per-synapse approach initially.
+### Intracellular substance dynamics
+
+Each intracellular substance `s` follows an ODE: `ds/dt = f(s, V, gate_states)`. If the spec ODE is pattern-matched (linear decay + gate-driven production), use the analytical kernel. If it is a `CUSTOM_EXPR`, generate via CUDAPrinter.
+
+```cuda
+// Pattern-matched: ds/dt = -s/tau_s + alpha_s * gate^p * (1 - s)
+__global__ void substance_step_linear(
+    double* substance, const double* gate_driver, const double* V,
+    double tau_s, double alpha_s, int power, int N, double dt)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    double g = gate_driver[i];
+    double gpow = 1.0;
+    for (int p = 0; p < power; ++p) gpow *= g;
+    substance[i] += dt * (-substance[i] / tau_s + alpha_s * gpow * (1.0 - substance[i]));
+}
+```
+
+### Synapse-conductance modulation
+
+`SYNAPSE_G` modulation scales the effective synapse conductance based on intracellular substance level. Device-side modulation is applied in `accumulate_isyn` (task 17.7) via a per-neuron modulation factor array:
+
+```cuda
+// Add d_mod_factor_[N] to CudaComposablePool; updated each step after substance step
+__global__ void compute_mod_factor(
+    double* mod_factor, const double* substance,
+    double mod_scale, double mod_offset, int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    mod_factor[i] = mod_offset + mod_scale * substance[i];
+}
+```
+
+The modulation factor array is exposed via a new accessor:
+```cpp
+const double* device_ptr_mod_factor() const { return d_mod_factor_; }
+```
+
+Task 17.7's `accumulate_isyn` kernel receives a `mod_factor` pointer; when nullptr (no modulation), it skips the multiplication.
 
 ---
 
@@ -117,14 +113,27 @@ Add this design note as a comment in `cuda_synapse.hpp` (task 17.6) and implemen
 
 | File | Change |
 |---|---|
-| `src/cpp/include/hodgkin_huxley/cuda_recording.hpp` | New — double-buffer recording struct |
-| `src/cpp/src/cuda_recording.cu` | `init`, `record_step`, `finalize` implementations |
-| `src/cpp/src/network.cpp` | Integrate `CudaRecordingBuffers` into `simulate_with_descriptors` |
-| `src/cpp/CMakeLists.txt` | Add `src/cuda_recording.cu` to sources |
+| `src/cpp/src/cuda_composable_pool.cu` | Custom gate NVRTC compilation + dispatch, substance kernels, modulation factor kernel |
+| `src/cpp/include/hodgkin_huxley/cuda_composable_pool.hpp` | Add `custom_gate_fns_`, `d_mod_factor_`, `device_ptr_mod_factor()` |
+| `src/cpp/src/cuda_synapse.cu` | Accept `mod_factor` pointer in `accumulate_isyn` |
+
+---
+
+## Baseline tests (before PR to testing branch)
+
+Requires: 17.4 (Python API) and 17.8 (CudaComposablePool standard gates) merged.
+
+- [ ] `pip install -e .` completes without error
+- [ ] `pytest tests/python/ -x -q` — all existing tests pass
+- [ ] Single composable population with one `CUSTOM_EXPR` gate (e.g. `1 / (1 + exp(-(V + 40) / 10))` with non-Boltzmann tau), 200ms on CUDA: V finite, gate values finite
+- [ ] NVRTC compilation of custom gate: no error, no crash
+- [ ] Composable pool with calcium intracellular substance + `SYNAPSE_G` modulation on CUDA: mod_factor non-trivial, I_syn affected, no crash
+- [ ] `rn.to(cpu)` after composable CUDA simulate with custom gates — no crash, CPU re-simulate produces finite V
 
 ---
 
 ## Contract for downstream tasks
 
-- Task 17.11's correctness tests compare `cuda_rec.finalize()` output against CPU reference V traces — the values must match to within floating-point tolerance.
-- Task 17.12's benchmarks measure the overhead of recording vs. no recording on GPU — use `CudaRecordingBuffers::copy_done_*` events for precise timing.
+- Task 17.10's recording pipeline accesses `device_ptr_mod_factor()` via `cudaMemcpyAsync` if recording modulation state.
+- The NVRTC-compiled kernels are cached to `~/.cache/hodgkin_huxley/cuda/model_<hash>.cubin` — re-used if spec hash matches.
+- `accumulate_isyn` in task 17.7 must accept a nullable `mod_factor` pointer — `nullptr` skips modulation, pointer present applies it per-post-neuron.

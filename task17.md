@@ -10,21 +10,21 @@
 
 | # | Role | Description | Done |
 |---|---|---|---|
-| [17.1](task17.1.md) | Team lead | PoolBase CUDA interface + Device struct | [ ] |
+| [17.1](completed/task17.1.md) | Team lead | PoolBase CUDA interface + Device struct | [x] |
 | [17.2](task17.2.md) | Team lead | CMake CUDA build configuration + stub `.cu` files | [ ] |
-| [17.3](task17.3.md) | Team lead | PoolManager + Network CUDA routing + pinned memory + `rn.to(device)` | [ ] |
-| [17.4](task17.4.md) | Codegen | CUDAPrinter: SymPy → `__device__` codegen + `compile_gate_cuda()` | [ ] |
-| [17.5](task17.5.md) | CUDA eng | CudaHHPool + CudaIzPool — device SoA, step kernels, scatter/gather | [ ] |
-| [17.6](task17.6.md) | CUDA eng | On-device synapse kernels + per-neuron spike delay ring buffer | [ ] |
-| [17.7](task17.7.md) | CUDA eng | CudaComposablePool — device SoA + pattern-matched gate kernels | [ ] |
-| [17.8](task17.8.md) | CUDA eng + Codegen | CudaComposablePool — CUSTOM_EXPR gates, intracellular dynamics, modulation | [ ] |
-| [17.9](task17.9.md) | VRAM eng | Async double-buffered recording pipeline to pinned host memory | [ ] |
-| [17.10](task17.10.md) | Team lead | Python Device API, `hh.device("cuda:0")`, pybind11 bindings, `.pyi` stubs | [ ] |
+| [17.3](task17.3.md) | Team lead | PoolManager + Network CUDA routing + pinned memory + `RegionalNetwork::to()` | [ ] |
+| [17.4](task17.4.md) | Team lead | Python Device API, `hh.device("cuda:0")`, pybind11 bindings, `.pyi` stubs | [ ] |
+| [17.5](task17.5.md) | Codegen | CUDAPrinter: SymPy → `__device__` codegen + `compile_gate_cuda()` | [ ] |
+| [17.6](task17.6.md) | CUDA eng | CudaHHPool + CudaIzPool — device SoA, step kernels, scatter/gather | [ ] |
+| [17.7](task17.7.md) | CUDA eng | On-device synapse kernels + per-neuron spike delay ring buffer | [ ] |
+| [17.8](task17.8.md) | CUDA eng | CudaComposablePool — device SoA + pattern-matched gate kernels | [ ] |
+| [17.9](task17.9.md) | CUDA eng + Codegen | CudaComposablePool — CUSTOM_EXPR gates, intracellular dynamics, modulation | [ ] |
+| [17.10](task17.10.md) | VRAM eng | Async double-buffered recording pipeline to pinned host memory | [ ] |
 | [17.11](task17.11.md) | Test eng | CUDA correctness test suite (device API, pool correctness, recording, robustness) | [ ] |
 | [17.12](task17.12.md) | Test eng | GPU performance benchmarks (CTX-BG-TH, scaling study, VRAM profiling) | [ ] |
 
-**Dependency order:** 17.1 → 17.2 → {17.3, 17.5, 17.6, 17.7} → 17.8 → 17.9 → 17.10 → 17.11 → 17.12  
-**Parallel track:** 17.4 (codegen) can begin after 17.1 independently of 17.2–17.3.
+**Dependency order:** 17.1 → 17.2 → {17.6, 17.7, 17.8} → 17.9 → 17.10 → 17.11 → 17.12  
+**Parallel tracks:** 17.3 → 17.4 (Python API available once network routing lands); 17.5 (CUDAPrinter) branches from 17.1 independently; 17.8 depends on 17.6; 17.9 depends on 17.5 + 17.8.
 
 ---
 

@@ -1,130 +1,124 @@
-# Task 17.6: On-Device Synapse Kernels + Spike Delay Ring Buffer
+# Task 17.6: CudaHHPool + CudaIzPool
 
 **Role:** CUDA engineer  
 **Status:** Not started  
-**Depends on:** 17.2 (CMake), 17.5 (device memory layout established)  
-**Unlocks:** 17.9 (recording g_syn needs device-side synapse state)
+**Depends on:** 17.1 (PoolBase virtual methods), 17.2 (CMake CUDA wired up)  
+**Unlocks:** 17.7, 17.8 (synapse + composable pool tasks build on device SoA patterns established here), 17.10 (recording interacts with CUDA pool memory)
 
 ---
 
 ## What to implement
 
-The existing CPU synapse update loop lives in `network.cpp` inside `update_synapses_grouped()`. This task moves that work onto the GPU when CUDA pools are active.
+Two new pool classes in the CUDA sources created by 17.2.
 
-### `src/cpp/src/cuda_synapse.cu` + `src/cpp/include/hodgkin_huxley/cuda_synapse.hpp`
-
-#### Device-side synapse SoA
-
-Allocate on-device copies of the synapse arrays that `Network` currently holds on the host:
+### `src/cpp/include/hodgkin_huxley/cuda_hh_pool.hpp` (new)
 
 ```cpp
-struct DeviceSynapseArrays {
-    // Mirrors the host SoA in network.cpp — allocated on device
-    double* d_weight;      // [S]
-    double* d_g;           // [S] conductance state
-    double* d_A;           // [S] rise variable (alpha/double-exp)
-    double* d_delay_buf;   // [S * max_delay_steps] ring buffer (spike history)
-    int*    d_pre;         // [S] pre-neuron global index
-    int*    d_post;        // [S] post-neuron global index
-    int*    d_delay_steps; // [S]
-    int*    d_syn_type;    // [S] encodes AMPA/GABA_A/etc enum value
-    double* d_E_rev;       // [S]
-    double* d_tau_rise;    // [S]
-    double* d_tau_decay;   // [S]
-    size_t  S;             // number of synapses
-    size_t  max_delay;     // ring buffer depth
-};
-```
-
-Provide:
-- `DeviceSynapseArrays alloc_device_synapses(const Network&, int device_id)` — copies host SoA to device
-- `void free_device_synapses(DeviceSynapseArrays&)`
-
-#### Spike detection + delay ring kernel
-
-```cuda
-__global__ void update_spike_delay_ring(
-    const double* V_cache,  // [N] current voltages (pinned host — use UVA or explicit copy)
-    uint8_t* spike_ring,    // [S * max_delay] — the delay ring buffer
-    const int* pre,         // [S]
-    const int* delay_steps, // [S]
-    int S, int current_step, int max_delay,
-    double threshold)
-{
-    int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= S) return;
-    int pre_idx = pre[k];
-    bool spiked = (V_cache[pre_idx] >= threshold);
-    int slot = (current_step) % max_delay;
-    spike_ring[k * max_delay + slot] = spiked ? 1 : 0;
-}
-```
-
-#### Synapse conductance update kernel
-
-```cuda
-__global__ void update_synapses(
-    double* g, double* A,
-    const uint8_t* spike_ring,
-    const int* delay_steps,
-    const double* tau_rise, const double* tau_decay,
-    const int* syn_type,
-    int S, int current_step, int max_delay, double dt)
-{
-    int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= S) return;
-
-    int read_slot = (current_step - delay_steps[k] + max_delay) % max_delay;
-    bool spike_arrived = spike_ring[k * max_delay + read_slot];
-
-    // Exponential decay
-    g[k] *= exp(-dt / tau_decay[k]);
-    if (syn_type[k] > 0) A[k] *= exp(-dt / tau_rise[k]);  // double-exp / alpha
-
-    if (spike_arrived) {
-        g[k] += 1.0;   // weight scaling done at accumulate step
-        if (syn_type[k] > 0) A[k] += 1.0;
-    }
-}
-```
-
-#### I_syn accumulation kernel
-
-```cuda
-__global__ void accumulate_isyn(
-    double* I_syn,        // [N] output — atomicAdd into post-neuron slot
-    const double* g,
-    const double* weight,
-    const double* E_rev,
-    const double* V_cache,
-    const int* post,
-    int S)
-{
-    int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= S) return;
-    int j = post[k];
-    double i_k = weight[k] * g[k] * (V_cache[j] - E_rev[k]);
-    atomicAdd(&I_syn[j], -i_k);  // inhibitory sign convention matches CPU
-}
-```
-
-`atomicAdd(double*)` requires sm_60+ — enforced by `CMAKE_CUDA_ARCHITECTURES` in 17.2.
-
-### Integration in `Network`
-
-Add `#ifdef HH_USE_CUDA` blocks in `network.cpp` around `update_synapses_grouped()`:
-
-```cpp
+#pragma once
 #ifdef HH_USE_CUDA
-if (pool_mgr_.on_cuda()) {
-    launch_cuda_synapse_update(dev_syn_, V_cache_pinned_, I_syn_pinned_, step, dt);
-    return;
-}
+#include "hodgkin_huxley/pool/pool_base.hpp"
+#include "hodgkin_huxley/neuron.hpp"
+
+namespace hodgkin_huxley {
+
+class CudaHHPool : public PoolBase {
+public:
+    explicit CudaHHPool(size_t capacity, int device_id = 0);
+    ~CudaHHPool() override;
+
+    void scatter_voltages(double* V_buf) const override;   // cudaMemcpyAsync → pinned
+    void gather_currents(const double* I_buf) override;    // cudaMemcpyAsync ← pinned
+    void step(double dt) override;                         // launch HH kernel
+    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>&) const override;
+
+    bool is_cuda()                const override { return true; }
+    int  device_id()              const override { return device_id_; }
+    void synchronize()                  override;  // cudaStreamSynchronize(stream_)
+    bool requires_pinned_memory() const override { return true; }
+    void migrate_to_device(int new_id)  override;
+
+    size_t size() const override { return n_; }
+
+    void add(size_t net_idx, const HHNeuron::Parameters& p,
+             const HHNeuron::State& s);
+
+private:
+    int    device_id_;
+    size_t n_ = 0;
+    size_t capacity_;
+    cudaStream_t stream_ = nullptr;
+
+    double* d_V_   = nullptr;
+    double* d_m_   = nullptr;
+    double* d_h_   = nullptr;
+    double* d_n_   = nullptr;
+    double* d_I_   = nullptr;
+    size_t* d_net_idx_ = nullptr;
+
+    double* d_gNa_ = nullptr;
+    double* d_gK_  = nullptr;
+    double* d_gL_  = nullptr;
+    double* d_ENa_ = nullptr;
+    double* d_EK_  = nullptr;
+    double* d_EL_  = nullptr;
+    double* d_Cm_  = nullptr;
+
+    void alloc(size_t cap);
+    void free_device();
+};
+
+} // namespace hodgkin_huxley
 #endif
-// existing CPU path
 ```
 
-`DeviceSynapseArrays dev_syn_` added as a `Network` private member, allocated in `simulate_with_descriptors` build phase when `on_cuda()` is true.
+### `src/cpp/src/cuda_hh_pool.cu`
+
+Key kernel — forward Euler matching `hh_pool.cpp` exactly:
+
+```cuda
+__global__ void hh_step_kernel(
+    double* V, double* m, double* h, double* n,
+    const double* I_ext,
+    const double* gNa, const double* gK, const double* gL,
+    const double* ENa, const double* EK,  const double* EL,
+    const double* Cm,
+    double dt, int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    double v = V[i];
+    double mi = m[i], hi = h[i], ni = n[i];
+
+    double alpha_m = (v == -40.0) ? 1.0 : 0.1*(v+40.0)/(1.0-exp(-(v+40.0)/10.0));
+    double beta_m  = 4.0*exp(-(v+65.0)/18.0);
+    double alpha_h = 0.07*exp(-(v+65.0)/20.0);
+    double beta_h  = 1.0/(1.0+exp(-(v+35.0)/10.0));
+    double alpha_n = (v == -55.0) ? 0.1 : 0.01*(v+55.0)/(1.0-exp(-(v+55.0)/10.0));
+    double beta_n  = 0.125*exp(-(v+65.0)/80.0);
+
+    double I_Na = gNa[i]*mi*mi*mi*hi*(v-ENa[i]);
+    double I_K  = gK[i]*ni*ni*ni*ni*(v-EK[i]);
+    double I_L  = gL[i]*(v-EL[i]);
+
+    V[i] = v + dt*(I_ext[i] - I_Na - I_K - I_L) / Cm[i];
+    m[i] = mi + dt*(alpha_m*(1.0-mi) - beta_m*mi);
+    h[i] = hi + dt*(alpha_h*(1.0-hi) - beta_h*hi);
+    n[i] = ni + dt*(alpha_n*(1.0-ni) - beta_n*ni);
+}
+```
+
+`scatter_voltages`: use a small gather kernel writing `V_buf[d_net_idx_[i]] = d_V_[i]` since net_idx is not guaranteed contiguous.
+
+### `CudaIzPool` — same pattern
+
+`cuda_iz_pool.hpp` / `cuda_iz_pool.cu` following identical structure. Izhikevich reset uses predicated assignment (no warp divergence):
+
+```cuda
+bool fired = V[i] >= 30.0;
+V[i] = fired ? c[i] : V[i];
+u[i] = fired ? u[i] + d[i] : u[i];
+```
 
 ---
 
@@ -132,15 +126,29 @@ if (pool_mgr_.on_cuda()) {
 
 | File | Change |
 |---|---|
-| `src/cpp/include/hodgkin_huxley/cuda_synapse.hpp` | New — `DeviceSynapseArrays`, launch declarations |
-| `src/cpp/src/cuda_synapse.cu` | Kernels + alloc/free helpers |
-| `src/cpp/include/hodgkin_huxley/network.hpp` | `DeviceSynapseArrays dev_syn_` private member |
-| `src/cpp/src/network.cpp` | Conditional CUDA dispatch in synapse update hot loop |
+| `src/cpp/include/hodgkin_huxley/cuda_hh_pool.hpp` | New class declaration |
+| `src/cpp/src/cuda_hh_pool.cu` | Kernel + PoolBase overrides |
+| `src/cpp/include/hodgkin_huxley/cuda_iz_pool.hpp` | New class declaration |
+| `src/cpp/src/cuda_iz_pool.cu` | Kernel + PoolBase overrides |
+
+---
+
+## Baseline tests (before PR to testing branch)
+
+Requires: 17.4 (Python API) merged so `rn.to(device)` is available.
+
+- [ ] `pip install -e .` completes without error
+- [ ] `pytest tests/python/ -x -q` — all existing tests pass
+- [ ] Single HH population (20 neurons, no synapses, 200ms): `rn.to(hh.Device.cuda(0))` → simulate → V array shape correct, all values finite
+- [ ] Single Iz population (20 neurons, no synapses, 200ms): same checks
+- [ ] `rn.to(hh.Device.cpu())` after CUDA simulate — no crash, CPU simulate produces finite V
+- [ ] `cuda_hh_pool.synchronize()` called implicitly — no hang
 
 ---
 
 ## Contract for downstream tasks
 
-- `d_delay_buf` ring is the device-side equivalent of the CPU `spike_detected_` + delay buffer. Task 17.9 does not record spike events directly from this; it uses the post-scatter V values.
-- `I_syn_pinned_` is cleared to zero on device each step (add a `cudaMemsetAsync` before accumulate kernel). Task 17.3 allocates this pinned buffer.
-- PLASTICITY (STDP/STP): defer — keep the `has_stdp_` / `has_stp_` guard. If either is true and `on_cuda()` is true, fall back to CPU synapse update with a CUDA stream sync first. Log a warning. Full CUDA plasticity is out of scope for task17.
+- `requires_pinned_memory()` returns `true` — task 17.3 uses this to allocate `V_cache_pinned_`.
+- `synchronize()` calls `cudaStreamSynchronize(stream_)` — task 17.3's hot loop calls this after `step_all()`.
+- `scatter_voltages(double* V_buf)` writes into pinned host buffer via `cudaMemcpyAsync`; caller must synchronize before reading.
+- Use forward Euler to match the CPU `HHPool` implementation — correctness tests in 17.11 compare against CPU traces.

@@ -1,108 +1,96 @@
-# Task 17.4: CUDAPrinter — SymPy → `__device__` Codegen
+# Task 17.4: Python Device API + pybind11 Bindings
 
-**Role:** Codegen engineer  
+**Role:** Team lead  
 **Status:** Not started  
-**Depends on:** 17.1 (parallel track — no runtime dependency)  
-**Unlocks:** 17.8 (CudaComposablePool CUSTOM_EXPR uses generated device functions)
+**Depends on:** 17.1 (Device struct — core bindings already done), 17.3 (RegionalNetwork::to(Device))  
+**Unlocks:** 17.6, 17.7, 17.8, 17.9, 17.10 (all CUDA pool tasks need Python-level testing from day one)
+
+---
+
+## Note on 17.1 overlap
+
+Task 17.1 already bound `Device`, `cuda_device_count`, and `cuda_is_available` in `bindings.cpp` and exported them from `__init__.py` so that `test_device.py` could run immediately. This task completes the remaining Python API surface:
+
+- `rn.to(device)` / `rn.current_device()` on `RegionalNetwork`
+- `hh.device("cuda:0")` string-parsing helper
+- `_core.pyi` type stubs
+- `DeviceType` enum export
+
+Do not re-bind what 17.1 already bound — check `bindings.cpp` and `__init__.py` first.
 
 ---
 
 ## What to implement
 
-The stub `CUDAPrinter` class already exists in `src/hodgkin_huxley/_codegen.py`. Flesh it out to produce valid CUDA `__device__` scalar C code from a SymPy expression.
+### `src/python/bindings.cpp` — bind `RegionalNetwork::to()`
 
-### `src/hodgkin_huxley/_codegen.py` — `CUDAPrinter`
+On the `_RegionalNetwork` binding (after 17.3 adds `RegionalNetwork::to()` to the C++ class):
 
-Current stub (locate by class name):
-
-```python
-class CUDAPrinter:
-    """Stub — generates __device__ scalar C code from a SymPy expression."""
-    pass
+```cpp
+.def("to", &RegionalNetwork::to, py::arg("device"),
+     "Move all pool state to the given device. Call before simulate().")
+.def("current_device", &RegionalNetwork::current_device)
 ```
 
-Replace with:
+### `src/hodgkin_huxley/_network/__init__.py` — Python-side `.to()`
 
 ```python
-class CUDAPrinter:
+def to(self, device: "Device") -> "RegionalNetwork":
     """
-    Converts a SymPy scalar expression to a CUDA __device__ function body.
+    Move simulation to device. Returns self for chaining.
 
-    Differences from EigenPrinter:
-    - No Eigen types — all variables are plain C doubles.
-    - exp/log/sqrt map to CUDA math intrinsics (expf/logf/sqrtf for float,
-      exp/log/sqrt for double — we use double throughout).
-    - Output is a complete __device__ inline function string ready to paste
-      into a .cu file.
+    rn.to(hh.Device.cuda(0))
+    rn.to(hh.Device.cpu())
     """
-
-    # Maps SymPy symbol names to the C variable names used inside the kernel.
-    # Caller supplies this when building the printer.
-    def __init__(self, symbol_map: dict[str, str] | None = None):
-        self._sym_map = symbol_map or {}
-
-    def doprint(self, expr) -> str:
-        """Return C scalar expression string (no semicolon)."""
-        from sympy.printing.c import C99CodePrinter
-        printer = C99CodePrinter()
-        code = printer.doprint(expr)
-        for sym, cname in self._sym_map.items():
-            # whole-word replace: avoid partial matches
-            import re
-            code = re.sub(r'\b' + re.escape(sym) + r'\b', cname, code)
-        return code
-
-    def print_device_fn(self, fn_name: str, params: list[str],
-                        expr, return_type: str = "double") -> str:
-        """
-        Return a complete CUDA __device__ inline function.
-
-        params: list of "double v", "double s", etc.
-        expr:   SymPy expression for the return value.
-        """
-        body = self.doprint(expr)
-        param_str = ", ".join(params)
-        return (
-            f"__device__ __forceinline__ {return_type} {fn_name}"
-            f"({param_str}) {{\n"
-            f"    return {body};\n"
-            f"}}"
+    if device.type == hh.Device.Type.CUDA and not hh.cuda_is_available():
+        raise RuntimeError(
+            "CUDA device requested but this build was not compiled with HH_USE_CUDA "
+            "or no CUDA devices are present."
         )
+    self._rnet.to(device)
+    return self
+
+def current_device(self) -> "Device":
+    return self._rnet.current_device()
 ```
 
-### Helper: `compile_gate_cuda(gate_spec, fn_prefix) -> str`
-
-Add a module-level function that generates the pair of `__device__` functions (`_inf` and `_tau`) for a gate, using `CUDAPrinter`. This mirrors `compile_gate_product_vm` but produces CUDA source instead of VM bytecode.
+### `src/hodgkin_huxley/__init__.py` — `device()` helper
 
 ```python
-def compile_gate_cuda(gate_spec, fn_prefix: str) -> str:
-    """
-    Generate CUDA __device__ functions for a gate's inf and tau expressions.
-
-    Returns a string containing two __device__ functions:
-      {fn_prefix}_inf(double V) -> double
-      {fn_prefix}_tau(double V) -> double
-
-    Raises HHEquationError if the expressions contain unsupported SymPy nodes.
-    """
-    from sympy import symbols
-    V_sym = symbols("V")
-    printer = CUDAPrinter({"V": "V"})
-
-    inf_code = printer.print_device_fn(
-        f"{fn_prefix}_inf", ["double V"], gate_spec.inf_expr
-    )
-    tau_code = printer.print_device_fn(
-        f"{fn_prefix}_tau", ["double V"], gate_spec.tau_expr
-    )
-    return inf_code + "\n" + tau_code
+def device(spec: str) -> "Device":
+    """Parse 'cpu', 'cuda', 'cuda:0', 'cuda:1', ... into a Device."""
+    if spec == "cpu":
+        return Device.cpu()
+    if spec.startswith("cuda"):
+        idx = int(spec.split(":")[-1]) if ":" in spec else 0
+        return Device.cuda(idx)
+    raise ValueError(f"Unknown device spec: {spec!r}")
 ```
 
-### Exports
+Add `"device"` to `__all__`.
 
-Add `CUDAPrinter` to `__init__.py` exports (it's already imported — just verify it's present in `__all__`).
+### `src/hodgkin_huxley/_core.pyi` — type stubs
 
-Add `compile_gate_cuda` to `_codegen.py` exports and to `__init__.py` `from ._codegen import (...)` and `__all__`.
+```python
+class Device:
+    class Type(enum.Enum):
+        CPU: Device.Type
+        CUDA: Device.Type
+    type: Device.Type
+    index: int
+    @staticmethod
+    def cpu() -> Device: ...
+    @staticmethod
+    def cuda(index: int = 0) -> Device: ...
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object) -> bool: ...
+
+def cuda_device_count() -> int: ...
+def cuda_is_available() -> bool: ...
+def device(spec: str) -> Device: ...
+```
+
+Add `.to(device: Device) -> RegionalNetwork` and `.current_device() -> Device` to the `RegionalNetwork` stub.
 
 ---
 
@@ -110,13 +98,26 @@ Add `compile_gate_cuda` to `_codegen.py` exports and to `__init__.py` `from ._co
 
 | File | Change |
 |---|---|
-| `src/hodgkin_huxley/_codegen.py` | Implement `CUDAPrinter`, add `compile_gate_cuda` |
-| `src/hodgkin_huxley/__init__.py` | Add `compile_gate_cuda` to imports and `__all__` |
+| `src/python/bindings.cpp` | Add `to()`, `current_device()` to `RegionalNetwork` binding |
+| `src/hodgkin_huxley/_network/__init__.py` | Python `to()` + `current_device()` with availability check |
+| `src/hodgkin_huxley/__init__.py` | Add `device()` helper + `"device"` to `__all__` |
+| `src/hodgkin_huxley/_core.pyi` | Complete stubs for all Device API |
+
+---
+
+## Baseline tests (before PR to testing branch)
+
+- [ ] `pip install -e .` completes without error
+- [ ] `pytest tests/python/ -x -q` — all existing tests pass
+- [ ] `hh.device("cpu") == hh.Device.cpu()` — string helper works
+- [ ] `hh.device("cuda:1").index == 1`
+- [ ] `rn.to(hh.Device.cpu())` on a minimal network — no exception, `rn.current_device() == hh.Device.cpu()`
+- [ ] `rn.to(hh.Device.cuda(0))` raises `RuntimeError` on non-CUDA build
 
 ---
 
 ## Contract for downstream tasks
 
-- Task 17.8 calls `compile_gate_cuda(gate_spec, fn_prefix)` to generate `__device__` functions for each non-pattern-matched gate in a `NeuronModelSpec`.
-- Output must be valid C99/CUDA scalar code — no Eigen, no Python, no `std::` types.
-- `CUDAPrinter.print_device_fn()` is the primitive; task 17.8 calls it directly for synapse and intracellular ODE expressions.
+- All CUDA pool tasks (17.6–17.10) write per-task Python tests using `hh.Device.cuda(0)` and `rn.to(...)`.
+- `hh.device("cuda:0")` is the shorthand used in benchmarks (17.12).
+- On non-CUDA builds, `rn.to(Device.cuda(0))` must raise `RuntimeError` with a clear message — no silent wrong answer.

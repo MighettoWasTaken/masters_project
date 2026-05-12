@@ -9,16 +9,16 @@ This project uses a single shared repository with task-scoped feature branches a
 ```
 main
  ├── task/17-1          (team lead)        — no dependencies, branch from main
- ├── task/17-2          (team lead)        — depends on 17.1, branch after 17.1 merges
- ├── task/17-4          (codegen)          — parallel track, branch from main immediately
- ├── task/17-3          (team lead)        — depends on 17.1 + 17.2
- ├── task/17-5          (CUDA eng)         — depends on 17.1 + 17.2
- ├── task/17-6          (CUDA eng)         — depends on 17.2 + 17.5
- ├── task/17-7          (CUDA eng)         — depends on 17.1 + 17.2 + 17.5
- ├── task/17-8          (CUDA + codegen)   — depends on 17.4 + 17.7
- ├── task/17-9          (VRAM eng)         — depends on 17.3 + 17.5 + 17.7
- ├── task/17-10         (team lead)        — depends on 17.1 + 17.3
- ├── task/17-11         (test eng)         — depends on full stack (17.5–17.10)
+ ├── task/17-2          (team lead)        — depends on 17.1
+ ├── task/17-3          (team lead)        — depends on 17.2
+ ├── task/17-4          (team lead)        — depends on 17.3 (rn.to() C++ must exist)
+ ├── task/17-5          (codegen)          — parallel track, branch from main after 17.1
+ ├── task/17-6          (CUDA eng)         — depends on 17.1 + 17.2
+ ├── task/17-7          (CUDA eng)         — depends on 17.2 + 17.6
+ ├── task/17-8          (CUDA eng)         — depends on 17.1 + 17.2 + 17.6
+ ├── task/17-9          (CUDA + codegen)   — depends on 17.5 + 17.8
+ ├── task/17-10         (VRAM eng)         — depends on 17.3 + 17.6 + 17.7 + 17.8
+ ├── task/17-11         (test eng)         — depends on full stack (17.4–17.10)
  └── task/17-12         (test eng)         — depends on 17.11
 ```
 
@@ -36,15 +36,15 @@ If your dependency is delayed, do design work, read the relevant headers, write 
 
 ### 2. Branch from `main`, not from another dev's branch
 
-Once the dependency task merges to `main`, branch from `main`:
+Once the dependency task merges to `testing`, branch from `testing`:
 
 ```bash
-git checkout main
+git checkout testing
 git pull
-git checkout -b task/17-5
+git checkout -b task/17-6
 ```
 
-The only exception is a sub-task file (`task/17-5-1`) that directly extends work in the parent branch before that branch has merged — in that case branch from the parent task branch and PR to it, not to `main`.
+The only exception is a sub-task file (`task/17-6-1`) that directly extends work in the parent branch before that branch has merged to `testing` — in that case branch from the parent task branch and PR to it, not to `testing`.
 
 ### 3. Sync by rebasing, not merging
 
@@ -65,9 +65,33 @@ Each PR corresponds to one task file. PRs that bundle multiple tasks will be sen
 
 For large tasks completed across multiple commits, one PR is still correct — just keep the individual commits clean and task-scoped.
 
-### 5. PRs target `main`
+### 5. Two-stage PR flow: feature → `testing` → `main`
 
-All PRs go to `main`. The team lead reviews and merges. Do not merge your own PR.
+PRs do not go directly to `main`. Every feature branch first targets the shared `testing` branch:
+
+```
+task17-X  →  testing  →  main
+```
+
+**Stage 1 — PR to `testing`:**
+- Open when your task's baseline tests pass (see the "Baseline tests" checklist in your task file)
+- The team lead does a lightweight review: interface contracts, no regressions, baseline tests green
+- Merge to `testing` unblocks downstream devs who need your interface
+
+**Stage 2 — PR to `main`:**
+- The `testing` branch accumulates a milestone's worth of tasks (e.g. all of 17.2–17.5)
+- Team lead opens a single PR from `testing` → `main` after confirming the full regression suite passes
+- No individual feature branch ever PRs directly to `main`
+
+**Rebasing against `testing`:**
+When a dependency merges to `testing`, update your branch from `testing` (not `main`):
+
+```bash
+git fetch origin
+git rebase origin/testing
+```
+
+Only rebase against `main` when starting a fresh task after a `testing` → `main` merge.
 
 ---
 
@@ -78,14 +102,15 @@ The team lead reviews in dependency order — blockers first:
 | Priority | Task | Blocks |
 |---|---|---|
 | 1 | 17.1 | Everything |
-| 2 | 17.2 | 17.3, 17.5, 17.6, 17.7 |
-| 3 | 17.3 | 17.9, 17.10 |
-| 3 | 17.4 | 17.8 |
-| 3 | 17.5 | 17.6, 17.7, 17.9 |
-| 4 | 17.7 | 17.8 |
-| 4 | 17.9 | 17.11 |
-| 4 | 17.10 | 17.11 |
-| 5 | 17.8 | 17.11 |
+| 2 | 17.2 | 17.3, 17.6, 17.7, 17.8 |
+| 3 | 17.3 | 17.4, 17.10 |
+| 3 | 17.5 (parallel) | 17.9 |
+| 3 | 17.6 | 17.7, 17.8, 17.10 |
+| 4 | 17.4 | 17.11 |
+| 4 | 17.7 | 17.10 |
+| 4 | 17.8 | 17.9, 17.10 |
+| 5 | 17.9 | 17.11 |
+| 5 | 17.10 | 17.11 |
 | 6 | 17.11 | 17.12 |
 | 7 | 17.12 | — |
 
@@ -114,16 +139,16 @@ The leading cause of incompatible work is one dev assuming an interface that ano
 ## Quick reference
 
 ```
-# Start a new task (after dependencies merged)
-git checkout main && git pull
+# Start a new task (after dependencies merged to testing)
+git checkout testing && git pull
 git checkout -b task/17-X
 
-# Sync when main moves
+# Sync when testing moves
 git fetch origin
-git rebase origin/main
+git rebase origin/testing
 
-# Push and open PR
+# Push and open PR to testing branch
 git push -u origin task/17-X
-# Open PR on GitHub targeting main
+# Open PR on GitHub targeting testing (not main)
 # Title: [task 17.X] completed|partial: <summary>
 ```

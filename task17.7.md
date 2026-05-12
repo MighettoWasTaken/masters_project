@@ -1,140 +1,106 @@
-# Task 17.7: CudaComposablePool — Device SoA + Standard Gate Kernels
+# Task 17.7: On-Device Synapse Kernels + Spike Delay Ring Buffer
 
 **Role:** CUDA engineer  
 **Status:** Not started  
-**Depends on:** 17.1 (PoolBase), 17.2 (CMake), 17.5 (establishes device SoA patterns)  
-**Unlocks:** 17.8 (CUSTOM_EXPR kernels extend this class)
+**Depends on:** 17.2 (CMake), 17.6 (device memory layout established)  
+**Unlocks:** 17.10 (recording needs device-side synapse state)
 
 ---
 
 ## What to implement
 
-`ComposablePool` is the most general pool — supports arbitrary gate counts, intracellular substances, and modulation. This task covers the device memory layout and the kernels for gates whose expressions are **pattern-matched** (Boltzmann, 6 tau forms, 4 rate forms) — i.e., the standard forms that already map to pre-compiled C++ paths.
+The existing CPU synapse update loop lives in `network.cpp` inside `update_synapses_grouped()`. This task moves that work onto the GPU when CUDA pools are active.
 
-Custom (VM) expressions are handled in task 17.8.
+### `src/cpp/src/cuda_synapse.cu` + `src/cpp/include/hodgkin_huxley/cuda_synapse.hpp`
 
-### `src/cpp/include/hodgkin_huxley/cuda_composable_pool.hpp` (new)
+#### Device-side synapse SoA
 
 ```cpp
-#pragma once
-#ifdef HH_USE_CUDA
-#include "hodgkin_huxley/pool/pool_base.hpp"
-#include "hodgkin_huxley/model/neuron_model_spec.hpp"
-#include <cuda_runtime.h>
-
-namespace hodgkin_huxley {
-
-class CudaComposablePool : public PoolBase {
-public:
-    CudaComposablePool(const NeuronModelSpec& spec, size_t capacity, int device_id = 0);
-    ~CudaComposablePool() override;
-
-    void scatter_voltages(double* V_buf) const override;
-    void gather_currents(const double* I_buf) override;
-    void step(double dt) override;
-    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>&) const override;
-
-    bool is_cuda()                const override { return true; }
-    int  device_id()              const override { return device_id_; }
-    void synchronize()                  override;
-    bool requires_pinned_memory() const override { return true; }
-    void migrate_to_device(int new_id)  override;
-
-    size_t size() const override { return n_; }
-    int    n_gates() const override;
-    int    n_substances() const override;
-    bool   has_synapse_g_mods() const;
-
-    void add(size_t net_idx, double V0,
-             const std::vector<double>& gate_states,
-             const std::vector<double>& substance_states);
-
-    bool contains_neuron(size_t global_idx) const;
-    double get_substance_at(size_t global_idx, size_t subst_idx) const;  // host copy
-
-private:
-    NeuronModelSpec spec_;
-    int    device_id_;
-    size_t n_ = 0;
-    size_t capacity_;
-    cudaStream_t stream_ = nullptr;
-
-    // Device SoA — layout: [n_neurons] per variable
-    double* d_V_   = nullptr;
-    double* d_I_   = nullptr;
-    double** d_gates_ = nullptr;      // [n_gates][n_neurons]
-    double** d_substances_ = nullptr; // [n_subst][n_neurons]
-    size_t*  d_net_idx_ = nullptr;
-
-    // Gate parameter arrays (constant across neurons — broadcast in kernel)
-    // These hold per-gate scalars from the spec.
-    struct GateParams { double v_half, k, tau_scale, tau_min; /* etc. */ };
-    GateParams* d_gate_params_ = nullptr;
-
-    void alloc(size_t cap);
-    void free_device();
-    void launch_gate_kernels(double dt);
-    void launch_V_kernel(double dt);
+struct DeviceSynapseArrays {
+    double* d_weight;
+    double* d_g;           // [S] conductance state
+    double* d_A;           // [S] rise variable (alpha/double-exp)
+    double* d_delay_buf;   // [S * max_delay_steps] ring buffer
+    int*    d_pre;
+    int*    d_post;
+    int*    d_delay_steps;
+    int*    d_syn_type;
+    double* d_E_rev;
+    double* d_tau_rise;
+    double* d_tau_decay;
+    size_t  S;
+    size_t  max_delay;
 };
-
-} // namespace hodgkin_huxley
-#endif
 ```
 
-### `src/cpp/src/cuda_composable_pool.cu`
+Provide:
+- `DeviceSynapseArrays alloc_device_synapses(const Network&, int device_id)`
+- `void free_device_synapses(DeviceSynapseArrays&)`
 
-#### Membrane voltage kernel
+#### Spike detection + delay ring kernel
 
 ```cuda
-__global__ void composable_V_step(
-    double* V, const double* I_ext, const double* I_ion,
-    const double* Cm, int N, double dt)
+__global__ void update_spike_delay_ring(
+    const double* V_cache, uint8_t* spike_ring,
+    const int* pre, const int* delay_steps,
+    int S, int current_step, int max_delay, double threshold)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    V[i] += dt * (I_ext[i] - I_ion[i]) / Cm[i];
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= S) return;
+    bool spiked = (V_cache[pre[k]] >= threshold);
+    spike_ring[k * max_delay + (current_step % max_delay)] = spiked ? 1 : 0;
 }
 ```
 
-`I_ion` is accumulated by the gate kernels into a temporary device array before this kernel runs.
-
-#### Standard gate kernel — Boltzmann inf, pattern-matched tau
-
-Each gate type (Boltzmann, alpha/beta, etc.) gets its own kernel or a dispatch via a per-gate `gate_type` enum stored alongside `GateParams`:
+#### Synapse conductance update kernel
 
 ```cuda
-__global__ void gate_step_boltzmann(
-    double* gate,      // [N] gate variable
-    const double* V,
-    double v_half, double k, double tau_scale, double tau_min,
-    int N, double dt)
+__global__ void update_synapses(
+    double* g, double* A, const uint8_t* spike_ring,
+    const int* delay_steps, const double* tau_rise, const double* tau_decay,
+    const int* syn_type, int S, int current_step, int max_delay, double dt)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    double inf = 1.0 / (1.0 + exp(-(V[i] - v_half) / k));
-    double tau = tau_scale + tau_min;  // simplified — full form depends on tau_type
-    gate[i] += dt * (inf - gate[i]) / tau;
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= S) return;
+    int read_slot = (current_step - delay_steps[k] + max_delay) % max_delay;
+    bool spike_arrived = spike_ring[k * max_delay + read_slot];
+    g[k] *= exp(-dt / tau_decay[k]);
+    if (syn_type[k] > 0) A[k] *= exp(-dt / tau_rise[k]);
+    if (spike_arrived) {
+        g[k] += 1.0;
+        if (syn_type[k] > 0) A[k] += 1.0;
+    }
 }
 ```
 
-The full set of pattern-matched kernels covers:
-1. Boltzmann inf + constant tau
-2. Boltzmann inf + Boltzmann-product tau (tau_A / (1 + exp(...)))
-3. Alpha/beta rate function form (calls device helper functions)
+#### I_syn accumulation kernel
 
-For gates that are NOT pattern-matched (CUSTOM_EXPR), skip in this task — add a `bool is_custom_[n_gates]` flag and skip the kernel call. Task 17.8 fills that gap.
+```cuda
+__global__ void accumulate_isyn(
+    double* I_syn, const double* g, const double* weight,
+    const double* E_rev, const double* V_cache, const int* post, int S)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= S) return;
+    atomicAdd(&I_syn[post[k]], -weight[k] * g[k] * (V_cache[post[k]] - E_rev[k]));
+}
+```
 
-#### `step()` implementation
+`atomicAdd(double*)` requires sm_60+ — enforced by `CMAKE_CUDA_ARCHITECTURES` in 17.2.
+
+### Integration in `Network`
 
 ```cpp
-void CudaComposablePool::step(double dt) {
-    // 1. Launch gate kernels (pattern-matched gates only; custom gates skipped)
-    launch_gate_kernels(dt);
-    // 2. Launch V update kernel
-    launch_V_kernel(dt);
-    // Async — caller calls synchronize() before reading
+#ifdef HH_USE_CUDA
+if (pool_mgr_.on_cuda()) {
+    launch_cuda_synapse_update(dev_syn_, V_cache_pinned_, I_syn_pinned_, step, dt);
+    return;
 }
+#endif
+// existing CPU path
 ```
+
+`DeviceSynapseArrays dev_syn_` added as a `Network` private member.
 
 ---
 
@@ -142,13 +108,27 @@ void CudaComposablePool::step(double dt) {
 
 | File | Change |
 |---|---|
-| `src/cpp/include/hodgkin_huxley/cuda_composable_pool.hpp` | New class |
-| `src/cpp/src/cuda_composable_pool.cu` | Device SoA alloc + gate/V kernels |
+| `src/cpp/include/hodgkin_huxley/cuda_synapse.hpp` | New — `DeviceSynapseArrays`, launch declarations |
+| `src/cpp/src/cuda_synapse.cu` | Kernels + alloc/free helpers |
+| `src/cpp/include/hodgkin_huxley/network.hpp` | `DeviceSynapseArrays dev_syn_` private member |
+| `src/cpp/src/network.cpp` | Conditional CUDA dispatch in synapse update hot loop |
+
+---
+
+## Baseline tests (before PR to testing branch)
+
+Requires: 17.4 (Python API) and 17.6 (CudaHHPool) merged.
+
+- [ ] `pip install -e .` completes without error
+- [ ] `pytest tests/python/ -x -q` — all existing tests pass
+- [ ] Two HH populations connected with AMPA synapses (delay=5ms), 200ms: CUDA simulate produces finite V, no crash
+- [ ] Two Iz populations connected with GABA_A synapses, 200ms: finite V, no crash
+- [ ] Network with delay=0 synapses on CUDA — no crash
+- [ ] STDP/STP network on CUDA falls back to CPU synapse update without crashing (no silent wrong answer)
 
 ---
 
 ## Contract for downstream tasks
 
-- Task 17.8 extends `CudaComposablePool` by implementing the `is_custom_` gate path — it calls device functions generated by `CUDAPrinter` (task 17.4).
-- Task 17.9's recording interacts with `d_gates_` and `d_substances_` via `cudaMemcpyAsync` — ensure these device arrays are accessible from outside the class through a `device_ptr_gates(int gate_idx)` getter or similar accessor.
-- `migrate_to_device(new_id)`: free all device arrays, `cudaSetDevice(new_id)`, re-alloc, copy from a host-side snapshot. Keep a host mirror (`h_V_`, `h_gates_`, etc.) updated after each `synchronize()` call, or just copy back on demand.
+- `I_syn_pinned_` is cleared to zero each step via `cudaMemsetAsync` before accumulate kernel. Task 17.3 allocates this pinned buffer.
+- PLASTICITY (STDP/STP): if `has_stdp_` or `has_stp_` is true and `on_cuda()` is true, fall back to CPU synapse update with a prior CUDA stream sync. Log a warning. Full CUDA plasticity is out of scope for task17.

@@ -1,86 +1,124 @@
-# Task 17.8: CudaComposablePool — CUSTOM_EXPR, Intracellular, Modulation
+# Task 17.8: CudaComposablePool — Device SoA + Standard Gate Kernels
 
-**Role:** CUDA engineer + Codegen engineer  
+**Role:** CUDA engineer  
 **Status:** Not started  
-**Depends on:** 17.4 (CUDAPrinter), 17.7 (CudaComposablePool structure)  
-**Unlocks:** 17.11 (tests need full composable pool support)
+**Depends on:** 17.1 (PoolBase), 17.2 (CMake), 17.6 (establishes device SoA patterns)  
+**Unlocks:** 17.9 (CUSTOM_EXPR kernels extend this class)
 
 ---
 
 ## What to implement
 
-Extends `CudaComposablePool` (task 17.7) to handle:
-1. **CUSTOM_EXPR gates** — gate kinetics given as arbitrary SymPy expressions
-2. **Intracellular substance dynamics** — `IntracellularSpec` ODE integration on-device
-3. **Modulation** — per-neuron `synapse_g_scale` computed from substance concentrations
+`ComposablePool` is the most general pool — supports arbitrary gate counts, intracellular substances, and modulation. This task covers the device memory layout and kernels for **pattern-matched** gates (Boltzmann, 6 tau forms, 4 rate forms). Custom (VM) expressions are handled in task 17.9.
 
-### Custom gate expressions — codegen pipeline
-
-For each gate in the `NeuronModelSpec` that is NOT pattern-matched (i.e., has `gate_type == CUSTOM_EXPR`):
-
-1. At `CudaComposablePool` construction time, call `compile_gate_cuda(gate_spec, fn_prefix)` (from task 17.4) to get a string of two `__device__` functions: `{fn_prefix}_inf(double V)` and `{fn_prefix}_tau(double V)`.
-2. Concatenate all generated device function strings into a single `.cu` fragment.
-3. Write the fragment to a temp `.cu` file and compile it with `nvcc --ptx` into a cubin/PTX string, then load with the CUDA driver API (`cuModuleLoadDataEx`, `cuModuleGetFunction`).
-4. At step time, launch the loaded kernel via the driver API.
-
-**Alternative (simpler for initial implementation):** Use a lookup table of 20 commonly-used expressions (the same set that the CPU pattern-matcher handles). If a CUSTOM_EXPR is in the lookup table, use the corresponding device function. If not, raise a runtime error with a message suggesting the user use a pattern-matched form. Full JIT can be deferred.
-
-Document which approach is taken in the implementation.
-
-### Intracellular substance kernels
-
-For each `IntracellularSpec` in the model, generate a `__device__` function for its ODE RHS using `CUDAPrinter`:
+### `src/cpp/include/hodgkin_huxley/cuda_composable_pool.hpp` (new)
 
 ```cpp
-// Example: calcium decay ODE: dCa/dt = -Ca/tau + alpha * I_Ca
-// CUDAPrinter generates:
-__device__ __forceinline__ double ca_deriv(double Ca, double I_source) {
-    return -Ca / 20.0 + 0.001 * I_source;
-}
+#pragma once
+#ifdef HH_USE_CUDA
+#include "hodgkin_huxley/pool/pool_base.hpp"
+#include "hodgkin_huxley/model/neuron_model_spec.hpp"
+#include <cuda_runtime.h>
+
+namespace hodgkin_huxley {
+
+class CudaComposablePool : public PoolBase {
+public:
+    CudaComposablePool(const NeuronModelSpec& spec, size_t capacity, int device_id = 0);
+    ~CudaComposablePool() override;
+
+    void scatter_voltages(double* V_buf) const override;
+    void gather_currents(const double* I_buf) override;
+    void step(double dt) override;
+    void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>&) const override;
+
+    bool is_cuda()                const override { return true; }
+    int  device_id()              const override { return device_id_; }
+    void synchronize()                  override;
+    bool requires_pinned_memory() const override { return true; }
+    void migrate_to_device(int new_id)  override;
+
+    size_t size() const override { return n_; }
+    int    n_gates() const override;
+    int    n_substances() const override;
+    bool   has_synapse_g_mods() const;
+
+    void add(size_t net_idx, double V0,
+             const std::vector<double>& gate_states,
+             const std::vector<double>& substance_states);
+
+    bool   contains_neuron(size_t global_idx) const;
+    double get_substance_at(size_t global_idx, size_t subst_idx) const;
+
+    // Accessors for task 17.10 recording pipeline
+    const double* device_ptr_V()               const { return d_V_; }
+    const double* device_ptr_gates(int g_idx)  const;
+    const double* device_ptr_substance(int s_idx) const;
+
+private:
+    NeuronModelSpec spec_;
+    int    device_id_;
+    size_t n_ = 0;
+    size_t capacity_;
+    cudaStream_t stream_ = nullptr;
+
+    double*  d_V_            = nullptr;
+    double*  d_I_            = nullptr;
+    double** d_gates_        = nullptr;      // [n_gates][n_neurons]
+    double** d_substances_   = nullptr;      // [n_subst][n_neurons]
+    size_t*  d_net_idx_      = nullptr;
+    bool*    is_custom_gate_ = nullptr;      // [n_gates] — skip custom gates until 17.9
+
+    struct GateParams { double v_half, k, tau_scale, tau_min; };
+    GateParams* d_gate_params_ = nullptr;
+
+    void alloc(size_t cap);
+    void free_device();
+    void launch_gate_kernels(double dt);
+    void launch_V_kernel(double dt);
+};
+
+} // namespace hodgkin_huxley
+#endif
 ```
 
-Launch a substance step kernel after the gate kernels and V kernel:
+### `src/cpp/src/cuda_composable_pool.cu`
+
+#### Membrane voltage kernel
 
 ```cuda
-__global__ void substance_step(
-    double* X,       // [N] substance concentration
-    const double* I_source,  // [N] driving current (from V or other substance)
-    double tau, double alpha, int N, double dt)
+__global__ void composable_V_step(
+    double* V, const double* I_ext, const double* I_ion,
+    const double* Cm, int N, double dt)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    // Call the __device__ fn generated by CUDAPrinter (or hardcoded for pattern forms)
-    X[i] += dt * ca_deriv(X[i], I_source[i]);
+    V[i] += dt * (I_ext[i] - I_ion[i]) / Cm[i];
 }
 ```
 
-For CUSTOM_EXPR intracellular ODEs: same lookup table / JIT approach as custom gates.
-
-### Modulation — synapse_g_scale
-
-After the substance step, if the model has any `SYNAPSE_G` modulations, launch:
+#### Standard gate kernel — Boltzmann inf + pattern-matched tau
 
 ```cuda
-__global__ void compute_synapse_g_scale(
-    double* scale_out,   // [N] written here, scattered to host by scatter_synapse_g_scale
-    const double** X,    // [n_substances][N]
-    /* modulation params */ int N)
+__global__ void gate_step_boltzmann(
+    double* gate, const double* V,
+    double v_half, double k, double tau_scale, double tau_min,
+    int N, double dt)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    // Evaluate modulation expression via __device__ fn (CUDAPrinter output)
-    scale_out[i] = /* expr */;
+    double inf = 1.0 / (1.0 + exp(-(V[i] - v_half) / k));
+    double tau = tau_scale + tau_min;
+    gate[i] += dt * (inf - gate[i]) / tau;
 }
 ```
 
-### `scatter_synapse_g_scale` override
+Implement the full set of pattern-matched kernels:
+1. Boltzmann inf + constant tau
+2. Boltzmann inf + Boltzmann-product tau
+3. Alpha/beta rate function form
 
-```cpp
-void CudaComposablePool::scatter_synapse_g_scale(double* buf) const override {
-    // async copy d_scale_ → pinned host staging, then scatter by net_idx_
-    // caller synchronizes before reading buf
-}
-```
+For `is_custom_gate_[g] == true`, skip the kernel call for that gate — task 17.9 fills this gap.
 
 ---
 
@@ -88,14 +126,25 @@ void CudaComposablePool::scatter_synapse_g_scale(double* buf) const override {
 
 | File | Change |
 |---|---|
-| `src/cpp/src/cuda_composable_pool.cu` | Add CUSTOM_EXPR dispatch, substance kernels, modulation kernel |
-| `src/cpp/include/hodgkin_huxley/cuda_composable_pool.hpp` | Add modulation device array members |
-| `src/hodgkin_huxley/_codegen.py` | `compile_gate_cuda` called at pool construction via Python callback or C++ subprocess |
+| `src/cpp/include/hodgkin_huxley/cuda_composable_pool.hpp` | New class |
+| `src/cpp/src/cuda_composable_pool.cu` | Device SoA alloc + gate/V kernels |
+
+---
+
+## Baseline tests (before PR to testing branch)
+
+Requires: 17.4 (Python API) merged.
+
+- [ ] `pip install -e .` completes without error
+- [ ] `pytest tests/python/ -x -q` — all existing tests pass
+- [ ] Single composable population using `NeuronModelSpec.hh_default()` (Boltzmann gates), 200ms on CUDA: V finite, no crash
+- [ ] `rn.to(cpu)` after composable CUDA simulate — no crash
+- [ ] Population with a gate that has `CUSTOM_EXPR` on CUDA — skips gracefully (no incorrect output, no crash)
 
 ---
 
 ## Contract for downstream tasks
 
-- Task 17.11 tests CUSTOM_EXPR gates and intracellular dynamics on CUDA against CPU reference.
-- If the simplified lookup-table approach is used, document clearly which SymPy expression forms raise an error on CUDA — the Python `.to(device)` path in 17.10 should surface this as a `ValueError` with a clear message.
-- `has_synapse_g_mods()` must return the correct value so task 17.3's hot loop knows whether to run the modulation scatter step.
+- Task 17.9 extends `CudaComposablePool` by implementing the `is_custom_gate_` path using device functions from `CUDAPrinter` (task 17.5).
+- Task 17.10's recording pipeline accesses `device_ptr_gates()` and `device_ptr_substance()` via `cudaMemcpyAsync`.
+- `migrate_to_device(new_id)`: free device arrays, `cudaSetDevice(new_id)`, re-alloc, copy from host mirror. Keep a host mirror updated after each `synchronize()`.
