@@ -14,6 +14,8 @@
 
 namespace hodgkin_huxley {
 
+static constexpr double kSynapseEpsilon = 1e-9;
+
 // =============================================================================
 // Constructors
 // =============================================================================
@@ -203,6 +205,7 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
     sa_.plast_type.push_back(PlasticityType::NONE);
     sa_.plast_state_idx.push_back(-1);
     sa_.plast_spec_idx_arr.push_back(0);
+    sa_.is_active.push_back(false);
 
     // Push lightweight view (always valid — no heap per synapse)
     synapses_.emplace_back(sa_.size() - 1, this);
@@ -445,7 +448,6 @@ void Network::update_decay_factors(double dt) {
 void Network::compute_synaptic_currents() {
     std::fill(I_syn_buffer_.begin(), I_syn_buffer_.end(), 0.0);
 
-    const size_t S = sa_.size();
     const double* g = sa_.g.data();
     const double* E_syn = sa_.E_syn.data();
     const size_t* post = sa_.post.data();
@@ -454,10 +456,10 @@ void Network::compute_synaptic_currents() {
 
     if (!synapse_g_scale_.empty() && pool_mgr_.has_synapse_g_mods()) {
         const double* gscale = synapse_g_scale_.data();
-        for (size_t i = 0; i < S; ++i)
+        for (size_t i : syn_groups_.active_g)
             I_syn[post[i]] += g[i] * gscale[post[i]] * (E_syn[i] - V[post[i]]);
     } else {
-        for (size_t i = 0; i < S; ++i)
+        for (size_t i : syn_groups_.active_g)
             I_syn[post[i]] += g[i] * (E_syn[i] - V[post[i]]);
     }
 }
@@ -537,10 +539,23 @@ void Network::sort_synapses_by_pre() {
     permute(sa_.decay_A);
     permute(sa_.spec_idx);
 
+    // is_active: vector<bool> uses proxy refs — permute manually
+    {
+        std::vector<bool> tmp(S);
+        for (size_t i = 0; i < S; ++i) tmp[i] = sa_.is_active[perm[i]];
+        sa_.is_active = std::move(tmp);
+    }
+
     // Reorder SynapseBase views and re-bind indices
     std::vector<SynapseBase> reordered(S);
     for (size_t i = 0; i < S; ++i) reordered[i] = SynapseBase(i, this);
     synapses_ = std::move(reordered);
+
+    // Active lists reference old indices — clear; will be rebuilt by build_synapse_groups
+    syn_groups_.active_exp_decay.clear();
+    syn_groups_.active_alpha_func.clear();
+    syn_groups_.active_double_exp.clear();
+    syn_groups_.active_g.clear();
 
     sa_.cached_dt = -1.0;
     soa_sorted_ = true;
@@ -557,9 +572,14 @@ void Network::build_synapse_groups() {
     syn_groups_.voltage_gated.clear();
     syn_groups_.stdp.clear();
     syn_groups_.stp.clear();
+    syn_groups_.active_exp_decay.clear();
+    syn_groups_.active_alpha_func.clear();
+    syn_groups_.active_double_exp.clear();
+    syn_groups_.active_g.clear();
 
     using UF = SynapseSpec::UpdateForm;
     const size_t S = sa_.size();
+    sa_.is_active.assign(S, false);
     for (size_t i = 0; i < S; ++i) {
         auto form = synapse_specs_[sa_.spec_idx[i]].update_form;
         if      (form == UF::EXP_DECAY)  syn_groups_.exp_decay.push_back(i);
@@ -569,6 +589,20 @@ void Network::build_synapse_groups() {
 
         if (sa_.plast_type[i] == PlasticityType::STDP) syn_groups_.stdp.push_back(i);
         if (sa_.plast_type[i] == PlasticityType::STP)  syn_groups_.stp.push_back(i);
+
+        // Re-activate any synapse already carrying conductance (e.g. after re-sort)
+        if (form == UF::EXP_DECAY && sa_.S[i] >= kSynapseEpsilon) {
+            sa_.is_active[i] = true;
+            syn_groups_.active_exp_decay.push_back(i);
+        } else if (form == UF::ALPHA_FUNC &&
+                   (sa_.S[i] >= kSynapseEpsilon || sa_.A[i] >= kSynapseEpsilon)) {
+            sa_.is_active[i] = true;
+            syn_groups_.active_alpha_func.push_back(i);
+        } else if (form == UF::DOUBLE_EXP &&
+                   (sa_.S[i] >= kSynapseEpsilon || sa_.A[i] >= kSynapseEpsilon)) {
+            sa_.is_active[i] = true;
+            syn_groups_.active_double_exp.push_back(i);
+        }
     }
 
     spike_detected_.resize(S);
@@ -632,39 +666,89 @@ void Network::update_synapses_grouped(double dt) {
     }
 
     // Phase 2a: EXP_DECAY — spike additive jump, exact multiplicative decay
+    // Activate newly spiked synapses
     for (size_t k : syn_groups_.exp_decay) {
-        if (spike_detected_[k]) sa_.S[k] += sa_.delta_S[k];
-        sa_.S[k] *= sa_.decay_S[k];
-        if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
-        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
-        sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+        if (spike_detected_[k] && !sa_.is_active[k]) {
+            sa_.is_active[k] = true;
+            syn_groups_.active_exp_decay.push_back(k);
+        }
+    }
+    // Iterate active only; swap-and-pop on decay
+    {
+        size_t pos = 0;
+        while (pos < syn_groups_.active_exp_decay.size()) {
+            const size_t k = syn_groups_.active_exp_decay[pos];
+            if (spike_detected_[k]) sa_.S[k] += sa_.delta_S[k];
+            sa_.S[k] *= sa_.decay_S[k];
+            if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
+            const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+            sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+            if (sa_.S[k] < kSynapseEpsilon) {
+                sa_.g[k] = 0.0;
+                sa_.is_active[k] = false;
+                syn_groups_.active_exp_decay[pos] = syn_groups_.active_exp_decay.back();
+                syn_groups_.active_exp_decay.pop_back();
+            } else { ++pos; }
+        }
     }
 
     // Phase 2b: ALPHA_FUNC — 2-variable Euler, spike on A
     for (size_t k : syn_groups_.alpha_func) {
-        if (spike_detected_[k]) sa_.A[k] += sa_.delta_A[k];
-        double inv = sa_.inv_tau_A[k];
-        double dS  = (sa_.A[k] - sa_.S[k]) * inv;
-        double dA  = -sa_.A[k] * inv;
-        sa_.S[k] += dt * dS;
-        sa_.A[k] += dt * dA;
-        if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
-        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
-        sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+        if (spike_detected_[k] && !sa_.is_active[k]) {
+            sa_.is_active[k] = true;
+            syn_groups_.active_alpha_func.push_back(k);
+        }
+    }
+    {
+        size_t pos = 0;
+        while (pos < syn_groups_.active_alpha_func.size()) {
+            const size_t k = syn_groups_.active_alpha_func[pos];
+            if (spike_detected_[k]) sa_.A[k] += sa_.delta_A[k];
+            double inv = sa_.inv_tau_A[k];
+            double dS  = (sa_.A[k] - sa_.S[k]) * inv;
+            double dA  = -sa_.A[k] * inv;
+            sa_.S[k] += dt * dS;
+            sa_.A[k] += dt * dA;
+            if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
+            const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+            sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+            if (sa_.S[k] < kSynapseEpsilon && sa_.A[k] < kSynapseEpsilon) {
+                sa_.g[k] = 0.0;
+                sa_.is_active[k] = false;
+                syn_groups_.active_alpha_func[pos] = syn_groups_.active_alpha_func.back();
+                syn_groups_.active_alpha_func.pop_back();
+            } else { ++pos; }
+        }
     }
 
     // Phase 2c: DOUBLE_EXP — two independent exact decays, spike on both
     for (size_t k : syn_groups_.double_exp) {
-        if (spike_detected_[k]) {
-            sa_.S[k] += sa_.delta_S[k];
-            sa_.A[k] += sa_.delta_A[k];
+        if (spike_detected_[k] && !sa_.is_active[k]) {
+            sa_.is_active[k] = true;
+            syn_groups_.active_double_exp.push_back(k);
         }
-        sa_.S[k] *= sa_.decay_S[k];
-        sa_.A[k] *= sa_.decay_A[k];
-        double g_eff = sa_.norm[k] * (sa_.S[k] - sa_.A[k]);
-        if (g_eff < 0.0) g_eff = 0.0;
-        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
-        sa_.g[k] = spec.g * sa_.weight[k] * g_eff;
+    }
+    {
+        size_t pos = 0;
+        while (pos < syn_groups_.active_double_exp.size()) {
+            const size_t k = syn_groups_.active_double_exp[pos];
+            if (spike_detected_[k]) {
+                sa_.S[k] += sa_.delta_S[k];
+                sa_.A[k] += sa_.delta_A[k];
+            }
+            sa_.S[k] *= sa_.decay_S[k];
+            sa_.A[k] *= sa_.decay_A[k];
+            double g_eff = sa_.norm[k] * (sa_.S[k] - sa_.A[k]);
+            if (g_eff < 0.0) g_eff = 0.0;
+            const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+            sa_.g[k] = spec.g * sa_.weight[k] * g_eff;
+            if (sa_.S[k] < kSynapseEpsilon && sa_.A[k] < kSynapseEpsilon) {
+                sa_.g[k] = 0.0;
+                sa_.is_active[k] = false;
+                syn_groups_.active_double_exp[pos] = syn_groups_.active_double_exp.back();
+                syn_groups_.active_double_exp.pop_back();
+            } else { ++pos; }
+        }
     }
 
     // Phase 2d: voltage-gated — TANH_GATE, BOLTZMANN_GATE, ALPHA_BETA, CUSTOM_EXPR
@@ -731,6 +815,18 @@ void Network::update_synapses_grouped(double dt) {
             sa_.g[k] = gS;
         }
     }
+
+    // Rebuild active_g: spike-driven actives + voltage-gated with g > epsilon
+    syn_groups_.active_g.clear();
+    for (size_t k : syn_groups_.active_exp_decay)
+        syn_groups_.active_g.push_back(k);
+    for (size_t k : syn_groups_.active_alpha_func)
+        syn_groups_.active_g.push_back(k);
+    for (size_t k : syn_groups_.active_double_exp)
+        syn_groups_.active_g.push_back(k);
+    for (size_t k : syn_groups_.voltage_gated)
+        if (sa_.g[k] > kSynapseEpsilon)
+            syn_groups_.active_g.push_back(k);
 
     // Phase 3: STDP weight updates
     if (has_stdp_) apply_stdp(dt);
@@ -1024,10 +1120,10 @@ void Network::simulate_with_descriptors(
         double* I_buf = I_syn_buffer_.data();
         if (pool_mgr_.has_synapse_g_mods()) {
             const double* gscale = synapse_g_scale_.data();
-            for (size_t i = 0; i < S; ++i)
+            for (size_t i : syn_groups_.active_g)
                 I_buf[post[i]] += g[i] * gscale[post[i]] * (E_syn_data[i] - V[post[i]]);
         } else {
-            for (size_t i = 0; i < S; ++i)
+            for (size_t i : syn_groups_.active_g)
                 I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
         }
 
@@ -1216,7 +1312,7 @@ void Network::simulate_with_descriptors_parallel(
 
     for (int gid = 0; gid < static_cast<int>(n_groups); ++gid) {
         threads.emplace_back([&, gid]() {
-            const GroupDef& grp = groups[gid];
+            GroupDef& grp = groups[gid];
 
             // Thread-local per-step stimulus cache (for I_syn = I_total - I_stim)
             std::vector<double> grp_I_stim_cache(n_neurons, 0.0);
@@ -1289,14 +1385,18 @@ void Network::simulate_with_descriptors_parallel(
                 }
 
                 // Phase A: I_syn accumulation — post_syn: post[k] in this group
-                // g[k] for inter-group synapses is from src group's step t-1 (wait above)
+                // g[k] for inter-group synapses is from src group's step t-1 (wait above).
+                // Check g > 0.0: spike-driven types set g=0.0 on deactivation; this matches
+                // the serial path's active_g which includes all synapses with S >= epsilon.
                 if (has_gmod) {
                     for (size_t k : grp.post_syn)
-                        I_buf[post_arr[k]] += g_arr[k] * gscale[post_arr[k]]
-                                            * (E_arr[k] - V_cache[post_arr[k]]);
+                        if (g_arr[k] > 0.0)
+                            I_buf[post_arr[k]] += g_arr[k] * gscale[post_arr[k]]
+                                                * (E_arr[k] - V_cache[post_arr[k]]);
                 } else {
                     for (size_t k : grp.post_syn)
-                        I_buf[post_arr[k]] += g_arr[k] * (E_arr[k] - V_cache[post_arr[k]]);
+                        if (g_arr[k] > 0.0)
+                            I_buf[post_arr[k]] += g_arr[k] * (E_arr[k] - V_cache[post_arr[k]]);
                 }
                 // Signal: done reading inter-group g[k] values for step t
                 read_done[gid].fetch_add(1, std::memory_order_release);
@@ -1370,38 +1470,86 @@ void Network::simulate_with_descriptors_parallel(
 
                 // Phase U2a: EXP_DECAY
                 for (size_t k : grp.pre_exp_decay) {
-                    if (spike_detected_[k]) sa_.S[k] += sa_.delta_S[k];
-                    sa_.S[k] *= sa_.decay_S[k];
-                    if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
-                    const auto& spec = synapse_specs_[sa_.spec_idx[k]];
-                    sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+                    if (spike_detected_[k] && !sa_.is_active[k]) {
+                        sa_.is_active[k] = true;
+                        grp.active_pre_exp_decay.push_back(k);
+                    }
+                }
+                {
+                    size_t pos = 0;
+                    while (pos < grp.active_pre_exp_decay.size()) {
+                        const size_t k = grp.active_pre_exp_decay[pos];
+                        if (spike_detected_[k]) sa_.S[k] += sa_.delta_S[k];
+                        sa_.S[k] *= sa_.decay_S[k];
+                        if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
+                        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                        sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+                        if (sa_.S[k] < kSynapseEpsilon) {
+                            sa_.g[k] = 0.0;
+                            sa_.is_active[k] = false;
+                            grp.active_pre_exp_decay[pos] = grp.active_pre_exp_decay.back();
+                            grp.active_pre_exp_decay.pop_back();
+                        } else { ++pos; }
+                    }
                 }
 
                 // Phase U2b: ALPHA_FUNC
                 for (size_t k : grp.pre_alpha_func) {
-                    if (spike_detected_[k]) sa_.A[k] += sa_.delta_A[k];
-                    double inv = sa_.inv_tau_A[k];
-                    double dS  = (sa_.A[k] - sa_.S[k]) * inv;
-                    double dA  = -sa_.A[k] * inv;
-                    sa_.S[k] += dt * dS;
-                    sa_.A[k] += dt * dA;
-                    if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
-                    const auto& spec = synapse_specs_[sa_.spec_idx[k]];
-                    sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+                    if (spike_detected_[k] && !sa_.is_active[k]) {
+                        sa_.is_active[k] = true;
+                        grp.active_pre_alpha_func.push_back(k);
+                    }
+                }
+                {
+                    size_t pos = 0;
+                    while (pos < grp.active_pre_alpha_func.size()) {
+                        const size_t k = grp.active_pre_alpha_func[pos];
+                        if (spike_detected_[k]) sa_.A[k] += sa_.delta_A[k];
+                        double inv = sa_.inv_tau_A[k];
+                        double dS  = (sa_.A[k] - sa_.S[k]) * inv;
+                        double dA  = -sa_.A[k] * inv;
+                        sa_.S[k] += dt * dS;
+                        sa_.A[k] += dt * dA;
+                        if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
+                        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                        sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+                        if (sa_.S[k] < kSynapseEpsilon && sa_.A[k] < kSynapseEpsilon) {
+                            sa_.g[k] = 0.0;
+                            sa_.is_active[k] = false;
+                            grp.active_pre_alpha_func[pos] = grp.active_pre_alpha_func.back();
+                            grp.active_pre_alpha_func.pop_back();
+                        } else { ++pos; }
+                    }
                 }
 
                 // Phase U2c: DOUBLE_EXP
                 for (size_t k : grp.pre_double_exp) {
-                    if (spike_detected_[k]) {
-                        sa_.S[k] += sa_.delta_S[k];
-                        sa_.A[k] += sa_.delta_A[k];
+                    if (spike_detected_[k] && !sa_.is_active[k]) {
+                        sa_.is_active[k] = true;
+                        grp.active_pre_double_exp.push_back(k);
                     }
-                    sa_.S[k] *= sa_.decay_S[k];
-                    sa_.A[k] *= sa_.decay_A[k];
-                    double g_eff = sa_.norm[k] * (sa_.S[k] - sa_.A[k]);
-                    if (g_eff < 0.0) g_eff = 0.0;
-                    const auto& spec = synapse_specs_[sa_.spec_idx[k]];
-                    sa_.g[k] = spec.g * sa_.weight[k] * g_eff;
+                }
+                {
+                    size_t pos = 0;
+                    while (pos < grp.active_pre_double_exp.size()) {
+                        const size_t k = grp.active_pre_double_exp[pos];
+                        if (spike_detected_[k]) {
+                            sa_.S[k] += sa_.delta_S[k];
+                            sa_.A[k] += sa_.delta_A[k];
+                        }
+                        sa_.S[k] *= sa_.decay_S[k];
+                        sa_.A[k] *= sa_.decay_A[k];
+                        double g_eff = sa_.norm[k] * (sa_.S[k] - sa_.A[k]);
+                        if (g_eff < 0.0) g_eff = 0.0;
+                        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                        sa_.g[k] = spec.g * sa_.weight[k] * g_eff;
+                        if (sa_.S[k] < kSynapseEpsilon && sa_.A[k] < kSynapseEpsilon) {
+                            sa_.g[k] = 0.0;
+                            sa_.is_active[k] = false;
+                            grp.active_pre_double_exp[pos] = grp.active_pre_double_exp.back();
+                            grp.active_pre_double_exp.pop_back();
+                        } else { ++pos; }
+                    }
                 }
 
                 // Phase U2d: VOLTAGE_GATED (TANH_GATE, BOLTZMANN_GATE, ALPHA_BETA, CUSTOM_EXPR)

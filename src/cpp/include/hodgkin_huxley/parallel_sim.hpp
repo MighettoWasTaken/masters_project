@@ -22,6 +22,10 @@ struct GroupDef {
     std::vector<size_t> pre_alpha_func;    // Phase 2b
     std::vector<size_t> pre_double_exp;    // Phase 2c
     std::vector<size_t> pre_voltage_gated; // Phase 2d
+    // Active subsets — spike-driven synapses with S/A > kSynapseEpsilon (task16.5)
+    std::vector<size_t> active_pre_exp_decay;
+    std::vector<size_t> active_pre_alpha_func;
+    std::vector<size_t> active_pre_double_exp;
 
     /// Synapse indices where post[k] is in this group — for I_syn accumulation.
     std::vector<size_t> post_syn;

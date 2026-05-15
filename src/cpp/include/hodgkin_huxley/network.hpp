@@ -275,6 +275,9 @@ private:
         std::vector<double>   stp_u;                // sparse (n_STP_synapses)
         std::vector<double>   stp_x;                // sparse (n_STP_synapses)
 
+        // Active synapse set (task16.5)
+        std::vector<bool> is_active;         // [S] O(1) membership check
+
         double cached_dt = -1.0;
         size_t size() const { return pre.size(); }
 
@@ -294,6 +297,7 @@ private:
             plast_type.push_back(PlasticityType::NONE);
             plast_state_idx.push_back(-1);
             plast_spec_idx_arr.push_back(0);
+            is_active.push_back(false);
         }
     } sa_;
 
@@ -321,6 +325,11 @@ private:
         // Plasticity index lists (task15)
         std::vector<size_t> stdp;           // synapses with STDP
         std::vector<size_t> stp;            // synapses with STP
+        // Active subsets (task16.5) — spike-driven types with S/A > epsilon
+        std::vector<size_t> active_exp_decay;
+        std::vector<size_t> active_alpha_func;
+        std::vector<size_t> active_double_exp;
+        std::vector<size_t> active_g;       // union of all types with g > epsilon
     } syn_groups_;
     std::vector<uint8_t> spike_detected_;
 
