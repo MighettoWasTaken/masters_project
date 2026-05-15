@@ -37,7 +37,8 @@ def _get_axes() -> list[tuple[str, list[str]]]:
     Import the library and collect all configurable axes.
     Returns a list of (axis_label, [variant_name, ...]) pairs.
     """
-    lib = importlib.import_module("hodgkin_huxley")
+    lib  = importlib.import_module("hodgkin_huxley")
+    core = importlib.import_module("hodgkin_huxley._core")
 
     def variants(enum_cls) -> list[str]:
         # pybind11 enums expose members via __members__, not via iteration
@@ -45,27 +46,39 @@ def _get_axes() -> list[tuple[str, list[str]]]:
 
     axes: list[tuple[str, list[str]]] = []
 
-    # --- Gate dynamics ---
-    axes.append(("Gate update form",    variants(lib.GateUpdateForm)))
-    axes.append(("Gate dependency",     variants(lib.GateDependency)))
+    # --- Composable gate dynamics ---
+    # Accessed via _core to avoid DeprecationWarning (these enums are deprecated
+    # on the top-level namespace but still valid configuration axes).
+    axes.append(("Gate update form",    variants(core.GateUpdateForm)))
+    # GateDependency has a CALCIUM alias that maps to INTRACELLULAR — count only
+    # the two functionally distinct values.
+    axes.append(("Gate dependency",     ["VOLTAGE", "INTRACELLULAR"]))
 
     # --- Time-constant parameterisation ---
-    axes.append(("Tau form",            variants(lib.TauForm)))
+    axes.append(("Tau form",            variants(core.TauForm)))
 
     # --- Alpha/beta rate functions ---
-    axes.append(("Rate function form",  variants(lib.RateFuncForm)))
+    axes.append(("Rate function form",  variants(core.RateFuncForm)))
+
+    # --- Intracellular dynamics (task14) ---
+    axes.append(("Intracellular ODE form",  variants(core.IntracellularUpdateForm)))
+    axes.append(("Modulation target",       variants(core.IntracellularModulationTarget)))
 
     # --- Synapse kinetics ---
-    axes.append(("Synapse type",        variants(lib.SynapseSpecType)))
-    axes.append(("Kinetic update form", variants(lib.KineticUpdateForm)))
-    axes.append(("Kinetic current form",variants(lib.KineticCurrentForm)))
+    axes.append(("Synapse update form", variants(lib.SynapseUpdateForm)))
+    axes.append(("Synapse current form",variants(lib.SynapseCurrentForm)))
 
     # --- Network connectivity ---
     axes.append(("Connectivity pattern",variants(lib.ConnectivityPattern)))
     axes.append(("Weight distribution", variants(lib.WeightDistType)))
 
+    # --- Neuron integration ---
+    axes.append(("Integration method",  variants(lib.IntegrationMethod)))
+
     # --- Neuron model types ---
     # HH and Izhikevich are fixed-form models; Composable is the open-ended builder
+    axes.append(("Izhikevich preset",   variants(lib.IzhikevichType)))
+    axes.append(("Receptor type",       variants(lib.ReceptorType)))
     axes.append(("Neuron model",        ["HodgkinHuxley", "Izhikevich", "Composable"]))
 
     return axes

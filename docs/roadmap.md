@@ -105,6 +105,24 @@ Documentation and ML integration tooling. task18 (docs) can proceed as features 
 
 ---
 
+---
+
+### Phase 6 — Multi-Compartment Neuron Models
+
+Full spatial neuron models with per-compartment gates, channels, and intracellular dynamics. The Hines (1984) algorithm provides O(C) cable-equation solves for arbitrary tree topologies. Point-neuron and multi-compartment populations coexist in the same `RegionalNetwork`. Morphologies can be defined programmatically or imported from SWC files (NeuroMorpho.org format).
+
+| Task | Title | Priority | Dependencies |
+|------|-------|----------|--------------|
+| [task21](../task21.md) | `CompartmentSpec` + `MorphologySpec` Data Structures | 3 | task14 (IntracellularSpec) |
+| [task22](../task22.md) | Hines Cable Solver + `MCPassivePool` | 3 | task21 |
+| [task23](../task23.md) | `MCPool` — Active Multi-Compartment Pool | 3 | task22, task14 |
+| [task24](../task24.md) | Python API + `RegionalNetwork` Integration + Recording | 3 | task23, task21 |
+| [task25](../task25.md) | SWC Morphology Import | 3 | task24 |
+
+**Key outcomes:** backpropagating action potentials; compartment-specific channel complements (somatic Na, dendritic Ca); per-compartment intracellular substance tracking; Rall equivalent-cylinder reduction; SWC import for NeuroMorpho.org reconstructions; recording shape `(N, C, T)` for compartment-resolved voltage traces.
+
+---
+
 ## Known Limitations (Deferred)
 
 - **RK45 adaptive integration**: enum exists, implementation incomplete. Fixed dt (0.01 ms) is sufficient for current use cases.

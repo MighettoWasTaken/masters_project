@@ -86,13 +86,13 @@ TOPO_INTER_CONN: Dict[str, str] = {
 TOPO_MAX_N_CPP: Dict[str, Optional[int]] = {
     "Chain":      None,    # linear — no cap needed
     "Ring":       None,
-    "All-to-All": 400,     # n_per_pop=100 → 12×10K = 120K synapses
+    "All-to-All": None,     # n_per_pop=100 → 12×10K = 120K synapses
     "Star":       None,
 }
 TOPO_MAX_N_NUMPY: Dict[str, Optional[int]] = {
     "Chain":      8000,    # 3×2K = 6K synapses — trivial for NumPy
     "Ring":       8000,
-    "All-to-All": 200,     # n_per_pop=50 → 30K synapses
+    "All-to-All": 8000,     # n_per_pop=50 → 30K synapses
     "Star":       8000,
 }
 
