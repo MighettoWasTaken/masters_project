@@ -38,6 +38,15 @@ find_package(pybind11 CONFIG REQUIRED)
 # OpenMP (optional — enables pool-level parallelism in step_all)
 find_package(OpenMP)
 
+# CUDA detection
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 14)
+    # sm_60 minimum: required for atomicAdd(double*) used in synapse kernels
+    set(CMAKE_CUDA_ARCHITECTURES 60 70 75 80 86 CACHE STRING "CUDA architectures")
+endif()
+
 # Option to build tests
 option(BUILD_TESTS "Build C++ tests" OFF)
 

@@ -11,7 +11,7 @@
 | # | Role | Description | Done |
 |---|---|---|---|
 | [17.1](completed/task17.1.md) | Team lead | PoolBase CUDA interface + Device struct | [x] |
-| [17.2](task17.2.md) | Team lead | CMake CUDA build configuration + stub `.cu` files | [ ] |
+| [17.2](completed/task17.2.md) | Team lead | CMake CUDA build configuration + stub `.cu` files | [x] |
 | [17.3](task17.3.md) | Team lead | PoolManager + Network CUDA routing + pinned memory + `RegionalNetwork::to()` | [ ] |
 | [17.4](task17.4.md) | Team lead | Python Device API, `hh.device("cuda:0")`, pybind11 bindings, `.pyi` stubs | [ ] |
 | [17.5](task17.5.md) | Codegen | CUDAPrinter: SymPy → `__device__` codegen + `compile_gate_cuda()` | [ ] |

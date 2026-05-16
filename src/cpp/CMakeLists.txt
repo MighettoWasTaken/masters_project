@@ -30,6 +30,19 @@ if(OpenMP_CXX_FOUND AND NOT MINGW)
     target_compile_definitions(hodgkin_huxley_core PRIVATE HH_USE_OPENMP)
 endif()
 
+if(CUDAToolkit_FOUND)
+    target_sources(hodgkin_huxley_core PRIVATE
+        src/cuda_hh_pool.cu
+        src/cuda_iz_pool.cu
+        src/cuda_composable_pool.cu
+        src/cuda_synapse.cu
+    )
+    target_link_libraries(hodgkin_huxley_core PUBLIC CUDA::cudart)
+    target_compile_definitions(hodgkin_huxley_core PRIVATE HH_USE_CUDA)
+    set_target_properties(hodgkin_huxley_core PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
 # Enable position independent code for shared library linking
 set_target_properties(hodgkin_huxley_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON
