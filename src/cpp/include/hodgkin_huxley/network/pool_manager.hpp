@@ -11,13 +11,19 @@
 //   - pools_dirty_ = false → reuse existing pools (task20: continuable simulation)
 //
 // Insertion point for task16 (OpenMP): replace step_all with a parallel version.
-// Insertion point for task17 (CUDA):   swap concrete pool types for CUDA variants.
+// Insertion point for task17 (CUDA):   done — assign_to_device() switches pool
+//   construction to CudaHHPool/CudaIzPool/CudaComposablePool variants.
 // =============================================================================
 
 #include "hodgkin_huxley/hh_pool.hpp"
 #include "hodgkin_huxley/iz_pool.hpp"
 #include "hodgkin_huxley/composable_pool.hpp"
 #include "hodgkin_huxley/neuron_base.hpp"
+#ifdef HH_USE_CUDA
+#  include "hodgkin_huxley/cuda_hh_pool.hpp"
+#  include "hodgkin_huxley/cuda_iz_pool.hpp"
+#  include "hodgkin_huxley/cuda_composable_pool.hpp"
+#endif
 #include <map>
 #include <memory>
 #include <string>
@@ -52,7 +58,9 @@ public:
     void scatter_synapse_g_scale(double* buf) const;
 
     bool empty() const {
-        return hh_pool_.empty() && iz_pool_.empty() && comp_pools_.empty();
+        return (!hh_pool_ || hh_pool_->empty()) &&
+               (!iz_pool_ || iz_pool_->empty()) &&
+               comp_pools_.empty();
     }
 
     // True if any ComposablePool has a SYNAPSE_G modulation (set after build)
@@ -60,6 +68,13 @@ public:
 
     // OpenMP thread count for step_all() (0 = let OpenMP decide)
     void set_num_threads(int n) { num_threads_ = n; }
+
+    // --- CUDA device routing (task17) ---
+    void assign_to_device(int device_id);   // next build_from_neurons uses CUDA pools
+    void assign_to_cpu();                   // revert to CPU pools
+    bool on_cuda() const { return use_cuda_; }
+    int  cuda_device_id() const { return device_id_; }
+    void synchronize_cuda() const;
 
     // --- Per-group ops for Phase 2 parallel simulation ---
     // ComposablePool subset (by spec name)
@@ -95,8 +110,8 @@ public:
     /// Scans all ComposablePools; returns 0 if neuron has no intracellular dynamics.
     double get_substance(size_t global_neuron_idx, size_t subst_idx) const {
         for (const auto& kv : comp_pools_) {
-            if (kv.second.contains_neuron(global_neuron_idx))
-                return kv.second.get_substance_at(global_neuron_idx, subst_idx);
+            if (kv.second->contains_neuron(global_neuron_idx))
+                return kv.second->get_substance_at(global_neuron_idx, subst_idx);
         }
         return 0.0;
     }
@@ -104,9 +119,16 @@ public:
 private:
     bool has_synapse_g_mods_ = false;
     int  num_threads_ = 0;
-    HHPool hh_pool_;
-    IzPool iz_pool_;
-    std::map<std::string, ComposablePool> comp_pools_;
+
+    // Heap-allocated so build_from_neurons can swap in CudaHHPool/CudaIzPool variants
+    // without object slicing.
+    std::unique_ptr<HHPool>          hh_pool_;
+    std::unique_ptr<IzPool>          iz_pool_;
+    std::map<std::string, std::unique_ptr<ComposablePool>> comp_pools_;
+
+    // CUDA routing state (task17)
+    bool use_cuda_  = false;
+    int  device_id_ = 0;
 
     // global neuron index → pool-local index, built in build_from_neurons.
     // Used by fill_group_hh_iz_indices for Phase 2 group partitioning.

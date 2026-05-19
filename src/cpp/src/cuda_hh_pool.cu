@@ -1,5 +1,11 @@
+#include "hodgkin_huxley/cuda_hh_pool.hpp"
 #include "hodgkin_huxley/device.hpp"
 #include <cuda_runtime.h>
+
+namespace hodgkin_huxley {
+void CudaHHPool::synchronize() { cudaDeviceSynchronize(); }
+} // namespace hodgkin_huxley
+
 
 // __global__ kernels must be at file scope, not inside a namespace.
 // On MSVC, nvcc's generated .cudafe1.stub.c is compiled as C (not C++), so

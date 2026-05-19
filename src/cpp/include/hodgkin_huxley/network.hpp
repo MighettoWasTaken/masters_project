@@ -12,6 +12,7 @@
 #include "hodgkin_huxley/composable_pool.hpp"
 #include "hodgkin_huxley/ion_channels.hpp"
 #include "hodgkin_huxley/network/pool_manager.hpp"
+#include "hodgkin_huxley/device.hpp"
 #include <vector>
 #include <memory>
 #include <string>
@@ -58,6 +59,7 @@ struct StimPlan {
  */
 class Network {
 public:
+    ~Network();
     /**
      * @brief Receptor types with biologically accurate default kinetics
      */
@@ -174,6 +176,10 @@ public:
 
     void reset();
     void step(double dt, const std::vector<double>& I_ext);
+
+    // --- CUDA device routing (task17) ---
+    void   set_device(const Device& device);
+    Device get_device() const;
 
     std::vector<std::vector<double>> simulate(
         double duration, double dt,
@@ -354,6 +360,13 @@ private:
     PoolManager pool_mgr_;
     bool pools_dirty_ = true;
 
+    // Pinned host memory for async GPU DMA (task17). Null when CUDA not active.
+    bool    use_pinned_memory_ = false;
+    double* V_cache_pinned_    = nullptr;
+    double* I_syn_pinned_      = nullptr;
+    size_t  pinned_size_       = 0;
+
+    void reallocate_pinned_buffers(size_t n);
     void cache_voltages();
     void ensure_buffers();
     void compute_synaptic_currents();

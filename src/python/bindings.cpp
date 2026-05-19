@@ -725,6 +725,12 @@ PYBIND11_MODULE(_core, m) {
             py::arg("interval"),
             py::arg("spike_threshold") = 0.0)
 
+        .def("to", &RegionalNetwork::to, py::arg("device"),
+             "Assign all populations to device. Call before simulate().\n"
+             "Example: rn.to(hh.Device.cuda(0))")
+        .def("current_device", &RegionalNetwork::current_device,
+             "Return the Device this network is currently assigned to.")
+
         .def("__repr__", [](const RegionalNetwork& rn) {
             return "<RegionalNetwork populations=" + std::to_string(rn.num_populations()) +
                    " neurons=" + std::to_string(rn.num_neurons()) +

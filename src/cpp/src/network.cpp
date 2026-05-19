@@ -1,5 +1,8 @@
 #include "hodgkin_huxley/network.hpp"
 #include "hodgkin_huxley/model/kinetics.hpp"
+#ifdef HH_USE_CUDA
+#  include <cuda_runtime_api.h>
+#endif
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -13,6 +16,40 @@
 #endif
 
 namespace hodgkin_huxley {
+
+Network::~Network() {
+#ifdef HH_USE_CUDA
+    if (V_cache_pinned_) cudaFreeHost(V_cache_pinned_);
+    if (I_syn_pinned_)   cudaFreeHost(I_syn_pinned_);
+#endif
+}
+
+void Network::set_device(const Device& device) {
+    if (device.type == Device::Type::CUDA)
+        pool_mgr_.assign_to_device(device.index);
+    else
+        pool_mgr_.assign_to_cpu();
+    pools_dirty_ = true;
+}
+
+Device Network::get_device() const {
+    return pool_mgr_.on_cuda()
+        ? Device::cuda(pool_mgr_.cuda_device_id())
+        : Device::cpu();
+}
+
+void Network::reallocate_pinned_buffers(size_t n) {
+#ifdef HH_USE_CUDA
+    if (V_cache_pinned_) cudaFreeHost(V_cache_pinned_);
+    if (I_syn_pinned_)   cudaFreeHost(I_syn_pinned_);
+    cudaMallocHost(reinterpret_cast<void**>(&V_cache_pinned_), n * sizeof(double));
+    cudaMallocHost(reinterpret_cast<void**>(&I_syn_pinned_),   n * sizeof(double));
+    use_pinned_memory_ = true;
+    pinned_size_       = n;
+#else
+    (void)n;
+#endif
+}
 
 static constexpr double kSynapseEpsilon = 1e-9;
 
@@ -1051,19 +1088,26 @@ void Network::simulate_with_descriptors(
 
     ensure_buffers();
 
+#ifdef HH_USE_CUDA
+    if (pool_mgr_.on_cuda() && (!use_pinned_memory_ || pinned_size_ != n_neurons))
+        reallocate_pinned_buffers(n_neurons);
+#endif
+    double* V_ptr = use_pinned_memory_ ? V_cache_pinned_ : V_cache_.data();
+    double* I_ptr = use_pinned_memory_ ? I_syn_pinned_   : I_syn_buffer_.data();
+
     const size_t S = sa_.size();
     std::vector<double> syn_spike_accum(n_neurons, 0.0);
     std::vector<double> I_stim_cache(n_neurons, 0.0);
 
     for (size_t t = 0; t < num_steps; ++t) {
-        pool_mgr_.scatter_all_voltages(V_cache_.data());
+        pool_mgr_.scatter_all_voltages(V_ptr);
 
         if (t % interval == 0) {
             size_t tr = t / interval;
 
             if (V_buf) {
                 for (size_t i = 0; i < n_neurons; ++i)
-                    V_buf[i * n_rec + tr] = V_cache_[i];
+                    V_buf[i * n_rec + tr] = V_ptr[i];
             }
 
             if (gate_buf && max_gates > 0)
@@ -1091,13 +1135,13 @@ void Network::simulate_with_descriptors(
 
         // Seed from compact descriptors
         for (size_t i = 0; i < n_neurons; ++i)
-            I_syn_buffer_[i] = I_stim_cache[i] = stim.I_const[i];
+            I_ptr[i] = I_stim_cache[i] = stim.I_const[i];
 
         for (const auto& p : stim.pulses) {
             if (t >= p.onset_step && t < p.end_step) {
                 for (size_t i = p.neuron_start; i < p.neuron_end; ++i) {
-                    I_syn_buffer_[i] += p.amplitude;
-                    I_stim_cache[i]  += p.amplitude;
+                    I_ptr[i]          += p.amplitude;
+                    I_stim_cache[i]   += p.amplitude;
                 }
             }
         }
@@ -1107,7 +1151,7 @@ void Network::simulate_with_descriptors(
             size_t phase = t % d.isi_steps;
             if (phase < d.pw_steps) {
                 for (size_t i = d.neuron_start; i < d.neuron_end; ++i) {
-                    I_syn_buffer_[i] += d.amplitude;
+                    I_ptr[i]         += d.amplitude;
                     I_stim_cache[i]  += d.amplitude;
                 }
             }
@@ -1116,8 +1160,8 @@ void Network::simulate_with_descriptors(
         const double* g = sa_.g.data();
         const double* E_syn_data = sa_.E_syn.data();
         const size_t* post = sa_.post.data();
-        const double* V = V_cache_.data();
-        double* I_buf = I_syn_buffer_.data();
+        const double* V = V_ptr;
+        double* I_buf = I_ptr;
         if (pool_mgr_.has_synapse_g_mods()) {
             const double* gscale = synapse_g_scale_.data();
             for (size_t i : syn_groups_.active_g)
@@ -1130,16 +1174,16 @@ void Network::simulate_with_descriptors(
         if (I_syn_buf && t % interval == 0) {
             size_t tr = t / interval;
             for (size_t i = 0; i < n_neurons; ++i)
-                I_syn_buf[i * n_rec + tr] = I_syn_buffer_[i] - I_stim_cache[i];
+                I_syn_buf[i * n_rec + tr] = I_ptr[i] - I_stim_cache[i];
         }
 
-        pool_mgr_.gather_all_currents(I_syn_buffer_.data());
+        pool_mgr_.gather_all_currents(I_ptr);
         pool_mgr_.step_all(dt);
         if (pool_mgr_.has_synapse_g_mods()) {
             std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
             pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
         }
-        pool_mgr_.scatter_all_voltages(V_cache_.data());
+        pool_mgr_.scatter_all_voltages(V_ptr);
 
         update_synapses_grouped(dt);
 
