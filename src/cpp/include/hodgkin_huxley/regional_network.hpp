@@ -130,6 +130,10 @@ public:
                            size_t n_rec, size_t interval,
                            double spike_threshold = 0.0);
 
+    // --- CUDA device routing (task17) ---
+    void   to(const Device& device);
+    Device current_device() const { return current_device_; }
+
     // Delegation
     size_t num_neurons() const;
     size_t num_synapses() const;
@@ -141,6 +145,7 @@ public:
 
 private:
     Network net_;
+    Device  current_device_ = Device::cpu();
     std::vector<Population> populations_;
     std::map<std::string, size_t> pop_index_;
     std::map<std::string, NeuronModelSpec> pop_specs_;  // per-population stored spec (task14)

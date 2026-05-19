@@ -725,6 +725,12 @@ PYBIND11_MODULE(_core, m) {
             py::arg("interval"),
             py::arg("spike_threshold") = 0.0)
 
+        .def("to", &RegionalNetwork::to, py::arg("device"),
+             "Assign all populations to device. Call before simulate().\n"
+             "Example: rn.to(hh.Device.cuda(0))")
+        .def("current_device", &RegionalNetwork::current_device,
+             "Return the Device this network is currently assigned to.")
+
         .def("__repr__", [](const RegionalNetwork& rn) {
             return "<RegionalNetwork populations=" + std::to_string(rn.num_populations()) +
                    " neurons=" + std::to_string(rn.num_neurons()) +
@@ -1146,6 +1152,10 @@ PYBIND11_MODULE(_core, m) {
           "Number of available CUDA devices (0 if not built with HH_USE_CUDA).");
     m.def("cuda_is_available",  &cuda_is_available,
           "True if at least one CUDA device is present and accessible.");
+    m.def("cuda_device_name", &cuda_device_name, py::arg("idx") = 0,
+          "Name of CUDA device at index idx (empty string if not built with CUDA).");
+    m.def("cuda_smoke_test",  &cuda_smoke_test,  py::arg("device_idx") = 0,
+          "Run a trivial kernel on the GPU; returns True if computation is correct.");
 
     // Module version
     m.attr("__version__") = "0.7.0";

@@ -176,6 +176,11 @@ void RegionalNetwork::reset() { net_.reset(); }
 Network& RegionalNetwork::network() { return net_; }
 const Network& RegionalNetwork::network() const { return net_; }
 
+void RegionalNetwork::to(const Device& device) {
+    current_device_ = device;
+    net_.set_device(device);
+}
+
 
 // =============================================================================
 // Single connection (for Python custom patterns)

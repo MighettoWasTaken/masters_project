@@ -1,7 +1,7 @@
 # Task 17.3: PoolManager + Network CUDA Routing
 
 **Role:** Team lead  
-**Status:** Not started  
+**Status:** Completed
 **Depends on:** 17.1 (PoolBase virtual methods), 17.2 (HH_USE_CUDA define)  
 **Unlocks:** 17.9 (recording needs pinned memory), 17.10 (Python `.to(device)` needs routing)
 
