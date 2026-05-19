@@ -725,9 +725,20 @@ PYBIND11_MODULE(_core, m) {
             py::arg("interval"),
             py::arg("spike_threshold") = 0.0)
 
-        .def("to", &RegionalNetwork::to, py::arg("device"),
-             "Assign all populations to device. Call before simulate().\n"
-             "Example: rn.to(hh.Device.cuda(0))")
+        .def("to",
+            [](RegionalNetwork& rn, const Device& device) -> RegionalNetwork& {
+                if (device.type == Device::Type::CUDA && !cuda_is_available())
+                    throw std::runtime_error(
+                        "CUDA device requested but this build was not compiled with "
+                        "HH_USE_CUDA or no CUDA-capable GPU is present.");
+                rn.to(device);
+                return rn;
+            },
+            py::arg("device"),
+            py::return_value_policy::reference,
+            "Move all pools to device. Returns self for chaining.\n"
+            "Raises RuntimeError if CUDA requested but not available.\n"
+            "Example: rn.to(hh.Device.cuda(0)).simulate(...)")
         .def("current_device", &RegionalNetwork::current_device,
              "Return the Device this network is currently assigned to.")
 
