@@ -41,6 +41,8 @@ from ._core import (
     __version__,
     cuda_device_count,
     cuda_is_available,
+    cuda_device_name,
+    cuda_smoke_test,
 )
 
 # Backward-compat aliases for old enum names
@@ -158,6 +160,8 @@ __all__ = [
     "Device",
     "cuda_device_count",
     "cuda_is_available",
+    "cuda_device_name",
+    "cuda_smoke_test",
     # DBS stimulator
     "DBSStimulator",
     "DBSParameters",

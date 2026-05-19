@@ -30,7 +30,7 @@ if(OpenMP_CXX_FOUND AND NOT MINGW)
     target_compile_definitions(hodgkin_huxley_core PRIVATE HH_USE_OPENMP)
 endif()
 
-if(CUDAToolkit_FOUND)
+if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
     target_sources(hodgkin_huxley_core PRIVATE
         src/cuda_hh_pool.cu
         src/cuda_iz_pool.cu
@@ -39,8 +39,8 @@ if(CUDAToolkit_FOUND)
     )
     target_link_libraries(hodgkin_huxley_core PUBLIC CUDA::cudart)
     target_compile_definitions(hodgkin_huxley_core PRIVATE HH_USE_CUDA)
-    set_target_properties(hodgkin_huxley_core PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON)
+    # Separable compilation (-rdc=true) is not needed — kernels are
+    # self-contained within their own .cu files and don't call across them.
 endif()
 
 # Enable position independent code for shared library linking
