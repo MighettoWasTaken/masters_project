@@ -122,18 +122,41 @@ class TestEigenPrinter:
 
 
 # =============================================================================
-# CUDAPrinter stub tests
+# CUDAPrinter tests
 # =============================================================================
 
-class TestCUDAPrinterStub:
+class TestCUDAPrinter:
 
-    def test_device_qualifier(self):
-        code = CUDAPrinter().doprint(sympy.exp(V))
+    def test_doprint_with_exp(self):
+        code = CUDAPrinter().doprint(sympy.exp(-V/10))
+        assert "exp" in code
+        assert "std::" not in code
+        assert ".exp()" not in code
+
+    def test_symbol_mapping(self):
+        code = CUDAPrinter(symbol_map={"V": "v_in"}).doprint(V)
+        assert code == "v_in"
+
+    def test_print_device_fn(self):
+        code = CUDAPrinter().print_device_fn("test_fn", ["double V"], sympy.exp(-V/10))
+        assert code.startswith("__device__ __forceinline__ double test_fn(double V)")
+        assert "return exp" in code
+
+    def test_compile_gate_cuda(self):
+        from hodgkin_huxley._codegen import compile_gate_cuda
+        class MockGateSpec:
+            def __init__(self):
+                self.inf_expr = 1 / (1 + sympy.exp(-(V + 40) / 10))
+                self.tau_expr = 0.5 + 1.0 / (1 + sympy.exp(-(V + 30) / 5))
+
+        code = compile_gate_cuda(MockGateSpec(), "m")
+        assert "m_inf(double V)" in code
+        assert "m_tau(double V)" in code
         assert "__device__" in code
-
-    def test_todo_marker(self):
-        code = CUDAPrinter().doprint(V ** 2)
-        assert "TODO" in code and "task17" in code
+        assert "lambda" not in code
+        assert "def " not in code
+        assert "ArrayXd" not in code
+        assert ".exp()" not in code
 
 
 # =============================================================================

@@ -6,15 +6,15 @@ SymPy expression compilation infrastructure for the hodgkin-huxley library.
 
 Provides:
   - Pre-defined SymPy symbols (V, Ca, V_pre, V_post, S, ...)
-  - EigenPrinter  — generates Eigen C++ from SymPy (vectorized, SIMD); reserved for task17 GPU codegen
-  - CUDAPrinter   — stub placeholder (task17)
+  - EigenPrinter  — generates Eigen C++ from SymPy (vectorized, SIMD)
+  - CUDAPrinter   — generates CUDA __device__ scalar C code from SymPy (task17.5)
+  - compile_gate_cuda — generates __device__ inf/tau functions for a gate spec
   - Pattern matching catalog (10 forms: 6 tau + 4 rate + Boltzmann)
   - TaggedExpr    — SymPy expr with pre-matched parameter metadata
   - compile_to_vm_bytecode — cross-platform VM bytecode for all custom expressions
   - HHEquationError — raised when expression compilation fails
 
 Insertion points for future tasks:
-  - task17: replace CUDAPrinter stub with full nvcc pipeline (EigenPrinter already available)
   - task13 extension: add more patterns to PATTERN_CATALOG as new forms are added
 """
 
@@ -265,17 +265,31 @@ class EigenPrinter(CodePrinter):
 
 
 # =============================================================================
-# CUDAPrinter (stub — task17)
+# CUDAPrinter — SymPy → CUDA __device__ scalar C code (task17.5)
 # =============================================================================
 
 class CUDAPrinter(CodePrinter):
     """
-    Placeholder CUDA printer.
+    Converts a SymPy scalar expression to a CUDA ``__device__`` function body.
 
-    # TODO task17: full CUDA JIT pipeline not implemented.
-    Generates a minimal __device__ function stub using sympy.ccode() for the
-    expression body. No Eigen — GPU parallelism is across threads, not SIMD.
+    Differences from EigenPrinter:
+    - No Eigen types — all variables are plain C doubles.
+    - Math functions map to C99 double-precision intrinsics (``exp``, ``log``,
+      ``sqrt``, ``tanh``, ``fabs``) without ``std::`` prefix, matching CUDA's
+      ``<math.h>``-style device math library.
+    - Output is a complete ``__device__ __forceinline__`` function string ready
+      to paste into a ``.cu`` file via :meth:`print_device_fn`.
+
+    Parameters
+    ----------
+    symbol_map : dict[str, str] | None
+        Optional mapping from SymPy symbol names to C variable names.
+        For example ``{"V": "V"}`` keeps voltage as-is, while
+        ``{"V": "v_in"}`` would rename it.  Unmapped symbols use their
+        raw SymPy name.
     """
+
+    printmethod = "_hh_cuda_print"
 
     _default_settings: dict = {
         "order": None,
@@ -288,17 +302,184 @@ class CUDAPrinter(CodePrinter):
         "contract": True,
     }
 
+    def __init__(self, symbol_map: "dict[str, str] | None" = None, **kwargs):
+        super().__init__(**kwargs)
+        self._sym_map: dict[str, str] = symbol_map or {}
+
+    # ---- Arithmetic operators -----------------------------------------------
+
+    def _print_Add(self, expr, order=None):
+        parts = [self._print(a) for a in expr.args]
+        return "(" + " + ".join(parts) + ")"
+
+    def _print_Mul(self, expr):
+        parts = [self._print(a) for a in expr.args]
+        return "(" + " * ".join(parts) + ")"
+
+    def _print_Pow(self, expr, rational=False):
+        base, exp_val = expr.args
+        base_s = self._print(base)
+        if exp_val == sympy.Integer(2):
+            return f"(({base_s}) * ({base_s}))"
+        if exp_val == sympy.Rational(1, 2):
+            return f"sqrt({base_s})"
+        if exp_val == sympy.Integer(-1):
+            return f"(1.0 / ({base_s}))"
+        if isinstance(exp_val, sympy.Integer):
+            n = int(exp_val)
+            if 2 < n <= 6:
+                return "(" + " * ".join([f"({base_s})"] * n) + ")"
+            return f"pow({base_s}, {n})"
+        exp_s = self._print(exp_val)
+        return f"pow({base_s}, {exp_s})"
+
+    # ---- Functions ----------------------------------------------------------
+
+    def _print_exp(self, expr):
+        arg = self._print(expr.args[0])
+        return f"exp({arg})"
+
+    def _print_log(self, expr):
+        arg = self._print(expr.args[0])
+        return f"log({arg})"
+
+    def _print_tanh(self, expr):
+        arg = self._print(expr.args[0])
+        return f"tanh({arg})"
+
+    def _print_sin(self, expr):
+        arg = self._print(expr.args[0])
+        return f"sin({arg})"
+
+    def _print_cos(self, expr):
+        arg = self._print(expr.args[0])
+        return f"cos({arg})"
+
+    def _print_Abs(self, expr):
+        arg = self._print(expr.args[0])
+        return f"fabs({arg})"
+
+    def _print_sqrt(self, expr):
+        arg = self._print(expr.args[0])
+        return f"sqrt({arg})"
+
+    # ---- Symbols and literals -----------------------------------------------
+
+    def _print_Symbol(self, expr):
+        name = str(expr)
+        if name in self._sym_map:
+            return self._sym_map[name]
+        return name
+
+    def _print_Integer(self, expr):
+        return f"{int(expr)}.0"
+
+    def _print_Float(self, expr):
+        return repr(float(expr))
+
+    def _print_Rational(self, expr):
+        return repr(float(expr))
+
+    def _print_Number(self, expr):
+        return repr(float(expr))
+
+    def _print_NumberSymbol(self, expr):
+        return repr(float(expr))
+
+    def _print_NegativeOne(self, expr):
+        return "-1.0"
+
+    def _print_One(self, expr):
+        return "1.0"
+
+    def _print_Zero(self, expr):
+        return "0.0"
+
+    def _print_Half(self, expr):
+        return "0.5"
+
+    # ---- Infrastructure -----------------------------------------------------
+
+    def _format_code(self, lines):
+        # Required by CodePrinter; we generate inline expressions so just join.
+        return lines
+
     def doprint(self, expr, assign_to=None) -> str:  # type: ignore[override]
-        # TODO task17: full CUDA JIT pipeline not implemented.
-        from sympy.printing.c import ccode
-        # Use standard scalar C code
-        body = ccode(expr)
+        """Return a C99 scalar expression string (no semicolon, no wrapping).
+
+        Unlike the old stub, this produces a bare expression suitable for
+        embedding in a ``return`` statement or assignment.
+        """
+        return self._print(expr)
+
+    def print_device_fn(
+        self,
+        fn_name: str,
+        params: "list[str]",
+        expr,
+        return_type: str = "double",
+    ) -> str:
+        """Return a complete CUDA ``__device__ __forceinline__`` function.
+
+        Parameters
+        ----------
+        fn_name : str
+            Name of the generated function.
+        params : list[str]
+            Parameter declarations, e.g. ``["double V"]``.
+        expr : sympy.Expr
+            The SymPy expression to compile as the function body.
+        return_type : str
+            C return type (default ``"double"``).
+
+        Returns
+        -------
+        str
+            A complete ``__device__`` function definition.
+        """
+        body = self.doprint(expr)
+        param_str = ", ".join(params)
         return (
-            "// TODO task17: full CUDA JIT pipeline not implemented\n"
-            "__device__ static inline double fn(double V) {\n"
+            f"__device__ __forceinline__ {return_type} {fn_name}"
+            f"({param_str}) {{\n"
             f"    return {body};\n"
-            "}"
+            f"}}"
         )
+
+
+def compile_gate_cuda(gate_spec, fn_prefix: str) -> str:
+    """
+    Generate CUDA ``__device__`` functions for a gate's inf and tau expressions.
+
+    Parameters
+    ----------
+    gate_spec : object
+        An object with ``.inf_expr`` and ``.tau_expr`` attributes containing
+        SymPy expressions parameterised by ``V`` (voltage).
+    fn_prefix : str
+        Prefix for generated function names.  For prefix ``"m"`` the output
+        contains ``m_inf(double V)`` and ``m_tau(double V)``.
+
+    Returns
+    -------
+    str
+        A string containing two ``__device__`` function definitions:
+        ``{fn_prefix}_inf(double V) -> double`` and
+        ``{fn_prefix}_tau(double V) -> double``.
+
+    Raises
+    ------
+    HHEquationError
+        If the expressions contain unsupported SymPy nodes.
+    """
+    printer = CUDAPrinter(symbol_map={"V": "V"})
+    inf_code = printer.print_device_fn(
+        f"{fn_prefix}_inf", ["double V"], gate_spec.inf_expr
+    )
+    tau_code = printer.print_device_fn(
+        f"{fn_prefix}_tau", ["double V"], gate_spec.tau_expr
+    )
+    return inf_code + "\n\n" + tau_code
 
 
 # =============================================================================
