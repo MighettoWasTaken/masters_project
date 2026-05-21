@@ -50,6 +50,15 @@ struct GroupDef {
     /// Synapse indices where BOTH pre[k] and post[k] are in this group.
     /// Used for spike_event accumulation without cross-group data races.
     std::vector<size_t> intra_syn;
+
+    /// Unique pre-neuron indices for synapses in pre_all.
+    /// Built during group setup; used by forward-injection Phase U1.
+    std::vector<size_t> pre_neurons;
+
+    /// Per-group circular event buffer for forward-injection spike delivery.
+    /// Size = max delay (in steps) among this group's pre-synapses + 1.
+    /// Thread-private: only this group's thread reads/writes it.
+    std::vector<std::vector<size_t>> event_slots;
 };
 
 } // namespace hodgkin_huxley
