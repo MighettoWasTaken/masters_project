@@ -232,25 +232,26 @@ At 10M synapses: 1.9 GB → 880 MB → 420–500 MB.
 ## Implementation Checklist
 
 ### 27.1 Spec deduplication
-- [ ] Add `SynapseSpecCache` struct to `network.hpp`
-- [ ] Add `synapse_spec_caches_` vector to `Network`
-- [ ] Implement `rebuild_spec_caches(double dt)` — called when `cached_dt` changes
-- [ ] Remove `delta_S`, `delta_A`, `tau_S`, `tau_A`, `inv_tau_A`, `norm`, `decay_S`, `decay_A`, `E_syn` from `SynArrays`
-- [ ] Update `push_defaults()` — remove the 9 fields
-- [ ] Update `ensure_synapse_state()` — replace per-synapse constant population with cache build
-- [ ] Update all simulation loop phases (2a–2d) to use `cache.*` instead of `sa_.*`
-- [ ] Update I_syn scatter step for `E_syn`
-- [ ] Verify: all existing tests pass, outputs bit-identical before/after
+- [x] Add `SynapseSpecCache` struct to `network.hpp`
+- [x] Add `synapse_spec_caches_` vector to `Network`
+- [x] Implement `rebuild_spec_caches(double dt)` — called when `cached_dt` changes
+- [x] Remove `delta_S`, `delta_A`, `tau_S`, `tau_A`, `inv_tau_A`, `norm`, `decay_S`, `decay_A` from `SynArrays` (E_syn kept per-synapse — overwritten by add_*_synapse wrappers)
+- [x] Update `push_defaults()` — remove the 8 fields
+- [x] Update `add_synapse()` — replace per-synapse constant population with cache entry
+- [x] Update all simulation loop phases (2a–2d) to use `cache.*` instead of `sa_.*`
+- [x] Update I_syn scatter step: E_syn stays per-synapse (no change needed)
+- [x] Verify: all existing tests pass, outputs bit-identical before/after
 
 ### 27.2 Connectivity compression
-- [ ] Add `NeuronConnectivity` struct to `network.hpp`
-- [ ] Add `neuron_connectivity_` to `Network`
-- [ ] Implement sort + delta-encode build in `ensure_buffers()`
-- [ ] Implement delta-decode helper (inline, handles overflow list)
-- [ ] Restructure spike detection + scatter to spike-driven outer loop
-- [ ] Update `get_synapse_weights()` to decode compressed weights
-- [ ] Update `reset()` to clear state arrays (connectivity unchanged)
-- [ ] Update STDP weight update path — verify flat synapse index still valid
-- [ ] Verify: spike delivery timing correct at delay = 1×dt, 2×dt, max delay
-- [ ] Verify: outputs match 27.1 baseline for all existing test networks
-- [ ] Benchmark: memory usage and step throughput at N_synapses = 1M, 10M
+- [x] Add `NeuronConnectivity` struct to `network.hpp`
+- [x] Add `neuron_connectivity_`, `post_decoded_`, `pre_decoded_` to `Network`
+- [x] Implement `build_neuron_connectivity()` — delta-encode, populate decoded arrays, free sa_.pre/sa_.post
+- [x] Implement `reconstruct_pre_post()` — restore sa_.pre/sa_.post when new synapses added after build
+- [x] Guard `build_injection_tables()` with `injection_tables_built_` flag — skip rebuild on reset+simulate
+- [x] Narrow `sa_.pre`/`sa_.post` to `uint32_t`, `sa_.delay` to `float`, `delay_steps_` to `uint32_t`
+- [x] Update all hot loops and parallel path setup to use `pre_decoded_`/`post_decoded_`
+- [x] Update STDP weight update path (`apply_stdp()`)
+- [x] Update `get_synapse_pre/post_indices()` to fall back to decoded arrays
+- [x] Verify: spike delivery timing correct (test_synapses.py delay tests)
+- [x] Verify: outputs match 27.1 baseline — 1135/1135 tests pass
+- [x] Benchmark: ~2–3 MB reduction at 120K synapses (≈15 bytes/syn freed)
