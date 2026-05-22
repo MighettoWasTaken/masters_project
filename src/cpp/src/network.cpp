@@ -188,10 +188,20 @@ IzhikevichNeuron& Network::iz_neuron(size_t idx) {
 }
 
 // =============================================================================
-// Synapse accessor — SynapseBase is always a valid view (no lazy sync needed)
+// Synapse accessor — lazily builds the SynapseBase view vector (task27.5)
 // =============================================================================
 
+void Network::ensure_synapses_built() const {
+    if (!synapses_dirty_ && synapses_.size() == sa_.size()) return;
+    const size_t S = sa_.size();
+    synapses_.resize(S);
+    for (size_t i = 0; i < S; ++i)
+        synapses_[i] = SynapseBase(i, this);
+    synapses_dirty_ = false;
+}
+
 const SynapseBase& Network::synapse(size_t idx) const {
+    ensure_synapses_built();
     if (idx >= synapses_.size()) throw std::out_of_range("Synapse index out of range");
     return synapses_[idx];
 }
@@ -227,27 +237,27 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
     // Restore pre/post arrays if they were freed after a prior build
     if (pre_post_cleared_) reconstruct_pre_post();
 
-    // Common SoA fields (task27.2: narrow types)
+    // Common SoA fields — narrow types: task27.2 (pre/post/delay), task27.4 (E_syn/spec_idx)
     sa_.pre.push_back(static_cast<uint32_t>(pre));
     sa_.post.push_back(static_cast<uint32_t>(post));
     sa_.weight.push_back(weight);
-    sa_.E_syn.push_back(spec.E_syn);
+    sa_.E_syn.push_back(static_cast<float>(spec.E_syn));
     sa_.g.push_back(0.0);
     sa_.delay.push_back(static_cast<float>(delay));
 
     // Unified state (spec-derived constants now live in synapse_spec_caches_)
     sa_.S.push_back(spec.S_init);
     sa_.A.push_back(spec.A_init);
-    sa_.spec_idx.push_back(sidx);
+    sa_.spec_idx.push_back(static_cast<uint32_t>(sidx));
 
     // Plasticity defaults (NONE — no state allocated)
     sa_.plast_type.push_back(PlasticityType::NONE);
     sa_.plast_state_idx.push_back(-1);
-    sa_.plast_spec_idx_arr.push_back(0);
+    sa_.plast_spec_idx_arr.push_back(static_cast<uint32_t>(0));
     sa_.is_active.push_back(false);
 
-    // Push lightweight view (always valid — no heap per synapse)
-    synapses_.emplace_back(sa_.size() - 1, this);
+    // synapses_ is built lazily on first synapse(idx) call (task27.5)
+    synapses_dirty_ = true;
 
     sa_.cached_dt = -1.0;
     soa_sorted_ = false;
@@ -292,7 +302,7 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
 
     size_t ps_idx = add_or_find_plasticity_spec(plast);
     sa_.plast_type[syn_i] = plast.type;
-    sa_.plast_spec_idx_arr[syn_i] = ps_idx;
+    sa_.plast_spec_idx_arr[syn_i] = static_cast<uint32_t>(ps_idx);
 
     if (plast.type == PlasticityType::STDP) {
         int32_t state_i = (int32_t)sa_.plast_x_pre.size();
@@ -499,7 +509,7 @@ void Network::compute_synaptic_currents() {
     std::fill(I_syn_buffer_.begin(), I_syn_buffer_.end(), 0.0);
 
     const double*   g    = sa_.g.data();
-    const double*   E_syn = sa_.E_syn.data();
+    const float*    E_syn = sa_.E_syn.data();  // float; promotes to double in arithmetic
     const uint32_t* post  = post_decoded_.empty() ? sa_.post.data() : post_decoded_.data();
     const double*   V    = V_cache_.data();
     double*         I_syn = I_syn_buffer_.data();
@@ -603,10 +613,8 @@ void Network::sort_synapses_by_pre() {
         sa_.is_active = std::move(tmp);
     }
 
-    // Reorder SynapseBase views and re-bind indices
-    std::vector<SynapseBase> reordered(S);
-    for (size_t i = 0; i < S; ++i) reordered[i] = SynapseBase(i, this);
-    synapses_ = std::move(reordered);
+    // synapses_ indices no longer valid after permutation — mark dirty (task27.5)
+    synapses_dirty_ = true;
 
     // Active lists reference old indices — clear; will be rebuilt by build_synapse_groups
     syn_groups_.active_exp_decay.clear();
@@ -703,7 +711,7 @@ void Network::build_injection_tables(double dt) {
 
     post_from_.assign(N, {});
     for (size_t i = 0; i < S; ++i)
-        post_from_[sa_.pre[i]].push_back({i, delay_steps_[i]});
+        post_from_[sa_.pre[i]].push_back({static_cast<uint32_t>(i), delay_steps_[i]});
 
     // +1 so the slot for step t and the slot for step t+max_delay don't collide
     event_slots_.assign(max_delay_steps + 1, {});
@@ -1147,7 +1155,7 @@ void Network::simulate_into_buffers(
             I_syn_buffer_[i] = I_ext[i][t];
 
         const double*   g          = sa_.g.data();
-        const double*   E_syn_data = sa_.E_syn.data();
+        const float*    E_syn_data = sa_.E_syn.data();  // float; promotes in arithmetic
         const uint32_t* post       = post_decoded_.data();
         const double*   V          = V_cache_.data();
         double*         I_buf      = I_syn_buffer_.data();
@@ -1294,7 +1302,7 @@ void Network::simulate_with_descriptors(
         }
 
         const double*   g          = sa_.g.data();
-        const double*   E_syn_data = sa_.E_syn.data();
+        const float*    E_syn_data = sa_.E_syn.data();  // float; promotes in arithmetic
         const uint32_t* post       = post_decoded_.data();
         const double*   V          = V_ptr;
         double*         I_buf      = I_ptr;
@@ -1501,7 +1509,7 @@ void Network::simulate_with_descriptors_parallel(
     const double* const I_const = stim.I_const.data();
     const uint32_t* const pre_arr  = pre_decoded_.data();
     const uint32_t* const post_arr = post_decoded_.data();
-    const double* const E_arr    = sa_.E_syn.data();
+    const float* const  E_arr    = sa_.E_syn.data();  // float; promotes in arithmetic
     double* const g_arr          = sa_.g.data();
 
     // --- Launch one std::thread per group ---

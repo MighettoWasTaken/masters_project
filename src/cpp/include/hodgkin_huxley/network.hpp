@@ -145,7 +145,7 @@ public:
     // Getters
     // -------------------------------------------------------------------------
     [[nodiscard]] size_t num_neurons()  const { return neurons_.size(); }
-    [[nodiscard]] size_t num_synapses() const { return synapses_.size(); }
+    [[nodiscard]] size_t num_synapses() const { return sa_.size(); }  // sa_ is source of truth
 
     [[nodiscard]] double get_kin_S(size_t synapse_idx) const;
     [[nodiscard]] double get_kin_g(size_t synapse_idx) const;
@@ -241,9 +241,9 @@ public:
         double  spike_threshold = 0.0
     );
 
-    // Forward-injection spike delivery (task26)
+    // Forward-injection spike delivery (task26); syn_idx narrow to uint32_t (task27.3)
     struct SynapseRef {
-        size_t   syn_idx;       // index into SynArrays
+        uint32_t syn_idx;       // index into SynArrays — uint32_t saves 8 bytes/syn via padding removal
         uint32_t delay_steps;   // precomputed: round(sa_.delay[i] / dt)
     };
 
@@ -271,27 +271,28 @@ public:
 
 private:
     std::vector<std::unique_ptr<NeuronBase>> neurons_;
-    std::vector<SynapseBase> synapses_;   // lightweight views — always in sync
+    mutable std::vector<SynapseBase> synapses_;   // lazy: built on first synapse(idx) call (task27.5)
 
     // =========================================================================
     // Structure-of-Arrays synapse data (all types unified)
     // =========================================================================
     struct SynArrays {
-        // Common — pre/post narrow to uint32_t; delay narrows to float (task27.2)
+        // Common — pre/post uint32_t (task27.2); delay float (task27.2); E_syn float (task27.4)
         std::vector<uint32_t> pre, post;
-        std::vector<double>   weight, E_syn, g;
+        std::vector<double>   weight, g;
+        std::vector<float>    E_syn;     // float: biological values ≤3 sig figs (task27.4)
         std::vector<float>    delay;
 
         // Unified state (all types)
         std::vector<double> S;           // primary gating / conductance variable
         std::vector<double> A;           // auxiliary variable (0 if unused)
 
-        std::vector<size_t> spec_idx;    // index into Network::synapse_specs_ / synapse_spec_caches_
+        std::vector<uint32_t> spec_idx;  // index into synapse_specs_ / spec_caches_ (task27.4)
 
         // Plasticity state (task15) — all empty when no plasticity used
         std::vector<PlasticityType> plast_type;     // full-length, NONE by default
         std::vector<int32_t>  plast_state_idx;      // full-length, -1 = no state
-        std::vector<size_t>   plast_spec_idx_arr;   // full-length, → plasticity_specs_
+        std::vector<uint32_t> plast_spec_idx_arr;   // full-length, → plasticity_specs_ (task27.4)
         std::vector<double>   plast_x_pre;          // sparse (n_STDP_synapses)
         std::vector<double>   plast_x_post;         // sparse (n_STDP_synapses)
         std::vector<double>   stp_u;                // sparse (n_STP_synapses)
@@ -317,11 +318,19 @@ private:
 
 public:
     // -------------------------------------------------------------------------
-    // SoA accessor for SynapseBase view (called from SynapseBase member fns)
+    // SoA accessors for SynapseBase (called from synapse_base.cpp)
     // -------------------------------------------------------------------------
     [[nodiscard]] const SynArrays& syn_arrays() const { return sa_; }
     [[nodiscard]] const SynapseSpec& synapse_spec(size_t spec_idx) const {
         return synapse_specs_[spec_idx];
+    }
+    // pre/post indices: prefer decoded arrays (available after first simulate);
+    // fall back to sa_.pre/post when accessed before the first build.
+    [[nodiscard]] size_t pre_at(size_t syn_idx) const {
+        return pre_decoded_.empty() ? sa_.pre[syn_idx] : pre_decoded_[syn_idx];
+    }
+    [[nodiscard]] size_t post_at(size_t syn_idx) const {
+        return post_decoded_.empty() ? sa_.post[syn_idx] : post_decoded_[syn_idx];
     }
 
 private:
@@ -389,7 +398,10 @@ private:
     bool                            pre_post_cleared_       = false;
     bool                            injection_tables_built_ = false;
 
+    mutable bool synapses_dirty_ = true;  // cleared on first synapse(idx) call (task27.5)
+
     void reallocate_pinned_buffers(size_t n);
+    void ensure_synapses_built() const;  // lazy SynapseBase construction (task27.5)
     void cache_voltages();
     void ensure_buffers();
     void compute_synaptic_currents();
