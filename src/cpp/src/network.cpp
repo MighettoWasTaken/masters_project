@@ -188,10 +188,20 @@ IzhikevichNeuron& Network::iz_neuron(size_t idx) {
 }
 
 // =============================================================================
-// Synapse accessor — SynapseBase is always a valid view (no lazy sync needed)
+// Synapse accessor — lazily builds the SynapseBase view vector (task27.5)
 // =============================================================================
 
+void Network::ensure_synapses_built() const {
+    if (!synapses_dirty_ && synapses_.size() == sa_.size()) return;
+    const size_t S = sa_.size();
+    synapses_.resize(S);
+    for (size_t i = 0; i < S; ++i)
+        synapses_[i] = SynapseBase(i, this);
+    synapses_dirty_ = false;
+}
+
 const SynapseBase& Network::synapse(size_t idx) const {
+    ensure_synapses_built();
     if (idx >= synapses_.size()) throw std::out_of_range("Synapse index out of range");
     return synapses_[idx];
 }
@@ -206,46 +216,53 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
         throw std::out_of_range("Neuron index out of range");
     }
 
-    // Dedup spec by name
+    // Dedup spec by name; populate spec cache for new entries
     size_t sidx = synapse_specs_.size();
     for (size_t i = 0; i < synapse_specs_.size(); ++i) {
         if (synapse_specs_[i].name == spec.name) { sidx = i; break; }
     }
-    if (sidx == synapse_specs_.size()) synapse_specs_.push_back(spec);
+    if (sidx == synapse_specs_.size()) {
+        synapse_specs_.push_back(spec);
+        SynapseSpecCache c;
+        c.delta_S   = spec.delta_S;
+        c.delta_A   = spec.delta_A;
+        c.tau_S     = spec.tau_S;
+        c.tau_A     = spec.tau_A;
+        c.inv_tau_A = spec.tau_A > 0.0 ? 1.0 / spec.tau_A : 0.0;
+        c.norm      = spec.norm_factor;
+        // decay fields left 0 — filled by rebuild_spec_caches() at simulate time
+        synapse_spec_caches_.push_back(c);
+    }
 
-    // Common SoA fields
-    sa_.pre.push_back(pre);
-    sa_.post.push_back(post);
+    // Restore pre/post arrays if they were freed after a prior build
+    if (pre_post_cleared_) reconstruct_pre_post();
+
+    // Common SoA fields — narrow types: task27.2 (pre/post/delay), task27.4 (E_syn/spec_idx)
+    sa_.pre.push_back(static_cast<uint32_t>(pre));
+    sa_.post.push_back(static_cast<uint32_t>(post));
     sa_.weight.push_back(weight);
-    sa_.E_syn.push_back(spec.E_syn);
+    sa_.E_syn.push_back(static_cast<float>(spec.E_syn));
     sa_.g.push_back(0.0);
-    sa_.delay.push_back(delay);
+    sa_.delay.push_back(static_cast<float>(delay));
 
-    // Unified state
+    // Unified state (spec-derived constants now live in synapse_spec_caches_)
     sa_.S.push_back(spec.S_init);
     sa_.A.push_back(spec.A_init);
-    sa_.delta_S.push_back(spec.delta_S);
-    sa_.delta_A.push_back(spec.delta_A);
-    sa_.tau_S.push_back(spec.tau_S);
-    sa_.tau_A.push_back(spec.tau_A);
-    sa_.inv_tau_A.push_back(spec.tau_A > 0.0 ? 1.0 / spec.tau_A : 0.0);
-    sa_.norm.push_back(spec.norm_factor);
-    sa_.decay_S.push_back(0.0);
-    sa_.decay_A.push_back(0.0);
-    sa_.spec_idx.push_back(sidx);
+    sa_.spec_idx.push_back(static_cast<uint32_t>(sidx));
 
     // Plasticity defaults (NONE — no state allocated)
     sa_.plast_type.push_back(PlasticityType::NONE);
     sa_.plast_state_idx.push_back(-1);
-    sa_.plast_spec_idx_arr.push_back(0);
+    sa_.plast_spec_idx_arr.push_back(static_cast<uint32_t>(0));
     sa_.is_active.push_back(false);
 
-    // Push lightweight view (always valid — no heap per synapse)
-    synapses_.emplace_back(sa_.size() - 1, this);
+    // synapses_ is built lazily on first synapse(idx) call (task27.5)
+    synapses_dirty_ = true;
 
     sa_.cached_dt = -1.0;
     soa_sorted_ = false;
     groups_built_ = false;
+    injection_tables_built_ = false;
 
     return sa_.size() - 1;
 }
@@ -285,7 +302,7 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
 
     size_t ps_idx = add_or_find_plasticity_spec(plast);
     sa_.plast_type[syn_i] = plast.type;
-    sa_.plast_spec_idx_arr[syn_i] = ps_idx;
+    sa_.plast_spec_idx_arr[syn_i] = static_cast<uint32_t>(ps_idx);
 
     if (plast.type == PlasticityType::STDP) {
         int32_t state_i = (int32_t)sa_.plast_x_pre.size();
@@ -458,24 +475,28 @@ void Network::reset() {
 }
 
 // =============================================================================
-// Decay factor caching (called once when dt changes)
+// Spec cache rebuild — O(n_spec_types), called once when dt changes (task27.1)
 // =============================================================================
 
-void Network::update_decay_factors(double dt) {
+void Network::rebuild_spec_caches(double dt) {
     if (dt == sa_.cached_dt) return;
 
     using UF = SynapseSpec::UpdateForm;
-    const size_t N = sa_.size();
-    for (size_t i = 0; i < N; ++i) {
-        const auto& spec = synapse_specs_[sa_.spec_idx[i]];
-        if (spec.update_form == UF::EXP_DECAY) {
-            sa_.decay_S[i] = std::exp(-dt / sa_.tau_S[i]);
-        } else if (spec.update_form == UF::DOUBLE_EXP) {
-            sa_.decay_S[i] = std::exp(-dt / sa_.tau_S[i]);
-            sa_.decay_A[i] = std::exp(-dt / sa_.tau_A[i]);
-        }
-        // ALPHA_FUNC uses Euler — no precomputed decay needed
-        // Voltage-gated forms compute their own exact integration per step
+    synapse_spec_caches_.resize(synapse_specs_.size());
+    for (size_t i = 0; i < synapse_specs_.size(); ++i) {
+        const auto& spec = synapse_specs_[i];
+        auto& c = synapse_spec_caches_[i];
+        c.delta_S   = spec.delta_S;
+        c.delta_A   = spec.delta_A;
+        c.tau_S     = spec.tau_S;
+        c.tau_A     = spec.tau_A;
+        c.inv_tau_A = spec.tau_A > 0.0 ? 1.0 / spec.tau_A : 0.0;
+        c.norm      = spec.norm_factor;
+        const auto uf = spec.update_form;
+        c.decay_S = (uf == UF::EXP_DECAY || uf == UF::DOUBLE_EXP)
+                    ? std::exp(-dt / spec.tau_S) : 0.0;
+        c.decay_A = (uf == UF::DOUBLE_EXP)
+                    ? std::exp(-dt / spec.tau_A) : 0.0;
     }
     sa_.cached_dt = dt;
 }
@@ -487,11 +508,11 @@ void Network::update_decay_factors(double dt) {
 void Network::compute_synaptic_currents() {
     std::fill(I_syn_buffer_.begin(), I_syn_buffer_.end(), 0.0);
 
-    const double* g = sa_.g.data();
-    const double* E_syn = sa_.E_syn.data();
-    const size_t* post = sa_.post.data();
-    const double* V = V_cache_.data();
-    double* I_syn = I_syn_buffer_.data();
+    const double*   g    = sa_.g.data();
+    const float*    E_syn = sa_.E_syn.data();  // float; promotes to double in arithmetic
+    const uint32_t* post  = post_decoded_.empty() ? sa_.post.data() : post_decoded_.data();
+    const double*   V    = V_cache_.data();
+    double*         I_syn = I_syn_buffer_.data();
 
     if (!synapse_g_scale_.empty() && pool_mgr_.has_synapse_g_mods()) {
         const double* gscale = synapse_g_scale_.data();
@@ -530,6 +551,25 @@ void Network::step(double dt, const std::vector<double>& I_ext) {
 }
 
 // =============================================================================
+// Reconstruct sa_.pre / sa_.post from compressed data (task27.2)
+// Called by add_synapse() when new synapses are added after a prior build.
+// =============================================================================
+
+void Network::reconstruct_pre_post() {
+    const size_t S = post_decoded_.size();
+    sa_.pre.resize(S);
+    sa_.post.resize(S);
+    for (size_t n = 0; n < neuron_connectivity_.size(); ++n) {
+        const auto& conn = neuron_connectivity_[n];
+        for (size_t j = 0; j < conn.syn_count; ++j) {
+            sa_.pre[conn.syn_start + j]  = static_cast<uint32_t>(n);
+            sa_.post[conn.syn_start + j] = post_decoded_[conn.syn_start + j];
+        }
+    }
+    pre_post_cleared_ = false;
+}
+
+// =============================================================================
 // Sort SoA arrays by presynaptic index for cache-friendly access
 // =============================================================================
 
@@ -564,14 +604,6 @@ void Network::sort_synapses_by_pre() {
     // Unified state
     permute(sa_.S);
     permute(sa_.A);
-    permute(sa_.delta_S);
-    permute(sa_.delta_A);
-    permute(sa_.tau_S);
-    permute(sa_.tau_A);
-    permute(sa_.inv_tau_A);
-    permute(sa_.norm);
-    permute(sa_.decay_S);
-    permute(sa_.decay_A);
     permute(sa_.spec_idx);
 
     // is_active: vector<bool> uses proxy refs — permute manually
@@ -581,10 +613,8 @@ void Network::sort_synapses_by_pre() {
         sa_.is_active = std::move(tmp);
     }
 
-    // Reorder SynapseBase views and re-bind indices
-    std::vector<SynapseBase> reordered(S);
-    for (size_t i = 0; i < S; ++i) reordered[i] = SynapseBase(i, this);
-    synapses_ = std::move(reordered);
+    // synapses_ indices no longer valid after permutation — mark dirty (task27.5)
+    synapses_dirty_ = true;
 
     // Active lists reference old indices — clear; will be rebuilt by build_synapse_groups
     syn_groups_.active_exp_decay.clear();
@@ -660,18 +690,28 @@ void Network::build_synapse_groups() {
 
 void Network::build_injection_tables(double dt) {
     const size_t N = neurons_.size();
+
+    // On subsequent simulate() calls the tables are unchanged; only reset V_prev_.
+    if (injection_tables_built_) {
+        V_prev_.resize(N);
+        for (size_t n = 0; n < N; ++n)
+            V_prev_[n] = neurons_[n]->membrane_potential();
+        return;
+    }
+
     const size_t S = sa_.size();
 
     delay_steps_.resize(S);
     size_t max_delay_steps = 0;
     for (size_t i = 0; i < S; ++i) {
-        delay_steps_[i] = static_cast<size_t>(std::round(sa_.delay[i] / dt));
+        delay_steps_[i] = static_cast<uint32_t>(
+            std::round(static_cast<double>(sa_.delay[i]) / dt));
         if (delay_steps_[i] > max_delay_steps) max_delay_steps = delay_steps_[i];
     }
 
     post_from_.assign(N, {});
     for (size_t i = 0; i < S; ++i)
-        post_from_[sa_.pre[i]].push_back({i, static_cast<uint32_t>(delay_steps_[i])});
+        post_from_[sa_.pre[i]].push_back({static_cast<uint32_t>(i), delay_steps_[i]});
 
     // +1 so the slot for step t and the slot for step t+max_delay don't collide
     event_slots_.assign(max_delay_steps + 1, {});
@@ -680,6 +720,73 @@ void Network::build_injection_tables(double dt) {
     V_prev_.resize(N);
     for (size_t n = 0; n < N; ++n)
         V_prev_[n] = neurons_[n]->membrane_potential();
+
+    build_neuron_connectivity();
+    injection_tables_built_ = true;
+}
+
+// =============================================================================
+// Build compressed per-neuron connectivity (task27.2)
+// Called at the end of build_injection_tables() once sa_.pre is sorted.
+// Populates neuron_connectivity_, post_decoded_, pre_decoded_;
+// then clears sa_.pre / sa_.post to reclaim ~8 bytes/synapse.
+// =============================================================================
+
+void Network::build_neuron_connectivity() {
+    const size_t N = neurons_.size();
+    const size_t S = sa_.size();
+
+    neuron_connectivity_.assign(N, NeuronConnectivity{});
+    post_decoded_.resize(S);
+    pre_decoded_.resize(S);
+
+    size_t k = 0;
+    for (size_t n = 0; n < N; ++n) {
+        auto& conn = neuron_connectivity_[n];
+        conn.syn_start = k;
+        while (k < S && sa_.pre[k] == n) ++k;
+        conn.syn_count = k - conn.syn_start;
+
+        for (size_t j = 0; j < conn.syn_count; ++j) {
+            const size_t idx = conn.syn_start + j;
+            pre_decoded_[idx] = static_cast<uint32_t>(n);
+            post_decoded_[idx] = sa_.post[idx];
+        }
+
+        if (conn.syn_count == 0) continue;
+
+        // Delta-encode post indices (sorted ascending after sort_synapses_by_pre)
+        conn.post_deltas.resize(conn.syn_count);
+        uint32_t prev = 0;
+        for (size_t j = 0; j < conn.syn_count; ++j) {
+            uint32_t cur   = sa_.post[conn.syn_start + j];
+            uint32_t delta = cur - prev;
+            if (delta < 255u) {
+                conn.post_deltas[j] = static_cast<uint8_t>(delta);
+            } else {
+                conn.post_deltas[j] = 255u;
+                conn.post_overflow.push_back(static_cast<uint32_t>(j));
+                conn.post_overflow.push_back(cur);
+            }
+            prev = cur;
+        }
+
+        // Uniform weight detection
+        double w0 = sa_.weight[conn.syn_start];
+        conn.uniform_weight = true;
+        for (size_t j = 1; j < conn.syn_count; ++j) {
+            if (sa_.weight[conn.syn_start + j] != w0) {
+                conn.uniform_weight = false;
+                break;
+            }
+        }
+        conn.weight_value = w0;
+    }
+
+    // Free sa_.pre and sa_.post — connectivity is now in neuron_connectivity_ + decoded arrays
+    sa_.pre.clear();  sa_.pre.shrink_to_fit();
+    sa_.post.clear(); sa_.post.shrink_to_fit();
+    pre_post_cleared_ = true;
 }
 
 // =============================================================================
@@ -687,7 +794,7 @@ void Network::build_injection_tables(double dt) {
 // =============================================================================
 
 void Network::update_synapses_grouped(double dt) {
-    update_decay_factors(dt);
+    rebuild_spec_caches(dt);
 
     const size_t S = sa_.size();
     const double spike_threshold = spike_threshold_;
@@ -744,8 +851,9 @@ void Network::update_synapses_grouped(double dt) {
         size_t pos = 0;
         while (pos < syn_groups_.active_exp_decay.size()) {
             const size_t k = syn_groups_.active_exp_decay[pos];
-            if (spike_detected_[k]) sa_.S[k] += sa_.delta_S[k];
-            sa_.S[k] *= sa_.decay_S[k];
+            const auto& cache = synapse_spec_caches_[sa_.spec_idx[k]];
+            if (spike_detected_[k]) sa_.S[k] += cache.delta_S;
+            sa_.S[k] *= cache.decay_S;
             if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
             const auto& spec = synapse_specs_[sa_.spec_idx[k]];
             sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
@@ -769,10 +877,10 @@ void Network::update_synapses_grouped(double dt) {
         size_t pos = 0;
         while (pos < syn_groups_.active_alpha_func.size()) {
             const size_t k = syn_groups_.active_alpha_func[pos];
-            if (spike_detected_[k]) sa_.A[k] += sa_.delta_A[k];
-            double inv = sa_.inv_tau_A[k];
-            double dS  = (sa_.A[k] - sa_.S[k]) * inv;
-            double dA  = -sa_.A[k] * inv;
+            const auto& cache = synapse_spec_caches_[sa_.spec_idx[k]];
+            if (spike_detected_[k]) sa_.A[k] += cache.delta_A;
+            double dS  = (sa_.A[k] - sa_.S[k]) * cache.inv_tau_A;
+            double dA  = -sa_.A[k] * cache.inv_tau_A;
             sa_.S[k] += dt * dS;
             sa_.A[k] += dt * dA;
             if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
@@ -798,13 +906,14 @@ void Network::update_synapses_grouped(double dt) {
         size_t pos = 0;
         while (pos < syn_groups_.active_double_exp.size()) {
             const size_t k = syn_groups_.active_double_exp[pos];
+            const auto& cache = synapse_spec_caches_[sa_.spec_idx[k]];
             if (spike_detected_[k]) {
-                sa_.S[k] += sa_.delta_S[k];
-                sa_.A[k] += sa_.delta_A[k];
+                sa_.S[k] += cache.delta_S;
+                sa_.A[k] += cache.delta_A;
             }
-            sa_.S[k] *= sa_.decay_S[k];
-            sa_.A[k] *= sa_.decay_A[k];
-            double g_eff = sa_.norm[k] * (sa_.S[k] - sa_.A[k]);
+            sa_.S[k] *= cache.decay_S;
+            sa_.A[k] *= cache.decay_A;
+            double g_eff = cache.norm * (sa_.S[k] - sa_.A[k]);
             if (g_eff < 0.0) g_eff = 0.0;
             const auto& spec = synapse_specs_[sa_.spec_idx[k]];
             sa_.g[k] = spec.g * sa_.weight[k] * g_eff;
@@ -822,8 +931,8 @@ void Network::update_synapses_grouped(double dt) {
     using CF = SynapseSpec::CurrentForm;
 
     for (size_t k : syn_groups_.voltage_gated) {
-        double Vpre  = V_cache_[sa_.pre[k]];
-        double Vpost = V_cache_[sa_.post[k]];
+        double Vpre  = V_cache_[pre_decoded_[k]];
+        double Vpost = V_cache_[post_decoded_[k]];
         const auto& spec = synapse_specs_[sa_.spec_idx[k]];
         double S = sa_.S[k];
 
@@ -951,11 +1060,15 @@ size_t Network::max_gate_count() const {
 }
 
 std::vector<size_t> Network::get_synapse_pre_indices() const {
-    return sa_.pre;
+    if (!pre_decoded_.empty())
+        return std::vector<size_t>(pre_decoded_.begin(), pre_decoded_.end());
+    return std::vector<size_t>(sa_.pre.begin(), sa_.pre.end());
 }
 
 std::vector<size_t> Network::get_synapse_post_indices() const {
-    return sa_.post;
+    if (!post_decoded_.empty())
+        return std::vector<size_t>(post_decoded_.begin(), post_decoded_.end());
+    return std::vector<size_t>(sa_.post.begin(), sa_.post.end());
 }
 
 // =============================================================================
@@ -1041,11 +1154,11 @@ void Network::simulate_into_buffers(
         for (size_t i = 0; i < n_neurons; ++i)
             I_syn_buffer_[i] = I_ext[i][t];
 
-        const double* g = sa_.g.data();
-        const double* E_syn_data = sa_.E_syn.data();
-        const size_t* post = sa_.post.data();
-        const double* V = V_cache_.data();
-        double* I_buf = I_syn_buffer_.data();
+        const double*   g          = sa_.g.data();
+        const float*    E_syn_data = sa_.E_syn.data();  // float; promotes in arithmetic
+        const uint32_t* post       = post_decoded_.data();
+        const double*   V          = V_cache_.data();
+        double*         I_buf      = I_syn_buffer_.data();
         if (pool_mgr_.has_synapse_g_mods()) {
             const double* gscale = synapse_g_scale_.data();
             for (size_t i = 0; i < S; ++i)
@@ -1073,7 +1186,7 @@ void Network::simulate_into_buffers(
 
         if (spike_event_buf) {
             for (size_t j = 0; j < S; ++j)
-                if (spike_detected_[j]) syn_spike_accum[sa_.post[j]] += 1.0;
+                if (spike_detected_[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
         }
     }
 
@@ -1188,11 +1301,11 @@ void Network::simulate_with_descriptors(
             }
         }
 
-        const double* g = sa_.g.data();
-        const double* E_syn_data = sa_.E_syn.data();
-        const size_t* post = sa_.post.data();
-        const double* V = V_ptr;
-        double* I_buf = I_ptr;
+        const double*   g          = sa_.g.data();
+        const float*    E_syn_data = sa_.E_syn.data();  // float; promotes in arithmetic
+        const uint32_t* post       = post_decoded_.data();
+        const double*   V          = V_ptr;
+        double*         I_buf      = I_ptr;
         if (pool_mgr_.has_synapse_g_mods()) {
             const double* gscale = synapse_g_scale_.data();
             for (size_t i : syn_groups_.active_g)
@@ -1220,7 +1333,7 @@ void Network::simulate_with_descriptors(
 
         if (spike_event_buf) {
             for (size_t j = 0; j < S; ++j)
-                if (spike_detected_[j]) syn_spike_accum[sa_.post[j]] += 1.0;
+                if (spike_detected_[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
         }
     }
 
@@ -1277,7 +1390,7 @@ void Network::simulate_with_descriptors_parallel(
         pools_dirty_ = false;
     }
     ensure_buffers();
-    update_decay_factors(dt);   // once on main thread — dt is constant for this run
+    rebuild_spec_caches(dt);   // once on main thread — dt is constant for this run
 
     // --- Build GroupDef structs ---
     // Map neuron global index → group id
@@ -1299,9 +1412,10 @@ void Network::simulate_with_descriptors_parallel(
     }
 
     // Partition synapse type lists by pre-neuron group
+    // (uses pre_decoded_ — sa_.pre was cleared by build_neuron_connectivity)
     auto assign_pre = [&](const std::vector<size_t>& src, std::vector<size_t> GroupDef::* member) {
         for (size_t k : src) {
-            auto it = neuron_gid.find(sa_.pre[k]);
+            auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
             if (it != neuron_gid.end())
                 (groups[it->second].*member).push_back(k);
         }
@@ -1313,14 +1427,14 @@ void Network::simulate_with_descriptors_parallel(
 
     // Build pre_all (union of all pre-synapse type lists) for spike detection Phase 1
     for (size_t k = 0; k < sa_.size(); ++k) {
-        auto it = neuron_gid.find(sa_.pre[k]);
+        auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
         if (it != neuron_gid.end())
             groups[it->second].pre_all.push_back(k);
     }
 
     // Build post_syn (synapse indices where post[k] in this group) — I_syn accumulation
     for (size_t k = 0; k < sa_.size(); ++k) {
-        auto it = neuron_gid.find(sa_.post[k]);
+        auto it = neuron_gid.find(static_cast<size_t>(post_decoded_[k]));
         if (it != neuron_gid.end())
             groups[it->second].post_syn.push_back(k);
     }
@@ -1329,7 +1443,7 @@ void Network::simulate_with_descriptors_parallel(
     for (auto& g : groups) {
         std::unordered_set<int> srcs;
         for (size_t k : g.post_syn) {
-            auto it = neuron_gid.find(sa_.pre[k]);
+            auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
             if (it != neuron_gid.end() && it->second != g.id)
                 srcs.insert(it->second);
         }
@@ -1344,8 +1458,8 @@ void Network::simulate_with_descriptors_parallel(
 
     // Build intra_syn: synapses where both pre and post are in the same group
     for (size_t k = 0; k < sa_.size(); ++k) {
-        auto pre_it  = neuron_gid.find(sa_.pre[k]);
-        auto post_it = neuron_gid.find(sa_.post[k]);
+        auto pre_it  = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
+        auto post_it = neuron_gid.find(static_cast<size_t>(post_decoded_[k]));
         if (pre_it != neuron_gid.end() && post_it != neuron_gid.end()
                 && pre_it->second == post_it->second)
             groups[pre_it->second].intra_syn.push_back(k);
@@ -1362,7 +1476,7 @@ void Network::simulate_with_descriptors_parallel(
         // Collect unique pre-neuron indices for this group's pre-synapses
         std::unordered_set<size_t> pre_neuron_set;
         for (size_t k : grp.pre_all)
-            pre_neuron_set.insert(sa_.pre[k]);
+            pre_neuron_set.insert(static_cast<size_t>(pre_decoded_[k]));
         grp.pre_neurons.assign(pre_neuron_set.begin(), pre_neuron_set.end());
 
         // Size event buffer to cover max delay among this group's synapses
@@ -1393,9 +1507,9 @@ void Network::simulate_with_descriptors_parallel(
     double* const I_buf        = I_syn_buffer_.data();
     double* const gscale       = synapse_g_scale_.data();
     const double* const I_const = stim.I_const.data();
-    const size_t* const pre_arr  = sa_.pre.data();
-    const size_t* const post_arr = sa_.post.data();
-    const double* const E_arr    = sa_.E_syn.data();
+    const uint32_t* const pre_arr  = pre_decoded_.data();
+    const uint32_t* const post_arr = post_decoded_.data();
+    const float* const  E_arr    = sa_.E_syn.data();  // float; promotes in arithmetic
     double* const g_arr          = sa_.g.data();
 
     // --- Launch one std::thread per group ---
@@ -1566,8 +1680,9 @@ void Network::simulate_with_descriptors_parallel(
                     size_t pos = 0;
                     while (pos < grp.active_pre_exp_decay.size()) {
                         const size_t k = grp.active_pre_exp_decay[pos];
-                        if (spike_detected_[k]) sa_.S[k] += sa_.delta_S[k];
-                        sa_.S[k] *= sa_.decay_S[k];
+                        const auto& cache = synapse_spec_caches_[sa_.spec_idx[k]];
+                        if (spike_detected_[k]) sa_.S[k] += cache.delta_S;
+                        sa_.S[k] *= cache.decay_S;
                         if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
                         const auto& spec = synapse_specs_[sa_.spec_idx[k]];
                         sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
@@ -1591,10 +1706,10 @@ void Network::simulate_with_descriptors_parallel(
                     size_t pos = 0;
                     while (pos < grp.active_pre_alpha_func.size()) {
                         const size_t k = grp.active_pre_alpha_func[pos];
-                        if (spike_detected_[k]) sa_.A[k] += sa_.delta_A[k];
-                        double inv = sa_.inv_tau_A[k];
-                        double dS  = (sa_.A[k] - sa_.S[k]) * inv;
-                        double dA  = -sa_.A[k] * inv;
+                        const auto& cache = synapse_spec_caches_[sa_.spec_idx[k]];
+                        if (spike_detected_[k]) sa_.A[k] += cache.delta_A;
+                        double dS  = (sa_.A[k] - sa_.S[k]) * cache.inv_tau_A;
+                        double dA  = -sa_.A[k] * cache.inv_tau_A;
                         sa_.S[k] += dt * dS;
                         sa_.A[k] += dt * dA;
                         if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
@@ -1620,13 +1735,14 @@ void Network::simulate_with_descriptors_parallel(
                     size_t pos = 0;
                     while (pos < grp.active_pre_double_exp.size()) {
                         const size_t k = grp.active_pre_double_exp[pos];
+                        const auto& cache = synapse_spec_caches_[sa_.spec_idx[k]];
                         if (spike_detected_[k]) {
-                            sa_.S[k] += sa_.delta_S[k];
-                            sa_.A[k] += sa_.delta_A[k];
+                            sa_.S[k] += cache.delta_S;
+                            sa_.A[k] += cache.delta_A;
                         }
-                        sa_.S[k] *= sa_.decay_S[k];
-                        sa_.A[k] *= sa_.decay_A[k];
-                        double g_eff = sa_.norm[k] * (sa_.S[k] - sa_.A[k]);
+                        sa_.S[k] *= cache.decay_S;
+                        sa_.A[k] *= cache.decay_A;
+                        double g_eff = cache.norm * (sa_.S[k] - sa_.A[k]);
                         if (g_eff < 0.0) g_eff = 0.0;
                         const auto& spec = synapse_specs_[sa_.spec_idx[k]];
                         sa_.g[k] = spec.g * sa_.weight[k] * g_eff;
@@ -1723,7 +1839,7 @@ void Network::apply_stdp(double dt) {
         double& w = sa_.weight[k];
         double mod_scale = 1.0;
         if (spec.modulator_pop_start >= 0 && spec.modulator_substance_idx >= 0) {
-            size_t post_n = sa_.post[k];
+            size_t post_n = post_decoded_[k];
             mod_scale = spec.modulator_scale
                         * pool_mgr_.get_substance(post_n,
                                                    (size_t)spec.modulator_substance_idx);
@@ -1735,7 +1851,7 @@ void Network::apply_stdp(double dt) {
             sa_.plast_x_pre[si] += 1.0;
         }
         // Post-spike: LTD
-        if (post_spiked_[sa_.post[k]]) {
+        if (post_spiked_[post_decoded_[k]]) {
             w -= mod_scale * spec.A_minus * sa_.plast_x_pre[si];
             sa_.plast_x_post[si] += 1.0;
         }
@@ -1763,7 +1879,8 @@ void Network::apply_stp(double dt) {
             // We back-correct: remove the unscaled jump and add the scaled one.
             // Correction: S -= delta_S * decay_S * (1 - u*x)
             double ux = u * x;
-            sa_.S[k] -= sa_.delta_S[k] * sa_.decay_S[k] * (1.0 - ux);
+            const auto& syn_cache = synapse_spec_caches_[sa_.spec_idx[k]];
+            sa_.S[k] -= syn_cache.delta_S * syn_cache.decay_S * (1.0 - ux);
             if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
             // Recompute g from corrected S
             const auto& syn_spec = synapse_specs_[sa_.spec_idx[k]];

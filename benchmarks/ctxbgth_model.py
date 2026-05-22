@@ -730,13 +730,39 @@ def simulate_ctxbgth(
 # ---------------------------------------------------------------------------
 
 def main():
+    import os, gc, threading, psutil
     time = 1  # seconds
     window_s = 0.25  # time window for rate-over-time reporting (seconds)
 
     print(f"Building CTX-BG-TH network (healthy, no DBS, n=10, {time}s) ...")
-    area, S, f, spikes, t_sim = simulate_ctxbgth(
-        n=10, pd=0, tmax=time * 1000, dt=0.01, corstim=0, seed=6536, amplitude=1.0
-    )
+
+    proc = psutil.Process(os.getpid())
+    gc.collect()
+    baseline_rss = proc.memory_info().rss
+    peak_rss = [baseline_rss]
+    sim_done = [False]
+    sim_result = [None]
+
+    def _run():
+        sim_result[0] = simulate_ctxbgth(
+            n=10, pd=0, tmax=time * 1000, dt=0.01, corstim=0, seed=6536, amplitude=1.0
+        )
+        sim_done[0] = True
+
+    import time as _time
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    while not sim_done[0]:
+        rss = proc.memory_info().rss
+        if rss > peak_rss[0]:
+            peak_rss[0] = rss
+        _time.sleep(0.002)
+    t.join()
+
+    area, S, f, spikes, t_sim = sim_result[0]
+    print(f"  Baseline RSS (pre-simulate): {baseline_rss / 1024 / 1024:.1f} MB")
+    print(f"  Peak RSS (absolute):         {peak_rss[0] / 1024 / 1024:.1f} MB")
+    print(f"  Peak RSS increase:           {(peak_rss[0] - baseline_rss) / 1024 / 1024:.1f} MB")
     print(f"  Simulation time : {t_sim:.2f} s")
     print(f"  GPi beta-band power: {area:.4f}")
 
