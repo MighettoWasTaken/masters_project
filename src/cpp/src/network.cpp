@@ -1,5 +1,8 @@
 #include "hodgkin_huxley/network.hpp"
 #include "hodgkin_huxley/model/kinetics.hpp"
+#ifdef HH_USE_CUDA
+#  include <cuda_runtime_api.h>
+#endif
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -13,6 +16,40 @@
 #endif
 
 namespace hodgkin_huxley {
+
+Network::~Network() {
+#ifdef HH_USE_CUDA
+    if (V_cache_pinned_) cudaFreeHost(V_cache_pinned_);
+    if (I_syn_pinned_)   cudaFreeHost(I_syn_pinned_);
+#endif
+}
+
+void Network::set_device(const Device& device) {
+    if (device.type == Device::Type::CUDA)
+        pool_mgr_.assign_to_device(device.index);
+    else
+        pool_mgr_.assign_to_cpu();
+    pools_dirty_ = true;
+}
+
+Device Network::get_device() const {
+    return pool_mgr_.on_cuda()
+        ? Device::cuda(pool_mgr_.cuda_device_id())
+        : Device::cpu();
+}
+
+void Network::reallocate_pinned_buffers(size_t n) {
+#ifdef HH_USE_CUDA
+    if (V_cache_pinned_) cudaFreeHost(V_cache_pinned_);
+    if (I_syn_pinned_)   cudaFreeHost(I_syn_pinned_);
+    cudaMallocHost(reinterpret_cast<void**>(&V_cache_pinned_), n * sizeof(double));
+    cudaMallocHost(reinterpret_cast<void**>(&I_syn_pinned_),   n * sizeof(double));
+    use_pinned_memory_ = true;
+    pinned_size_       = n;
+#else
+    (void)n;
+#endif
+}
 
 static constexpr double kSynapseEpsilon = 1e-9;
 
@@ -182,11 +219,7 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
     sa_.weight.push_back(weight);
     sa_.E_syn.push_back(spec.E_syn);
     sa_.g.push_back(0.0);
-    sa_.V_pre_prev.push_back(neurons_[pre]->membrane_potential());
     sa_.delay.push_back(delay);
-    sa_.spike_buf.emplace_back();
-    sa_.buf_head.push_back(0);
-    sa_.delay_init.push_back(false);
 
     // Unified state
     sa_.S.push_back(spec.S_init);
@@ -406,12 +439,18 @@ void Network::reset() {
         const auto& spec = synapse_specs_[sa_.spec_idx[i]];
         sa_.S[i] = spec.S_init;
         sa_.A[i] = spec.A_init;
-        sa_.V_pre_prev[i] = neurons_[sa_.pre[i]]->membrane_potential();
-        if (sa_.delay_init[i]) {
-            std::fill(sa_.spike_buf[i].begin(), sa_.spike_buf[i].end(), false);
-            sa_.buf_head[i] = 0;
-        }
     }
+
+    // Clear in-flight spike events and reset step counter
+    for (auto& slot : event_slots_) slot.clear();
+    current_step_ = 0;
+
+    // Reinitialise per-neuron previous voltage
+    const size_t N_neurons = neurons_.size();
+    V_prev_.resize(N_neurons);
+    for (size_t n = 0; n < N_neurons; ++n)
+        V_prev_[n] = neurons_[n]->membrane_potential();
+
     sa_.cached_dt = -1.0;
 
     soa_dirty_ = false;
@@ -520,11 +559,7 @@ void Network::sort_synapses_by_pre() {
     permute(sa_.weight);
     permute(sa_.E_syn);
     permute(sa_.g);
-    permute(sa_.V_pre_prev);
     permute(sa_.delay);
-    permute(sa_.spike_buf);
-    permute(sa_.buf_head);
-    permute(sa_.delay_init);
 
     // Unified state
     permute(sa_.S);
@@ -620,6 +655,34 @@ void Network::build_synapse_groups() {
 }
 
 // =============================================================================
+// Forward-injection spike delivery tables (task26)
+// =============================================================================
+
+void Network::build_injection_tables(double dt) {
+    const size_t N = neurons_.size();
+    const size_t S = sa_.size();
+
+    delay_steps_.resize(S);
+    size_t max_delay_steps = 0;
+    for (size_t i = 0; i < S; ++i) {
+        delay_steps_[i] = static_cast<size_t>(std::round(sa_.delay[i] / dt));
+        if (delay_steps_[i] > max_delay_steps) max_delay_steps = delay_steps_[i];
+    }
+
+    post_from_.assign(N, {});
+    for (size_t i = 0; i < S; ++i)
+        post_from_[sa_.pre[i]].push_back({i, static_cast<uint32_t>(delay_steps_[i])});
+
+    // +1 so the slot for step t and the slot for step t+max_delay don't collide
+    event_slots_.assign(max_delay_steps + 1, {});
+    current_step_ = 0;
+
+    V_prev_.resize(N);
+    for (size_t n = 0; n < N; ++n)
+        V_prev_[n] = neurons_[n]->membrane_potential();
+}
+
+// =============================================================================
 // Unified synapse update — four tight sub-loops, no branch on type within each
 // =============================================================================
 
@@ -639,30 +702,33 @@ void Network::update_synapses_grouped(double dt) {
         }
     }
 
-    // Phase 1: spike detection + delay processing for ALL synapses
-    for (size_t i = 0; i < S; ++i) {
-        double V_pre = V_cache_[sa_.pre[i]];
-        bool spiked = (V_pre > spike_threshold) && (sa_.V_pre_prev[i] <= spike_threshold);
-        sa_.V_pre_prev[i] = V_pre;
+    // Phase 1: forward injection + event dispatch
+    // Lazy-build tables when called via the step() public API (no prior simulate call).
+    // Skip if dt=0 — spike timing is undefined with zero timestep.
+    if (event_slots_.empty() && dt > 0.0)
+        build_injection_tables(dt);
 
-        if (sa_.delay[i] > 0.0) {
-            if (!sa_.delay_init[i]) {
-                size_t steps = static_cast<size_t>(std::round(sa_.delay[i] / dt));
-                if (steps > 0) {
-                    sa_.spike_buf[i].assign(steps, false);
-                    sa_.buf_head[i] = 0;
-                    sa_.delay_init[i] = true;
-                }
-            }
-            if (sa_.delay_init[i]) {
-                bool delayed = sa_.spike_buf[i][sa_.buf_head[i]];
-                sa_.spike_buf[i][sa_.buf_head[i]] = spiked;
-                sa_.buf_head[i] = (sa_.buf_head[i] + 1) % sa_.spike_buf[i].size();
-                spiked = delayed;
+    std::fill(spike_detected_.begin(), spike_detected_.end(), 0);
+    if (!event_slots_.empty()) {
+        const size_t N = neurons_.size();
+        const size_t step = current_step_++;
+        // Detect spikes at neuron level; push arrivals into the correct future slot.
+        // Injection before dispatch ensures delay=0 fires in the same step.
+        for (size_t n = 0; n < N; ++n) {
+            double V = V_cache_[n];
+            bool spiked = (V > spike_threshold) && (V_prev_[n] <= spike_threshold);
+            V_prev_[n] = V;
+            if (!spiked) continue;
+            for (const SynapseRef& ref : post_from_[n]) {
+                size_t slot = (step + ref.delay_steps) % event_slots_.size();
+                event_slots_[slot].push_back(ref.syn_idx);
             }
         }
-
-        spike_detected_[i] = spiked ? 1 : 0;
+        // Populate spike_detected_ from events due this step, then clear the slot.
+        const size_t cur_slot = step % event_slots_.size();
+        for (size_t k : event_slots_[cur_slot])
+            spike_detected_[k] = 1;
+        event_slots_[cur_slot].clear();
     }
 
     // Phase 2a: EXP_DECAY — spike additive jump, exact multiplicative decay
@@ -926,6 +992,7 @@ void Network::simulate_into_buffers(
 
     sort_synapses_by_pre();
     build_synapse_groups();
+    build_injection_tables(dt);
 
     if (pools_dirty_) {
         pool_mgr_.build_from_neurons(neurons_, fast_math_);
@@ -1043,6 +1110,7 @@ void Network::simulate_with_descriptors(
 
     sort_synapses_by_pre();
     build_synapse_groups();
+    build_injection_tables(dt);
 
     if (pools_dirty_) {
         pool_mgr_.build_from_neurons(neurons_, fast_math_);
@@ -1051,19 +1119,26 @@ void Network::simulate_with_descriptors(
 
     ensure_buffers();
 
+#ifdef HH_USE_CUDA
+    if (pool_mgr_.on_cuda() && (!use_pinned_memory_ || pinned_size_ != n_neurons))
+        reallocate_pinned_buffers(n_neurons);
+#endif
+    double* V_ptr = use_pinned_memory_ ? V_cache_pinned_ : V_cache_.data();
+    double* I_ptr = use_pinned_memory_ ? I_syn_pinned_   : I_syn_buffer_.data();
+
     const size_t S = sa_.size();
     std::vector<double> syn_spike_accum(n_neurons, 0.0);
     std::vector<double> I_stim_cache(n_neurons, 0.0);
 
     for (size_t t = 0; t < num_steps; ++t) {
-        pool_mgr_.scatter_all_voltages(V_cache_.data());
+        pool_mgr_.scatter_all_voltages(V_ptr);
 
         if (t % interval == 0) {
             size_t tr = t / interval;
 
             if (V_buf) {
                 for (size_t i = 0; i < n_neurons; ++i)
-                    V_buf[i * n_rec + tr] = V_cache_[i];
+                    V_buf[i * n_rec + tr] = V_ptr[i];
             }
 
             if (gate_buf && max_gates > 0)
@@ -1091,13 +1166,13 @@ void Network::simulate_with_descriptors(
 
         // Seed from compact descriptors
         for (size_t i = 0; i < n_neurons; ++i)
-            I_syn_buffer_[i] = I_stim_cache[i] = stim.I_const[i];
+            I_ptr[i] = I_stim_cache[i] = stim.I_const[i];
 
         for (const auto& p : stim.pulses) {
             if (t >= p.onset_step && t < p.end_step) {
                 for (size_t i = p.neuron_start; i < p.neuron_end; ++i) {
-                    I_syn_buffer_[i] += p.amplitude;
-                    I_stim_cache[i]  += p.amplitude;
+                    I_ptr[i]          += p.amplitude;
+                    I_stim_cache[i]   += p.amplitude;
                 }
             }
         }
@@ -1107,7 +1182,7 @@ void Network::simulate_with_descriptors(
             size_t phase = t % d.isi_steps;
             if (phase < d.pw_steps) {
                 for (size_t i = d.neuron_start; i < d.neuron_end; ++i) {
-                    I_syn_buffer_[i] += d.amplitude;
+                    I_ptr[i]         += d.amplitude;
                     I_stim_cache[i]  += d.amplitude;
                 }
             }
@@ -1116,8 +1191,8 @@ void Network::simulate_with_descriptors(
         const double* g = sa_.g.data();
         const double* E_syn_data = sa_.E_syn.data();
         const size_t* post = sa_.post.data();
-        const double* V = V_cache_.data();
-        double* I_buf = I_syn_buffer_.data();
+        const double* V = V_ptr;
+        double* I_buf = I_ptr;
         if (pool_mgr_.has_synapse_g_mods()) {
             const double* gscale = synapse_g_scale_.data();
             for (size_t i : syn_groups_.active_g)
@@ -1130,16 +1205,16 @@ void Network::simulate_with_descriptors(
         if (I_syn_buf && t % interval == 0) {
             size_t tr = t / interval;
             for (size_t i = 0; i < n_neurons; ++i)
-                I_syn_buf[i * n_rec + tr] = I_syn_buffer_[i] - I_stim_cache[i];
+                I_syn_buf[i * n_rec + tr] = I_ptr[i] - I_stim_cache[i];
         }
 
-        pool_mgr_.gather_all_currents(I_syn_buffer_.data());
+        pool_mgr_.gather_all_currents(I_ptr);
         pool_mgr_.step_all(dt);
         if (pool_mgr_.has_synapse_g_mods()) {
             std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
             pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
         }
-        pool_mgr_.scatter_all_voltages(V_cache_.data());
+        pool_mgr_.scatter_all_voltages(V_ptr);
 
         update_synapses_grouped(dt);
 
@@ -1196,6 +1271,7 @@ void Network::simulate_with_descriptors_parallel(
     // --- Pre-simulate preparation (same as serial path) ---
     sort_synapses_by_pre();
     build_synapse_groups();
+    build_injection_tables(dt);
     if (pools_dirty_) {
         pool_mgr_.build_from_neurons(neurons_, fast_math_);
         pools_dirty_ = false;
@@ -1280,6 +1356,22 @@ void Network::simulate_with_descriptors_parallel(
         pool_mgr_.fill_group_hh_iz_indices(g.neuron_indices,
                                             g.hh_local_indices,
                                             g.iz_local_indices);
+
+    // Build per-group forward-injection structures (task26)
+    for (auto& grp : groups) {
+        // Collect unique pre-neuron indices for this group's pre-synapses
+        std::unordered_set<size_t> pre_neuron_set;
+        for (size_t k : grp.pre_all)
+            pre_neuron_set.insert(sa_.pre[k]);
+        grp.pre_neurons.assign(pre_neuron_set.begin(), pre_neuron_set.end());
+
+        // Size event buffer to cover max delay among this group's synapses
+        size_t max_delay = 0;
+        for (size_t n : grp.pre_neurons)
+            for (const auto& ref : post_from_[n])
+                if (ref.delay_steps > max_delay) max_delay = ref.delay_steps;
+        grp.event_slots.assign(max_delay + 1, {});
+    }
 
     // --- Initial V_cache scatter (t=0 needs pre-existing pool state) ---
     pool_mgr_.scatter_all_voltages(V_cache_.data());
@@ -1428,30 +1520,25 @@ void Network::simulate_with_descriptors_parallel(
                 pool_mgr_.scatter_voltages_for_hh(grp.hh_local_indices, V_cache);
                 pool_mgr_.scatter_voltages_for_iz(grp.iz_local_indices, V_cache);
 
-                // Phase U1: spike detection for own pre-synapses
-                for (size_t k : grp.pre_all) {
-                    double Vpre = V_cache[pre_arr[k]];
-                    bool spiked = (Vpre > spike_threshold_) && (sa_.V_pre_prev[k] <= spike_threshold_);
-                    sa_.V_pre_prev[k] = Vpre;
-
-                    if (sa_.delay[k] > 0.0) {
-                        if (!sa_.delay_init[k]) {
-                            size_t steps = static_cast<size_t>(std::round(sa_.delay[k] / dt));
-                            if (steps > 0) {
-                                sa_.spike_buf[k].assign(steps, false);
-                                sa_.buf_head[k] = 0;
-                                sa_.delay_init[k] = true;
-                            }
-                        }
-                        if (sa_.delay_init[k]) {
-                            bool delayed = sa_.spike_buf[k][sa_.buf_head[k]];
-                            sa_.spike_buf[k][sa_.buf_head[k]] = spiked;
-                            sa_.buf_head[k] = (sa_.buf_head[k] + 1) % sa_.spike_buf[k].size();
-                            spiked = delayed;
-                        }
+                // Phase U1: forward injection + event dispatch (task26)
+                // Clear spike_detected_ for own pre-synapses
+                for (size_t k : grp.pre_all) spike_detected_[k] = 0;
+                // Detect spikes at neuron level; inject into future slots
+                for (size_t n : grp.pre_neurons) {
+                    double V = V_cache[n];
+                    bool spiked = (V > spike_threshold_) && (V_prev_[n] <= spike_threshold_);
+                    V_prev_[n] = V;
+                    if (!spiked) continue;
+                    for (const SynapseRef& ref : post_from_[n]) {
+                        size_t slot = (t + ref.delay_steps) % grp.event_slots.size();
+                        grp.event_slots[slot].push_back(ref.syn_idx);
                     }
-                    spike_detected_[k] = spiked ? 1 : 0;
                 }
+                // Dispatch events due this step
+                const size_t cur_slot = t % grp.event_slots.size();
+                for (size_t k : grp.event_slots[cur_slot])
+                    spike_detected_[k] = 1;
+                grp.event_slots[cur_slot].clear();
 
                 // Spike-event accumulation: count intra-group spike arrivals
                 // (inter-group spikes omitted — spike_detected_ from other groups

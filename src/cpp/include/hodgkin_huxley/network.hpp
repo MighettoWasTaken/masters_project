@@ -12,6 +12,7 @@
 #include "hodgkin_huxley/composable_pool.hpp"
 #include "hodgkin_huxley/ion_channels.hpp"
 #include "hodgkin_huxley/network/pool_manager.hpp"
+#include "hodgkin_huxley/device.hpp"
 #include <vector>
 #include <memory>
 #include <string>
@@ -58,6 +59,7 @@ struct StimPlan {
  */
 class Network {
 public:
+    ~Network();
     /**
      * @brief Receptor types with biologically accurate default kinetics
      */
@@ -175,6 +177,10 @@ public:
     void reset();
     void step(double dt, const std::vector<double>& I_ext);
 
+    // --- CUDA device routing (task17) ---
+    void   set_device(const Device& device);
+    Device get_device() const;
+
     std::vector<std::vector<double>> simulate(
         double duration, double dt,
         const std::vector<std::vector<double>>& I_ext);
@@ -235,6 +241,12 @@ public:
         double  spike_threshold = 0.0
     );
 
+    // Forward-injection spike delivery (task26)
+    struct SynapseRef {
+        size_t   syn_idx;       // index into SynArrays
+        uint32_t delay_steps;   // precomputed: round(sa_.delay[i] / dt)
+    };
+
 private:
     std::vector<std::unique_ptr<NeuronBase>> neurons_;
     std::vector<SynapseBase> synapses_;   // lightweight views — always in sync
@@ -246,11 +258,7 @@ private:
         // Common
         std::vector<size_t> pre, post;
         std::vector<double> weight, E_syn, g;
-        std::vector<double> V_pre_prev;
         std::vector<double> delay;
-        std::vector<std::vector<bool>> spike_buf;
-        std::vector<size_t> buf_head;
-        std::vector<bool>   delay_init;
 
         // Unified state (all types)
         std::vector<double> S;           // primary gating / conductance variable
@@ -354,12 +362,27 @@ private:
     PoolManager pool_mgr_;
     bool pools_dirty_ = true;
 
+    // Pinned host memory for async GPU DMA (task17). Null when CUDA not active.
+    bool    use_pinned_memory_ = false;
+    double* V_cache_pinned_    = nullptr;
+    double* I_syn_pinned_      = nullptr;
+    size_t  pinned_size_       = 0;
+
+    // Forward-injection spike delivery state (task26)
+    std::vector<std::vector<SynapseRef>> post_from_;    // [pre_neuron] → {syn_idx, delay_steps}
+    std::vector<std::vector<size_t>>     event_slots_;  // [step % cap] → syn_indices due this step
+    std::vector<size_t>                  delay_steps_;  // precomputed per-synapse delay/dt
+    std::vector<double>                  V_prev_;       // per-neuron previous voltage
+    size_t                               current_step_ = 0;
+
+    void reallocate_pinned_buffers(size_t n);
     void cache_voltages();
     void ensure_buffers();
     void compute_synaptic_currents();
     void update_synapses_grouped(double dt);
     void update_decay_factors(double dt);
     void build_synapse_groups();
+    void build_injection_tables(double dt);
     void sort_synapses_by_pre();
     void apply_stdp(double dt);
     void apply_stp(double dt);

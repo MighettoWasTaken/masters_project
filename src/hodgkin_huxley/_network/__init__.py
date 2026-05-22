@@ -766,6 +766,18 @@ class RegionalNetwork:
         """Reset all neurons to resting state."""
         self._rnet.reset()
 
+    def to(self, device: "Device") -> "RegionalNetwork":
+        """Move all pools to device. Returns self for chaining.
+
+        Raises RuntimeError if CUDA is requested but not available.
+        """
+        self._rnet.to(device)
+        return self
+
+    def current_device(self) -> "Device":
+        """Return the Device this network is currently assigned to."""
+        return self._rnet.current_device()
+
     def attach_stimulator(self, pop_name: str, stimulator) -> None:
         """
         Attach a DBS stimulator to a population.

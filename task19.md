@@ -197,7 +197,28 @@ private:
 
 ---
 
-## 19.7 Implementation Checklist
+## 19.7 Extension Path: Multi-Machine (Hybrid MPI+OpenMP)
+
+The current architecture is not a dead end for multi-machine scaling. The natural extension is **hybrid MPI+OpenMP**: shared memory within each node (existing OpenMP path), MPI for inter-node spike exchange. This is the same model used by NEST and other production simulators.
+
+The current codebase already has most of the required building blocks:
+
+- **`set_thread_groups` + inter-group delay constraint** — the same invariant (`delay >= dt` at partition boundaries) applies at the MPI boundary, just with a larger enforced d_min matched to MPI round-trip latency rather than dt. No new synchronisation concept is needed.
+- **`SpikeTransport` abstraction (task16 §16.2)** — the seam is already there. Adding an `MPITransport` backend behind it is an implementation addition, not a redesign. Local delivery stays in shared memory; inter-node delivery goes through MPI.
+- **`assign()` / `device_map()`** — population-to-device assignment introduced here maps cleanly to population-to-rank assignment. Extending `Device` with a `rank` field or adding a parallel `MachineAssignment` struct covers it.
+- **Spike event buffers** — already compact integer arrays (indices + timestamps). Trivially serialisable for `MPI_Send`/`MPI_Recv` without additional packing.
+
+What would actually need to be added:
+1. `MPITransport` backend implementing `SpikeTransport::send/recv/flush` via MPI collective or CPEX pairwise exchange
+2. Rank-aware population partitioner (extends `auto_assign_devices()`)
+3. d_min enforcement at MPI boundaries (larger than dt — typically 0.1–1 ms for InfiniBand)
+4. Optional: replace blocking MPI exchange with non-blocking (`MPI_Isend`/`MPI_Irecv`) once d_min window is large enough to hide latency
+
+At the scales tested so far (tens of millions of synapses, single workstation), shared memory is strictly faster than any MPI approach. The crossover where MPI overhead is justified is roughly hundreds of millions of synapses — the equivalent of a dense cortical column model or larger.
+
+---
+
+## 19.8 Implementation Checklist
 
 ### CMake / Build
 - [ ] Add `USE_NCCL` CMake option; `find_package(NCCL)` when enabled

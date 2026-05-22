@@ -15,7 +15,9 @@ struct Device {
     std::string str() const;  // "cpu", "cuda:0", etc.
 };
 
-int  cuda_device_count();
-bool cuda_is_available();
+int         cuda_device_count();
+bool        cuda_is_available();
+std::string cuda_device_name(int idx);           // e.g. "NVIDIA GeForce RTX 3090"
+double        cuda_smoke_test(int device_idx = 0); // True = GPU ran a kernel correctly
 
 } // namespace hodgkin_huxley

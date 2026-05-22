@@ -38,7 +38,51 @@ This project provides modular, reusable components for computational neuroscienc
 uv venv && uv pip install -e ".[examples]" --python .venv/Scripts/python.exe
 ```
 
-Creates a virtual environment and installs the library in editable mode. `cmake` and `ninja` are fetched automatically as build dependencies — no separate CMake install required. 
+Creates a virtual environment and installs the library in editable mode. `cmake` and `ninja` are fetched automatically as build dependencies — no separate CMake install required.
+
+---
+
+## CUDA Support (Optional)
+
+GPU acceleration is detected automatically at build time — no extra flags needed. If `nvcc` is on the PATH when you run `pip install -e .`, CUDA kernels are compiled in alongside the CPU backend.
+
+**Prerequisites:** NVIDIA GPU (Compute Capability ≥ 6.0, Pascal or later), CUDA Toolkit 11.x+, matching NVIDIA driver.
+
+**Conda (recommended — manages the CUDA toolkit automatically):**
+
+```bash
+conda install cuda -c nvidia       # installs nvcc + runtime matching your driver
+pip install -e .                   # or: uv pip install -e ".[examples]"
+```
+
+**Linux (manual toolkit install):**
+
+```bash
+sudo apt-get install cuda-toolkit-12-x   # replace x with minor version
+pip install -e .
+```
+
+**Windows:** CUDA on Windows requires both the CUDA Toolkit and **VS 2022 Build Tools** (CUDA 12.x does not support VS 2023/2026). The recommended setup uses a dedicated conda environment with Ninja so the build system bypasses VS generator quirks:
+
+```bash
+# One-time setup
+conda create -n masters python=3.11
+conda activate masters
+conda install cuda -c nvidia
+pip install scikit-build-core pybind11 numpy scipy
+conda env config vars set SKBUILD_CMAKE_GENERATOR=Ninja   # persists across activations
+conda deactivate && conda activate masters                 # reload env vars
+pip install -e . --no-build-isolation
+```
+
+To confirm CUDA was included and a kernel runs correctly:
+
+```python
+import hodgkin_huxley as hh
+print(hh.cuda_is_available())    # True if GPU accessible
+print(hh.cuda_device_name(0))    # e.g. "NVIDIA GeForce RTX 4080"
+print(hh.cuda_smoke_test())      # 0.0 = kernel executed and results verified
+```
 
 ---
 
@@ -77,6 +121,14 @@ uv run python benchmarks/ctxbgth_model.py
 ```
 
 Builds and simulates the full 8-population cortex–basal ganglia–thalamus network (80 neurons, 2000 ms) using the library's composable neuron builder and population API. Prints per-population firing rates and GPi beta-band power. Reproduces the Parkinson's disease model from Hahn et al. (2019).
+
+### 5. Verify CUDA (if GPU available)
+
+```bash
+uv run python examples/verify_cuda.py
+```
+
+Prints device count, name, and smoke-test result for each GPU. On a CPU-only machine prints `CUDA not available`.
 
 ---
 
@@ -224,6 +276,7 @@ The composable ion-channel framework builds arbitrary conductance-based neurons 
 | Weight recording (`record_weights`) | Done |
 | Phase-1 OpenMP pool parallelism (`set_num_threads`) | Done |
 | Phase-2 delay-decomposition threading (`set_thread_groups`) | Done |
+| CUDA device query (`cuda_device_name`, `cuda_smoke_test`) | Done |
 
 ---
 

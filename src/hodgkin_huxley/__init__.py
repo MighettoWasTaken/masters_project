@@ -41,6 +41,8 @@ from ._core import (
     __version__,
     cuda_device_count,
     cuda_is_available,
+    cuda_device_name,
+    cuda_smoke_test,
 )
 
 # Backward-compat aliases for old enum names
@@ -102,6 +104,19 @@ from ._codegen import (
     x_post,
     x_pre,
 )
+def device(spec: str) -> "Device":
+    """Parse a device string into a Device.
+
+    Examples: "cpu", "cuda", "cuda:0", "cuda:1"
+    """
+    if spec == "cpu":
+        return Device.cpu()
+    if spec.startswith("cuda"):
+        idx = int(spec.split(":")[-1]) if ":" in spec else 0
+        return Device.cuda(idx)
+    raise ValueError(f"Unknown device spec: {spec!r}. Use 'cpu', 'cuda', or 'cuda:N'.")
+
+
 from .noise import NoiseInjector
 from .pulse import PulseStimulator
 from .recording import MetricsResult, PopulationMetricsResult, RecordingConfig
@@ -158,8 +173,11 @@ __all__ = [
     "CUDAPrinter",
     # Device API (task17)
     "Device",
+    "device",
     "cuda_device_count",
     "cuda_is_available",
+    "cuda_device_name",
+    "cuda_smoke_test",
     # DBS stimulator
     "DBSStimulator",
     "DBSParameters",

@@ -7,6 +7,26 @@ import numpy
 import numpy.typing
 import typing
 __all__: list[str] = ['ABS', 'ADD', 'ALL_TO_ALL', 'ALPHA_BETA', 'ALPHA_FUNC', 'AMPA', 'BOLTZMANN', 'BOLTZMANN_GATE', 'BoltzmannParams', 'CALCIUM', 'CHANNEL_EREV', 'CHANNEL_G', 'CHATTERING', 'COMPOSABLE', 'COMPOUND_AB', 'CONSTANT', 'COS', 'CUSTOM', 'CUSTOM_EXPR', 'CalciumSpec', 'ChannelSpec', 'ChannelSpecVector', 'ComposableNeuron', 'ConnectivityPattern', 'DBSParameters', 'DBSStimulator', 'DECAY', 'DERIVED', 'DOUBLE_EXP', 'DOUBLE_EXP_SUM', 'DRIVEN_DECAY', 'DRIVEN_DECAY_NERNST', 'EULER', 'EXP', 'EXP_DECAY', 'FAST_SPIKING', 'GABA_A', 'GATE_INF_EXPR', 'GATE_INF_SCALE', 'GATE_INF_SHIFT', 'GATE_TAU_SCALE', 'GateDependency', 'GateSpec', 'GateSpecVector', 'GateUpdateForm', 'HH', 'HHNeuron', 'HHParameters', 'HHState', 'INF_TAU', 'INSTANT', 'INTRACELLULAR', 'INTRINSICALLY_BURSTING', 'IZHIKEVICH_CH', 'IZHIKEVICH_CUSTOM', 'IZHIKEVICH_FS', 'IZHIKEVICH_IB', 'IZHIKEVICH_LTS', 'IZHIKEVICH_RS', 'IntegrationMethod', 'IntracellularModulation', 'IntracellularModulationTarget', 'IntracellularModulationVector', 'IntracellularSpec', 'IntracellularSpecVector', 'IntracellularUpdateForm', 'IzhikevichNeuron', 'IzhikevichParameters', 'IzhikevichState', 'IzhikevichType', 'KineticCurrentForm', 'KineticSynapseSpec', 'KineticUpdateForm', 'LINEAR', 'LINEAR_OVER_EXP', 'LINEAR_OVER_EXPM1', 'LOG', 'LOW_THRESHOLD_SPIKING', 'MG_BLOCK', 'MUL', 'NEG', 'NMDA', 'NONE', 'NORMAL', 'NeuronBase', 'NeuronModelSpec', 'OFFSET_DOUBLE_EXP', 'ONE_TO_ONE', 'POW_GEN', 'POW_HALF', 'POW_INT', 'PUSH_A', 'PUSH_CONST', 'PUSH_DEP', 'PUSH_GATE', 'PUSH_S', 'PUSH_X', 'Parameters', 'PlasticitySpec', 'PlasticityType', 'RANDOM_PERMUTATION', 'RANDOM_SPARSE', 'RCP', 'REGULAR_SPIKING', 'RK4', 'RK45_ADAPTIVE', 'RateFuncForm', 'RateFuncParams', 'ReceptorType', 'RegionalNetwork', 'SCALED_EXP', 'SHIFTED', 'SIGMOID', 'SIN', 'SQRT', 'STDP', 'STDPParams', 'STP', 'STPParams', 'SYNAPSE_G', 'State', 'SynapseBase', 'SynapseCurrentForm', 'SynapseSpec', 'SynapseUpdateForm', 'TANH', 'TANH_GATE', 'TauForm', 'TauParams', 'UNIFORM', 'VOLTAGE', 'VmExpr', 'VmInstruction', 'VmInstructionVector', 'VmOp', 'WeightDistType', 'WeightDistribution']
+import enum as _enum
+
+class Device:
+    class Type(_enum.Enum):
+        CPU: Device.Type
+        CUDA: Device.Type
+    type: Device.Type
+    index: int
+    @staticmethod
+    def cpu() -> Device: ...
+    @staticmethod
+    def cuda(index: int = 0) -> Device: ...
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object) -> bool: ...
+
+def cuda_device_count() -> int: ...
+def cuda_is_available() -> bool: ...
+def cuda_device_name(idx: int = 0) -> str: ...
+def cuda_smoke_test(device_idx: int = 0) -> float: ...
+
 class BoltzmannParams:
     def __init__(self) -> None:
         ...
@@ -1556,6 +1576,10 @@ class RegionalNetwork:
         """
     def reset(self) -> None:
         ...
+    def to(self, device: Device) -> RegionalNetwork:
+        """Move all pools to device. Returns self for chaining."""
+    def current_device(self) -> Device:
+        """Return the Device this network is currently assigned to."""
     def update_population_spec(self, name: str, spec: NeuronModelSpec) -> None:
         """
         Push an updated NeuronModelSpec (e.g., with new intracellular) back to C++
