@@ -14,7 +14,7 @@
 | [17.2](completed/task17.2.md) | Team lead | CMake CUDA build configuration + stub `.cu` files | [x] |
 | [17.3](task17.3.md) | Team lead | PoolManager + Network CUDA routing + pinned memory + `RegionalNetwork::to()` | [ ] |
 | [17.4](task17.4.md) | Team lead | Python Device API, `hh.device("cuda:0")`, pybind11 bindings, `.pyi` stubs | [ ] |
-| [17.5](task17.5.md) | Codegen | CUDAPrinter: SymPy → `__device__` codegen + `compile_gate_cuda()` | [ ] |
+| [17.5](completed/task17.5.md) | Codegen | CUDAPrinter: SymPy → `__device__` codegen + `compile_gate_cuda()` | [x] |
 | [17.6](task17.6.md) | CUDA eng | CudaHHPool + CudaIzPool — device SoA, step kernels, scatter/gather | [ ] |
 | [17.7](task17.7.md) | CUDA eng | On-device synapse kernels + per-neuron spike delay ring buffer | [ ] |
 | [17.8](task17.8.md) | CUDA eng | CudaComposablePool — device SoA + pattern-matched gate kernels | [ ] |
