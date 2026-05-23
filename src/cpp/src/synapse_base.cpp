@@ -16,11 +16,11 @@ double SynapseBase::weight() const {
 }
 
 size_t SynapseBase::pre_idx() const {
-    return net_->syn_arrays().pre[idx_];
+    return net_->pre_at(idx_);
 }
 
 size_t SynapseBase::post_idx() const {
-    return net_->syn_arrays().post[idx_];
+    return net_->post_at(idx_);
 }
 
 double SynapseBase::delay() const {

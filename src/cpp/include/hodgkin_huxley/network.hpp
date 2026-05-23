@@ -145,7 +145,7 @@ public:
     // Getters
     // -------------------------------------------------------------------------
     [[nodiscard]] size_t num_neurons()  const { return neurons_.size(); }
-    [[nodiscard]] size_t num_synapses() const { return synapses_.size(); }
+    [[nodiscard]] size_t num_synapses() const { return sa_.size(); }  // sa_ is source of truth
 
     [[nodiscard]] double get_kin_S(size_t synapse_idx) const;
     [[nodiscard]] double get_kin_g(size_t synapse_idx) const;
@@ -241,43 +241,58 @@ public:
         double  spike_threshold = 0.0
     );
 
-    // Forward-injection spike delivery (task26)
+    // Forward-injection spike delivery (task26); syn_idx narrow to uint32_t (task27.3)
     struct SynapseRef {
-        size_t   syn_idx;       // index into SynArrays
+        uint32_t syn_idx;       // index into SynArrays — uint32_t saves 8 bytes/syn via padding removal
         uint32_t delay_steps;   // precomputed: round(sa_.delay[i] / dt)
+    };
+
+    // Compressed per-neuron connectivity (task27.2)
+    struct NeuronConnectivity {
+        std::vector<uint8_t>  post_deltas;    // delta-encoded sorted post indices
+        std::vector<uint32_t> post_overflow;  // pairs (local_j, full_post) where delta == 255
+        bool   uniform_weight = false;
+        double weight_value   = 0.0;
+        size_t syn_start      = 0;
+        size_t syn_count      = 0;
+    };
+
+    // Spec-derived constants shared across all synapses of the same spec (task27.1)
+    struct SynapseSpecCache {
+        double delta_S   = 0.0;
+        double delta_A   = 0.0;
+        double tau_S     = 0.0;
+        double tau_A     = 0.0;
+        double inv_tau_A = 0.0;
+        double norm      = 1.0;
+        double decay_S   = 0.0;  // dt-dependent; rebuilt when dt changes
+        double decay_A   = 0.0;  // dt-dependent
     };
 
 private:
     std::vector<std::unique_ptr<NeuronBase>> neurons_;
-    std::vector<SynapseBase> synapses_;   // lightweight views — always in sync
+    mutable std::vector<SynapseBase> synapses_;   // lazy: built on first synapse(idx) call (task27.5)
 
     // =========================================================================
     // Structure-of-Arrays synapse data (all types unified)
     // =========================================================================
     struct SynArrays {
-        // Common
-        std::vector<size_t> pre, post;
-        std::vector<double> weight, E_syn, g;
-        std::vector<double> delay;
+        // Common — pre/post uint32_t (task27.2); delay float (task27.2); E_syn float (task27.4)
+        std::vector<uint32_t> pre, post;
+        std::vector<double>   weight, g;
+        std::vector<float>    E_syn;     // float: biological values ≤3 sig figs (task27.4)
+        std::vector<float>    delay;
 
         // Unified state (all types)
         std::vector<double> S;           // primary gating / conductance variable
         std::vector<double> A;           // auxiliary variable (0 if unused)
-        std::vector<double> delta_S;     // on-spike additive increment for S
-        std::vector<double> delta_A;     // on-spike additive increment for A
-        std::vector<double> tau_S;       // S time constant (EXP_DECAY, DOUBLE_EXP)
-        std::vector<double> tau_A;       // A time constant (ALPHA_FUNC, DOUBLE_EXP)
-        std::vector<double> inv_tau_A;   // 1/tau_A cached (ALPHA_FUNC Euler)
-        std::vector<double> norm;        // DOUBLE_EXP peak normalization
-        std::vector<double> decay_S;     // cached exp(-dt/tau_S)
-        std::vector<double> decay_A;     // cached exp(-dt/tau_A)
 
-        std::vector<size_t> spec_idx;    // index into Network::synapse_specs_
+        std::vector<uint32_t> spec_idx;  // index into synapse_specs_ / spec_caches_ (task27.4)
 
         // Plasticity state (task15) — all empty when no plasticity used
         std::vector<PlasticityType> plast_type;     // full-length, NONE by default
         std::vector<int32_t>  plast_state_idx;      // full-length, -1 = no state
-        std::vector<size_t>   plast_spec_idx_arr;   // full-length, → plasticity_specs_
+        std::vector<uint32_t> plast_spec_idx_arr;   // full-length, → plasticity_specs_ (task27.4)
         std::vector<double>   plast_x_pre;          // sparse (n_STDP_synapses)
         std::vector<double>   plast_x_post;         // sparse (n_STDP_synapses)
         std::vector<double>   stp_u;                // sparse (n_STP_synapses)
@@ -287,19 +302,11 @@ private:
         std::vector<bool> is_active;         // [S] O(1) membership check
 
         double cached_dt = -1.0;
-        size_t size() const { return pre.size(); }
+        size_t size() const { return S.size(); }  // pre/post may be cleared after build
 
         void push_defaults() {
             S.push_back(0.0);
             A.push_back(0.0);
-            delta_S.push_back(0.0);
-            delta_A.push_back(0.0);
-            tau_S.push_back(0.0);
-            tau_A.push_back(0.0);
-            inv_tau_A.push_back(0.0);
-            norm.push_back(1.0);
-            decay_S.push_back(0.0);
-            decay_A.push_back(0.0);
             spec_idx.push_back(0);
             // Plasticity defaults: NONE, no state
             plast_type.push_back(PlasticityType::NONE);
@@ -311,11 +318,19 @@ private:
 
 public:
     // -------------------------------------------------------------------------
-    // SoA accessor for SynapseBase view (called from SynapseBase member fns)
+    // SoA accessors for SynapseBase (called from synapse_base.cpp)
     // -------------------------------------------------------------------------
     [[nodiscard]] const SynArrays& syn_arrays() const { return sa_; }
     [[nodiscard]] const SynapseSpec& synapse_spec(size_t spec_idx) const {
         return synapse_specs_[spec_idx];
+    }
+    // pre/post indices: prefer decoded arrays (available after first simulate);
+    // fall back to sa_.pre/post when accessed before the first build.
+    [[nodiscard]] size_t pre_at(size_t syn_idx) const {
+        return pre_decoded_.empty() ? sa_.pre[syn_idx] : pre_decoded_[syn_idx];
+    }
+    [[nodiscard]] size_t post_at(size_t syn_idx) const {
+        return post_decoded_.empty() ? sa_.post[syn_idx] : post_decoded_[syn_idx];
     }
 
 private:
@@ -348,8 +363,9 @@ private:
     std::vector<uint8_t> post_spiked_;   // per-neuron; allocated when has_stdp_
     std::vector<double>  V_all_prev_;    // per-neuron; allocated when has_stdp_
 
-    // Synapse specs (deduped by name)
-    std::vector<SynapseSpec> synapse_specs_;
+    // Synapse specs (deduped by name) + per-spec constant cache (task27.1)
+    std::vector<SynapseSpec>      synapse_specs_;
+    std::vector<SynapseSpecCache> synapse_spec_caches_;
 
     bool fast_math_ = true;
     double spike_threshold_ = 0.0;
@@ -371,18 +387,30 @@ private:
     // Forward-injection spike delivery state (task26)
     std::vector<std::vector<SynapseRef>> post_from_;    // [pre_neuron] → {syn_idx, delay_steps}
     std::vector<std::vector<size_t>>     event_slots_;  // [step % cap] → syn_indices due this step
-    std::vector<size_t>                  delay_steps_;  // precomputed per-synapse delay/dt
+    std::vector<uint32_t>                delay_steps_;  // precomputed per-synapse delay/dt (task27.2: uint32)
     std::vector<double>                  V_prev_;       // per-neuron previous voltage
     size_t                               current_step_ = 0;
 
+    // Connectivity compression (task27.2)
+    std::vector<NeuronConnectivity> neuron_connectivity_;  // [pre_neuron]
+    std::vector<uint32_t>           post_decoded_;         // flat post indices, 4 bytes/syn
+    std::vector<uint32_t>           pre_decoded_;          // flat pre indices, 4 bytes/syn
+    bool                            pre_post_cleared_       = false;
+    bool                            injection_tables_built_ = false;
+
+    mutable bool synapses_dirty_ = true;  // cleared on first synapse(idx) call (task27.5)
+
     void reallocate_pinned_buffers(size_t n);
+    void ensure_synapses_built() const;  // lazy SynapseBase construction (task27.5)
     void cache_voltages();
     void ensure_buffers();
     void compute_synaptic_currents();
     void update_synapses_grouped(double dt);
-    void update_decay_factors(double dt);
+    void rebuild_spec_caches(double dt);
     void build_synapse_groups();
     void build_injection_tables(double dt);
+    void build_neuron_connectivity();
+    void reconstruct_pre_post();
     void sort_synapses_by_pre();
     void apply_stdp(double dt);
     void apply_stp(double dt);

@@ -62,7 +62,7 @@ from hodgkin_huxley import RegionalNetwork, SynapseSpec
 #   n_per_pop=50  →  30,000 synapses
 #   n_per_pop=75  →  67,500 synapses
 #   n_per_pop=100 → 120,000 synapses
-NPP_VALUES     = [10, 25, 50, 75, 100]
+NPP_VALUES     = [10, 25, 50, 75, 100, 200, 400, 800, 2000]
 NUMPY_MAX_NPP  = 75   # NumPy becomes slow beyond this; still measured for memory
 DURATION_MS    = 50.0
 DT             = 0.05
