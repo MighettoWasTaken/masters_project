@@ -23,6 +23,97 @@ PYBIND11_MAKE_OPAQUE(std::vector<VmInstruction>);
 PYBIND11_MAKE_OPAQUE(std::vector<IntracellularSpec>);
 PYBIND11_MAKE_OPAQUE(std::vector<IntracellularModulation>);
 
+namespace {
+
+VmInstruction vm_instruction_from_py(const py::handle& obj) {
+    VmInstruction inst;
+    inst.op = py::reinterpret_borrow<py::object>(obj).attr("op").cast<VmOp>();
+    inst.operand = py::reinterpret_borrow<py::object>(obj).attr("operand").cast<int32_t>();
+    return inst;
+}
+
+VmExpr vm_expr_from_py(const py::object& obj) {
+    VmExpr vm;
+
+    auto instructions = py::reinterpret_borrow<py::sequence>(obj.attr("instructions"));
+    vm.instructions.reserve(static_cast<size_t>(py::len(instructions)));
+    for (const py::handle& inst_obj : instructions)
+        vm.instructions.push_back(vm_instruction_from_py(inst_obj));
+
+    auto constants = py::reinterpret_borrow<py::sequence>(obj.attr("constants"));
+    vm.constants.reserve(static_cast<size_t>(py::len(constants)));
+    for (const py::handle& value : constants)
+        vm.constants.push_back(py::cast<double>(value));
+
+    return vm;
+}
+
+BoltzmannParams boltzmann_from_py(const py::object& obj) {
+    BoltzmannParams out;
+    out.v_half = obj.attr("v_half").cast<double>();
+    out.k = obj.attr("k").cast<double>();
+    return out;
+}
+
+TauParams tau_from_py(const py::object& obj) {
+    TauParams out;
+    out.form = obj.attr("form").cast<TauParams::Form>();
+    for (int i = 0; i < 8; ++i)
+        out.params[i] = obj.attr("get_param")(i).cast<double>();
+    return out;
+}
+
+RateFuncParams rate_from_py(const py::object& obj) {
+    RateFuncParams out;
+    out.form = obj.attr("form").cast<RateFuncParams::Form>();
+    out.A = obj.attr("A").cast<double>();
+    out.B = obj.attr("B").cast<double>();
+    out.C = obj.attr("C").cast<double>();
+    return out;
+}
+
+SynapseSpec synapse_spec_from_py(const py::object& obj) {
+    SynapseSpec spec;
+    spec.name = obj.attr("name").cast<std::string>();
+    spec.update_form = obj.attr("update_form").cast<SynapseSpec::UpdateForm>();
+    spec.current_form = obj.attr("current_form").cast<SynapseSpec::CurrentForm>();
+    spec.g = obj.attr("g").cast<double>();
+    spec.E_syn = obj.attr("E_syn").cast<double>();
+    spec.power = obj.attr("power").cast<int>();
+    spec.S_init = obj.attr("S_init").cast<double>();
+    spec.A_init = obj.attr("A_init").cast<double>();
+    spec.delta_S = obj.attr("delta_S").cast<double>();
+    spec.delta_A = obj.attr("delta_A").cast<double>();
+    spec.tau_S = obj.attr("tau_S").cast<double>();
+    spec.tau_A = obj.attr("tau_A").cast<double>();
+    spec.norm_factor = obj.attr("norm_factor").cast<double>();
+    spec.tanh_amp = obj.attr("tanh_amp").cast<double>();
+    spec.tanh_vh = obj.attr("tanh_vh").cast<double>();
+    spec.tanh_k = obj.attr("tanh_k").cast<double>();
+    spec.tau_decay = obj.attr("tau_decay").cast<double>();
+    spec.s_inf = boltzmann_from_py(obj.attr("s_inf"));
+    spec.tau = tau_from_py(obj.attr("tau"));
+    spec.alpha = rate_from_py(obj.attr("alpha"));
+    spec.beta = rate_from_py(obj.attr("beta"));
+    spec.mg_conc = obj.attr("mg_conc").cast<double>();
+    spec.mg_scale = obj.attr("mg_scale").cast<double>();
+    spec.mg_denom = obj.attr("mg_denom").cast<double>();
+    spec.dS_dt_vm = vm_expr_from_py(obj.attr("dS_dt_vm"));
+    spec.dA_dt_vm = vm_expr_from_py(obj.attr("dA_dt_vm"));
+    spec.current_vm = vm_expr_from_py(obj.attr("current_vm"));
+    return spec;
+}
+
+WeightDistribution weight_distribution_from_py(const py::object& obj) {
+    WeightDistribution weight;
+    weight.type = obj.attr("type").cast<WeightDistType>();
+    weight.param1 = obj.attr("param1").cast<double>();
+    weight.param2 = obj.attr("param2").cast<double>();
+    return weight;
+}
+
+} // namespace
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Neural simulation library - C++ backend";
 
@@ -242,14 +333,20 @@ PYBIND11_MODULE(_core, m) {
 
         // Synapses — primary method (unified SynapseSpec)
         .def("add_synapse",
-             py::overload_cast<size_t, size_t, double, const SynapseSpec&, double>(
-                 &Network::add_synapse),
+             [](Network& net, size_t pre, size_t post, double weight,
+                py::object spec_obj, double delay) {
+                 return net.add_synapse(
+                     pre, post, weight, synapse_spec_from_py(spec_obj), delay);
+             },
              "Add a synapse from a unified SynapseSpec, returns index",
              py::arg("pre"), py::arg("post"), py::arg("weight"),
              py::arg("spec"), py::arg("delay") = 0.0)
         .def("add_synapse",
-             py::overload_cast<size_t, size_t, double, const SynapseSpec&, double, const PlasticitySpec&>(
-                 &Network::add_synapse),
+             [](Network& net, size_t pre, size_t post, double weight,
+                py::object spec_obj, double delay, const PlasticitySpec& plasticity) {
+                 return net.add_synapse(
+                     pre, post, weight, synapse_spec_from_py(spec_obj), delay, plasticity);
+             },
              "Add a synapse with optional plasticity rule, returns index",
              py::arg("pre"), py::arg("post"), py::arg("weight"),
              py::arg("spec"), py::arg("delay"), py::arg("plasticity"))
@@ -607,7 +704,16 @@ PYBIND11_MODULE(_core, m) {
              py::arg("name"), py::arg("specs"))
 
         // Connectivity
-        .def("connect", &RegionalNetwork::connect,
+        .def("connect",
+             [](RegionalNetwork& rn, const std::string& src, const std::string& dst,
+                ConnectivityPattern pattern, py::object synapse_obj,
+                py::object weight_obj, double delay, int shift,
+                double probability, bool allow_self, unsigned int seed) {
+                 rn.connect(src, dst, pattern,
+                            synapse_spec_from_py(synapse_obj),
+                            weight_distribution_from_py(weight_obj),
+                            delay, shift, probability, allow_self, seed);
+             },
              "Connect two populations with a preset pattern",
              py::arg("src"), py::arg("dst"), py::arg("pattern"),
              py::arg("synapse"), py::arg("weight"),
@@ -615,18 +721,25 @@ PYBIND11_MODULE(_core, m) {
              py::arg("probability") = 0.1, py::arg("allow_self") = false,
              py::arg("seed") = 0)
         .def("add_connection",
-             py::overload_cast<const std::string&, size_t, const std::string&, size_t,
-                               double, const SynapseSpec&, double>(
-                 &RegionalNetwork::add_connection),
+             [](RegionalNetwork& rn, const std::string& src, size_t src_local,
+                const std::string& dst, size_t dst_local, double weight,
+                py::object synapse_obj, double delay) {
+                 rn.add_connection(src, src_local, dst, dst_local, weight,
+                                   synapse_spec_from_py(synapse_obj), delay);
+             },
              "Add a single connection using local indices",
              py::arg("src"), py::arg("src_local"),
              py::arg("dst"), py::arg("dst_local"),
              py::arg("weight"), py::arg("synapse"),
              py::arg("delay") = 0.0)
         .def("add_connection",
-             py::overload_cast<const std::string&, size_t, const std::string&, size_t,
-                               double, const SynapseSpec&, double, const PlasticitySpec&>(
-                 &RegionalNetwork::add_connection),
+             [](RegionalNetwork& rn, const std::string& src, size_t src_local,
+                const std::string& dst, size_t dst_local, double weight,
+                py::object synapse_obj, double delay, const PlasticitySpec& plasticity) {
+                 rn.add_connection(src, src_local, dst, dst_local, weight,
+                                   synapse_spec_from_py(synapse_obj),
+                                   delay, plasticity);
+             },
              "Add a single connection with plasticity using local indices",
              py::arg("src"), py::arg("src_local"),
              py::arg("dst"), py::arg("dst_local"),
@@ -1091,13 +1204,22 @@ PYBIND11_MODULE(_core, m) {
 
     // Network.add_kinetic_synapse (now delegates to add_synapse)
     netCls.def("add_kinetic_synapse",
-        &Network::add_kinetic_synapse,
+        [](Network& net, size_t pre, size_t post, double weight,
+           py::object spec_obj, double delay) {
+            return net.add_kinetic_synapse(
+                pre, post, weight, synapse_spec_from_py(spec_obj), delay);
+        },
         py::arg("pre"), py::arg("post"), py::arg("weight"),
         py::arg("spec"), py::arg("delay") = 0.0);
 
     // RegionalNetwork.add_kinetic_connection
     rnetCls.def("add_kinetic_connection",
-        &RegionalNetwork::add_kinetic_connection,
+        [](RegionalNetwork& rn, const std::string& src, size_t i,
+           const std::string& dst, size_t j, double weight,
+           py::object spec_obj, double delay) {
+            rn.add_kinetic_connection(src, i, dst, j, weight,
+                                      synapse_spec_from_py(spec_obj), delay);
+        },
         py::arg("src"), py::arg("i"),
         py::arg("dst"), py::arg("j"),
         py::arg("weight"), py::arg("spec"), py::arg("delay") = 0.0);

@@ -27,7 +27,7 @@ target_link_libraries(hodgkin_huxley_core PUBLIC Eigen3::Eigen)
 # Enabled on Linux (GCC/Clang), macOS (AppleClang), and MSVC.
 if(OpenMP_CXX_FOUND AND NOT MINGW)
     target_link_libraries(hodgkin_huxley_core PUBLIC OpenMP::OpenMP_CXX)
-    target_compile_definitions(hodgkin_huxley_core PRIVATE HH_USE_OPENMP)
+    target_compile_definitions(hodgkin_huxley_core PUBLIC HH_USE_OPENMP)
 endif()
 
 if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
@@ -38,7 +38,7 @@ if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
         src/cuda_synapse.cu
     )
     target_link_libraries(hodgkin_huxley_core PUBLIC CUDA::cudart)
-    target_compile_definitions(hodgkin_huxley_core PRIVATE HH_USE_CUDA)
+    target_compile_definitions(hodgkin_huxley_core PUBLIC HH_USE_CUDA)
     # Separable compilation (-rdc=true) is not needed — kernels are
     # self-contained within their own .cu files and don't call across them.
 endif()

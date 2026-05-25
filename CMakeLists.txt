@@ -30,19 +30,31 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     endif()
 endif()
 
-# Fetch Eigen 3.4 (header-only, SIMD-vectorized math)
-include(FetchContent)
-FetchContent_Declare(
-    eigen
-    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-    GIT_TAG 3.4.0
-    GIT_SHALLOW TRUE
-)
-# Eigen has a heavy CMakeLists; skip tests/docs
-set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
-set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(eigen)
+# Fetch Eigen 3.4 headers if a system package is unavailable.
+# We intentionally avoid adding Eigen's own CMake project as a subdirectory:
+# Eigen is header-only for our use, and its optional BLAS/LAPACK sub-builds
+# pull in extra toolchain requirements (including Fortran on Windows) that we
+# do not need for this project.
+find_package(Eigen3 CONFIG QUIET)
+if(NOT Eigen3_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+        eigen
+        GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+        GIT_TAG 3.4.0
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_GetProperties(eigen)
+    if(NOT eigen_POPULATED)
+        FetchContent_Populate(eigen)
+    endif()
+
+    add_library(eigen_headers INTERFACE)
+    target_include_directories(eigen_headers INTERFACE
+        ${eigen_SOURCE_DIR}
+    )
+    add_library(Eigen3::Eigen ALIAS eigen_headers)
+endif()
 
 # Find pybind11
 find_package(pybind11 CONFIG REQUIRED)
@@ -50,23 +62,39 @@ find_package(pybind11 CONFIG REQUIRED)
 # OpenMP (optional — enables pool-level parallelism in step_all)
 find_package(OpenMP)
 
-# CUDA detection — check_language(CUDA) probes the compiler before committing;
-# guards against CUDAToolkit being found but the toolset integration failing
-# (common with pip-fetched cmake on Windows).
-find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
-    include(CheckLanguage)
-    check_language(CUDA)
-    if(CMAKE_CUDA_COMPILER)
-        enable_language(CUDA)
-        set(CMAKE_CUDA_STANDARD 14)
-        # "native" compiles only for the GPU(s) present on this machine (CMake 3.24+).
-        # Fallback covers Volta through Ada Lovelace for older CMake.
-        if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
-            set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures" FORCE)
-        else()
-            set(CMAKE_CUDA_ARCHITECTURES 60 70 75 80 86 89 90 CACHE STRING "CUDA architectures" FORCE)
-        endif()
+# CUDA detection — seed a likely nvcc path before check_language(CUDA).
+# On Windows, find_package(CUDAToolkit) often fails first when nvcc is not
+# already visible to CMake, so we probe the compiler before depending on the
+# toolkit package result.
+set(_hh_nvcc_candidate "")
+if(NOT CMAKE_CUDA_COMPILER)
+    if(DEFINED ENV{CUDACXX} AND EXISTS "$ENV{CUDACXX}")
+        set(_hh_nvcc_candidate "$ENV{CUDACXX}")
+    elseif(DEFINED ENV{CUDA_PATH} AND EXISTS "$ENV{CUDA_PATH}/bin/nvcc.exe")
+        set(_hh_nvcc_candidate "$ENV{CUDA_PATH}/bin/nvcc.exe")
+    elseif(EXISTS "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2/bin/nvcc.exe")
+        set(_hh_nvcc_candidate
+            "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.2/bin/nvcc.exe")
+    endif()
+
+    if(_hh_nvcc_candidate)
+        set(CMAKE_CUDA_COMPILER "${_hh_nvcc_candidate}" CACHE FILEPATH
+            "Path to NVIDIA nvcc compiler" FORCE)
+    endif()
+endif()
+
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 14)
+    find_package(CUDAToolkit QUIET)
+    # "native" compiles only for the GPU(s) present on this machine (CMake 3.24+).
+    # Fallback covers Volta through Ada Lovelace for older CMake.
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+        set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures" FORCE)
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES 60 70 75 80 86 89 90 CACHE STRING "CUDA architectures" FORCE)
     endif()
 endif()
 

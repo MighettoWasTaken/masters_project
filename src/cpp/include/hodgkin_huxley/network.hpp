@@ -13,6 +13,9 @@
 #include "hodgkin_huxley/ion_channels.hpp"
 #include "hodgkin_huxley/network/pool_manager.hpp"
 #include "hodgkin_huxley/device.hpp"
+#ifdef HH_USE_CUDA
+#  include "hodgkin_huxley/cuda_synapse.hpp"
+#endif
 #include <vector>
 #include <memory>
 #include <string>
@@ -86,8 +89,8 @@ public:
     Network() = default;
     Network(const Network&) = delete;
     Network& operator=(const Network&) = delete;
-    Network(Network&&) = default;
-    Network& operator=(Network&&) = default;
+    Network(Network&&) = delete;
+    Network& operator=(Network&&) = delete;
 
     explicit Network(size_t num_neurons);
     Network(size_t num_neurons, NeuronType type);
@@ -384,6 +387,14 @@ private:
     double* I_syn_pinned_      = nullptr;
     size_t  pinned_size_       = 0;
 
+#ifdef HH_USE_CUDA
+    double* d_V_cache_         = nullptr;
+    double* d_I_syn_           = nullptr;
+    double* d_synapse_g_scale_ = nullptr;
+    size_t  cuda_buffer_size_  = 0;
+    DeviceSynapseArrays dev_syn_;
+#endif
+
     // Forward-injection spike delivery state (task26)
     std::vector<std::vector<SynapseRef>> post_from_;    // [pre_neuron] → {syn_idx, delay_steps}
     std::vector<std::vector<size_t>>     event_slots_;  // [step % cap] → syn_indices due this step
@@ -415,6 +426,13 @@ private:
     void apply_stdp(double dt);
     void apply_stp(double dt);
     size_t add_or_find_plasticity_spec(const PlasticitySpec& ps);
+#ifdef HH_USE_CUDA
+    bool can_use_cuda_synapse_path() const;
+    void free_cuda_runtime();
+    void ensure_cuda_runtime_buffers(size_t n_neurons);
+    void prepare_cuda_synapses(double dt);
+    void sync_cuda_synapses_to_host(bool sync_pending_events);
+#endif
 };
 
 } // namespace hodgkin_huxley

@@ -19,6 +19,7 @@ namespace hodgkin_huxley {
  */
 class HHPool : public PoolBase {
 public:
+    virtual ~HHPool();
     HHPool() = default;
     explicit HHPool(size_t capacity, bool fast_math = true);
 
@@ -41,7 +42,7 @@ public:
     void step_subset(const std::vector<size_t>& local_indices, double dt);
     void scatter_voltages_subset(const std::vector<size_t>& local_indices, double* V_buf) const;
 
-private:
+protected:
     size_t N_ = 0;
     std::vector<size_t> net_idx_;
 

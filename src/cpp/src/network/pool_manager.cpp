@@ -12,6 +12,8 @@
 
 namespace hodgkin_huxley {
 
+PoolManager::~PoolManager() = default;
+
 void PoolManager::build_from_neurons(
     const std::vector<std::unique_ptr<NeuronBase>>& neurons, bool fast_math)
 {
@@ -24,7 +26,7 @@ void PoolManager::build_from_neurons(
         if (dynamic_cast<HHNeuron*>(n.get()))               ++n_hh;
         else if (dynamic_cast<IzhikevichNeuron*>(n.get()))  ++n_iz;
         else if (auto* cn = dynamic_cast<ComposableNeuron*>(n.get()))
-            composable_counts[cn->model_spec().name]++;
+            composable_counts[cn->pool_key()]++;
     }
 
     // Construct pools sized to capacity — CUDA variants when device is set
@@ -36,7 +38,7 @@ void PoolManager::build_from_neurons(
         for (const auto& kv : composable_counts) {
             for (const auto& n : neurons) {
                 auto* cn = dynamic_cast<ComposableNeuron*>(n.get());
-                if (cn && cn->model_spec().name == kv.first) {
+                if (cn && cn->pool_key() == kv.first) {
                     comp_pools_.emplace(kv.first,
                         std::make_unique<CudaComposablePool>(
                             device_id_, cn->model_spec(), kv.second, fast_math));
@@ -51,7 +53,7 @@ void PoolManager::build_from_neurons(
         for (const auto& kv : composable_counts) {
             for (const auto& n : neurons) {
                 auto* cn = dynamic_cast<ComposableNeuron*>(n.get());
-                if (cn && cn->model_spec().name == kv.first) {
+                if (cn && cn->pool_key() == kv.first) {
                     comp_pools_.emplace(kv.first,
                         std::make_unique<ComposablePool>(
                             cn->model_spec(), kv.second, fast_math));
@@ -79,7 +81,7 @@ void PoolManager::build_from_neurons(
             iz_global_to_local_[i] = iz_pool_->size();
             iz_pool_->add(i, iz->parameters(), iz->state());
         } else if (auto* cn = dynamic_cast<ComposableNeuron*>(neurons[i].get())) {
-            auto it = comp_pools_.find(cn->model_spec().name);
+            auto it = comp_pools_.find(cn->pool_key());
             if (it != comp_pools_.end())
                 it->second->add(i, cn->membrane_potential(),
                                 cn->gate_states(), cn->substances());
@@ -97,6 +99,38 @@ void PoolManager::gather_all_currents(const double* I_buf) {
     hh_pool_->gather_currents(I_buf);
     iz_pool_->gather_currents(I_buf);
     for (auto& kv : comp_pools_) kv.second->gather_currents(I_buf);
+}
+
+void PoolManager::scatter_all_voltages_device(double* d_V_cache) const {
+#ifdef HH_USE_CUDA
+    if (!use_cuda_) return;
+    if (auto* hh = dynamic_cast<CudaHHPool*>(hh_pool_.get()))
+        hh->scatter_voltages_device(d_V_cache);
+    if (auto* iz = dynamic_cast<CudaIzPool*>(iz_pool_.get()))
+        iz->scatter_voltages_device(d_V_cache);
+    for (const auto& kv : comp_pools_) {
+        if (auto* cp = dynamic_cast<CudaComposablePool*>(kv.second.get()))
+            cp->scatter_voltages_device(d_V_cache);
+    }
+#else
+    (void)d_V_cache;
+#endif
+}
+
+void PoolManager::gather_all_currents_device(const double* d_I_buf) {
+#ifdef HH_USE_CUDA
+    if (!use_cuda_) return;
+    if (auto* hh = dynamic_cast<CudaHHPool*>(hh_pool_.get()))
+        hh->gather_currents_device(d_I_buf);
+    if (auto* iz = dynamic_cast<CudaIzPool*>(iz_pool_.get()))
+        iz->gather_currents_device(d_I_buf);
+    for (auto& kv : comp_pools_) {
+        if (auto* cp = dynamic_cast<CudaComposablePool*>(kv.second.get()))
+            cp->gather_currents_device(d_I_buf);
+    }
+#else
+    (void)d_I_buf;
+#endif
 }
 
 void PoolManager::step_all(double dt) {
@@ -159,6 +193,18 @@ void PoolManager::scatter_synapse_g_scale(double* buf) const {
         kv.second->scatter_synapse_g_scale(buf);
 }
 
+void PoolManager::scatter_synapse_g_scale_device(double* d_buf) const {
+#ifdef HH_USE_CUDA
+    if (!use_cuda_) return;
+    for (const auto& kv : comp_pools_) {
+        if (auto* cp = dynamic_cast<CudaComposablePool*>(kv.second.get()))
+            cp->scatter_synapse_g_scale_device(d_buf);
+    }
+#else
+    (void)d_buf;
+#endif
+}
+
 // =============================================================================
 // CUDA device routing (task17)
 // =============================================================================
@@ -179,7 +225,14 @@ void PoolManager::assign_to_cpu() {
 
 void PoolManager::synchronize_cuda() const {
 #ifdef HH_USE_CUDA
-    if (use_cuda_) cudaDeviceSynchronize();
+    if (use_cuda_) {
+        const auto err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("PoolManager::synchronize_cuda failed: ") +
+                cudaGetErrorString(err));
+        }
+    }
 #endif
 }
 

@@ -19,6 +19,7 @@ namespace hodgkin_huxley {
  */
 class IzPool : public PoolBase {
 public:
+    virtual ~IzPool();
     IzPool() = default;
     explicit IzPool(size_t capacity);
 
@@ -44,7 +45,7 @@ public:
     void scatter_recoveries_subset(const std::vector<size_t>& local_indices,
                                    double* u_buf, size_t n_rec, size_t tr) const;
 
-private:
+protected:
     size_t N_ = 0;
     std::vector<size_t> net_idx_;
 

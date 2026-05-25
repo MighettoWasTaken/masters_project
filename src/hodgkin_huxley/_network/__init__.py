@@ -4,6 +4,8 @@ hodgkin_huxley._network — RegionalNetwork and supporting helpers.
 
 from __future__ import annotations
 
+import atexit
+import weakref
 from typing import TYPE_CHECKING, overload
 
 if TYPE_CHECKING:
@@ -47,6 +49,31 @@ _PATTERN_MAP = {
 }
 
 
+# Keep the helper for compatibility with older call sites. RegionalNetwork
+# instances are now disposed directly in __del__ after the extension rebuild
+# fixed the underlying CUDA teardown path.
+_PENDING_RNET_DISPOSE = []
+_LIVE_RNETS: "weakref.WeakSet[RegionalNetwork]" = weakref.WeakSet()
+
+
+def _drain_pending_rnets() -> None:
+    while _PENDING_RNET_DISPOSE:
+        del _PENDING_RNET_DISPOSE[-1]
+        _PENDING_RNET_DISPOSE.pop()
+
+
+def _dispose_live_rnets() -> None:
+    for rnet in list(_LIVE_RNETS):
+        try:
+            rnet._dispose()
+        except Exception:
+            pass
+    _drain_pending_rnets()
+
+
+atexit.register(_dispose_live_rnets)
+
+
 # ---------------------------------------------------------------------------
 # Weight / connectivity helpers
 # ---------------------------------------------------------------------------
@@ -71,6 +98,14 @@ def _generate_pairs(
 ):
     """Generate (i, j) pairs for a preset connectivity pattern."""
     pairs = []
+    if pattern in (
+        ConnectivityPattern.ONE_TO_ONE,
+        ConnectivityPattern.SHIFTED,
+        ConnectivityPattern.RANDOM_PERMUTATION,
+    ) and src_size != dst_size:
+        raise RuntimeError(
+            "Connectivity pattern requires equal population sizes"
+        )
     if pattern == ConnectivityPattern.ALL_TO_ALL:
         for i in range(src_size):
             for j in range(dst_size):
@@ -199,9 +234,24 @@ class RegionalNetwork:
     """
 
     def __init__(self):
+        _drain_pending_rnets()
         self._rnet = _RegionalNetwork()
         self._stimulators: dict = {}  # {pop_name: DBSStimulator}
         self._pop_specs: dict = {}    # {pop_name: NeuronModelSpec} (task14)
+        _LIVE_RNETS.add(self)
+
+    def _dispose(self):
+        dct = getattr(self, "__dict__", None)
+        if not dct:
+            return
+        rnet = dct.pop("_rnet", None)
+        dct.pop("_stimulators", None)
+        dct.pop("_pop_specs", None)
+        if rnet is not None:
+            del rnet
+
+    def __del__(self):
+        self._dispose()
 
     def add_population(
         self,
@@ -447,51 +497,48 @@ class RegionalNetwork:
                     w = rng.uniform(wdist.param1, wdist.param2)
                 else:
                     w = rng.normal(wdist.param1, wdist.param2)
-                self._rnet.add_kinetic_connection(
-                    src, int(i), dst, int(j), float(w), kinetic_spec, delay
+                pre = self._rnet.population_start(src) + int(i)
+                post = self._rnet.population_start(dst) + int(j)
+                self._rnet.network().add_kinetic_synapse(
+                    pre, post, float(w), kinetic_spec, delay
                 )
             return
 
         synapse = synapse or SynapseSpec.ampa()
 
-        if callable(pattern) or plast_spec is not None:
-            # Per-connection path: custom pattern OR plasticity (C++ connect() doesn't thread plasticity)
-            src_size = self._rnet.population_size(src)
-            dst_size = self._rnet.population_size(dst)
-            same_pop = src == dst
-            rng = np.random.default_rng(seed if seed != 0 else None)
-            if callable(pattern):
-                pairs = pattern(src_size, dst_size)
-            else:
-                if isinstance(pattern, str):
-                    pattern = _PATTERN_MAP[pattern.upper()]
-                pairs = _generate_pairs(
-                    pattern, src_size, dst_size, shift, probability,
-                    allow_self, rng, same_pop=same_pop,
-                )
-            for i, j in pairs:  # type: ignore[union-attr]
-                if wdist.type == WeightDistType.CONSTANT:
-                    w = wdist.param1
-                elif wdist.type == WeightDistType.UNIFORM:
-                    w = rng.uniform(wdist.param1, wdist.param2)
-                else:  # NORMAL
-                    w = rng.normal(wdist.param1, wdist.param2)
-                if plast_spec is not None:
-                    self._rnet.add_connection(
-                        src, int(i), dst, int(j), float(w), synapse, delay, plast_spec
-                    )
-                else:
-                    self._rnet.add_connection(
-                        src, int(i), dst, int(j), float(w), synapse, delay
-                    )
+        # Route all connectivity through add_connection(). This avoids the
+        # unstable low-level _rnet.connect binding while preserving the public
+        # API and seeded pattern generation behavior.
+        src_size = self._rnet.population_size(src)
+        dst_size = self._rnet.population_size(dst)
+        same_pop = src == dst
+        rng = np.random.default_rng(seed if seed != 0 else None)
+        if callable(pattern):
+            pairs = pattern(src_size, dst_size)
         else:
-            # Preset pattern, no plasticity: delegate to C++
             if isinstance(pattern, str):
                 pattern = _PATTERN_MAP[pattern.upper()]
-            self._rnet.connect(
-                src, dst, pattern, synapse, wdist, delay, shift,
-                probability, allow_self, seed,
+            pairs = _generate_pairs(
+                pattern, src_size, dst_size, shift, probability,
+                allow_self, rng, same_pop=same_pop,
             )
+        for i, j in pairs:  # type: ignore[union-attr]
+            if wdist.type == WeightDistType.CONSTANT:
+                w = wdist.param1
+            elif wdist.type == WeightDistType.UNIFORM:
+                w = rng.uniform(wdist.param1, wdist.param2)
+            else:  # NORMAL
+                w = rng.normal(wdist.param1, wdist.param2)
+            pre = self._rnet.population_start(src) + int(i)
+            post = self._rnet.population_start(dst) + int(j)
+            if plast_spec is not None:
+                self._rnet.network().add_synapse(
+                    pre, post, float(w), synapse, delay, plast_spec
+                )
+            else:
+                self._rnet.network().add_synapse(
+                    pre, post, float(w), synapse, delay
+                )
 
     def add_connection(
         self,
@@ -508,9 +555,19 @@ class RegionalNetwork:
         if isinstance(synapse, _SynapseModel):
             synapse = synapse.to_spec()
         synapse = synapse or SynapseSpec.ampa()
-        self._rnet.add_connection(
-            src, src_local, dst, dst_local, weight, synapse, delay
-        )
+        src_size = self._rnet.population_size(src)
+        dst_size = self._rnet.population_size(dst)
+        if src_local < 0 or src_local >= src_size:
+            raise IndexError(
+                f"Source local index {src_local} out of range for population {src!r}"
+            )
+        if dst_local < 0 or dst_local >= dst_size:
+            raise IndexError(
+                f"Destination local index {dst_local} out of range for population {dst!r}"
+            )
+        pre = self._rnet.population_start(src) + int(src_local)
+        post = self._rnet.population_start(dst) + int(dst_local)
+        self._rnet.network().add_synapse(pre, post, weight, synapse, delay)
 
     def add_kinetic_connection(
         self,
@@ -523,7 +580,15 @@ class RegionalNetwork:
         delay: float = 0.0,
     ) -> None:
         """Add a kinetic synapse between two populations using local indices."""
-        self._rnet.add_kinetic_connection(src, i, dst, j, weight, spec, delay)
+        src_size = self._rnet.population_size(src)
+        dst_size = self._rnet.population_size(dst)
+        if i < 0 or i >= src_size:
+            raise IndexError(f"Source local index {i} out of range for population {src!r}")
+        if j < 0 or j >= dst_size:
+            raise IndexError(f"Destination local index {j} out of range for population {dst!r}")
+        pre = self._rnet.population_start(src) + int(i)
+        post = self._rnet.population_start(dst) + int(j)
+        self._rnet.network().add_kinetic_synapse(pre, post, weight, spec, delay)
 
     def connect_from_matrix(
         self,
@@ -581,9 +646,9 @@ class RegionalNetwork:
                 nz_i, nz_j = matrix.nonzero()
                 for i, j in zip(nz_i, nz_j):
                     w = float(matrix[i, j]) * weight_scale
-                    self._rnet.add_connection(
-                        src, int(i), dst, int(j), w, synapse, delay
-                    )
+                    pre = self._rnet.population_start(src) + int(i)
+                    post = self._rnet.population_start(dst) + int(j)
+                    self._rnet.network().add_synapse(pre, post, w, synapse, delay)
                 return
         except ImportError:
             pass
@@ -601,8 +666,10 @@ class RegionalNetwork:
                 )
             for j, w in enumerate(row):
                 if w:
-                    self._rnet.add_connection(
-                        src, i, dst, j, float(w) * weight_scale, synapse, delay
+                    pre = self._rnet.population_start(src) + int(i)
+                    post = self._rnet.population_start(dst) + int(j)
+                    self._rnet.network().add_synapse(
+                        pre, post, float(w) * weight_scale, synapse, delay
                     )
 
     def randomize_membrane_potentials(

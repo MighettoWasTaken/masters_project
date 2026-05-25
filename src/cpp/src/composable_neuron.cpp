@@ -2,8 +2,130 @@
 #include "hodgkin_huxley/model/kinetics.hpp"
 #include <cmath>
 #include <algorithm>
+#include <iomanip>
+#include <sstream>
 
 namespace hodgkin_huxley {
+
+namespace {
+
+void append_string(std::ostringstream& oss, const std::string& s) {
+    oss << s.size() << ':' << s << '|';
+}
+
+void append_double(std::ostringstream& oss, double v) {
+    oss << v << '|';
+}
+
+void append_vm_expr(std::ostringstream& oss, const VmExpr& expr) {
+    oss << expr.instructions.size() << '|';
+    for (const auto& inst : expr.instructions) {
+        oss << static_cast<int>(inst.op) << ',' << inst.operand << ';';
+    }
+    oss << '|';
+    oss << expr.constants.size() << '|';
+    for (double c : expr.constants) append_double(oss, c);
+}
+
+void append_tau(std::ostringstream& oss, const TauParams& tau) {
+    oss << static_cast<int>(tau.form) << '|';
+    for (double p : tau.params) append_double(oss, p);
+}
+
+void append_rate(std::ostringstream& oss, const RateFuncParams& rate) {
+    oss << static_cast<int>(rate.form) << '|';
+    append_double(oss, rate.A);
+    append_double(oss, rate.B);
+    append_double(oss, rate.C);
+}
+
+void append_gate(std::ostringstream& oss, const GateSpec& gate) {
+    append_string(oss, gate.name);
+    oss << static_cast<int>(gate.update_form) << '|'
+        << static_cast<int>(gate.dependency) << '|'
+        << gate.intracellular_idx << '|';
+    append_double(oss, gate.scale);
+    append_double(oss, gate.initial_value);
+    append_double(oss, gate.inf.v_half);
+    append_double(oss, gate.inf.k);
+    append_tau(oss, gate.tau);
+    append_rate(oss, gate.alpha);
+    append_rate(oss, gate.beta);
+    oss << gate.derived_source_gate << '|';
+    append_double(oss, gate.derived_a);
+    append_double(oss, gate.derived_b);
+    append_double(oss, gate.derived_c);
+    append_vm_expr(oss, gate.inf_vm);
+    append_vm_expr(oss, gate.tau_vm);
+    append_vm_expr(oss, gate.alpha_vm);
+    append_vm_expr(oss, gate.beta_vm);
+    append_vm_expr(oss, gate.dxdt_vm);
+}
+
+void append_channel(std::ostringstream& oss, const ChannelSpec& ch) {
+    append_string(oss, ch.name);
+    append_double(oss, ch.g);
+    append_double(oss, ch.E_rev);
+    oss << ch.nernst_substance_idx << '|'
+        << ch.gates.size() << '|';
+    for (const auto& gp : ch.gates) {
+        oss << gp.first << ',' << gp.second << ';';
+    }
+    oss << '|'
+        << static_cast<int>(ch.is_ahp) << '|';
+    append_double(oss, ch.ahp_k1);
+    oss << ch.ahp_substance_idx << '|';
+    append_vm_expr(oss, ch.gate_product_vm);
+}
+
+void append_modulation(std::ostringstream& oss, const IntracellularModulation& mod) {
+    oss << static_cast<int>(mod.target) << '|'
+        << mod.target_idx << '|'
+        << mod.substance_idx << '|';
+    append_vm_expr(oss, mod.mod_vm);
+    append_double(oss, mod.shift_scale);
+}
+
+void append_intracellular(std::ostringstream& oss, const IntracellularSpec& ic) {
+    append_string(oss, ic.name);
+    append_double(oss, ic.initial);
+    oss << static_cast<int>(ic.update_form) << '|';
+    append_double(oss, ic.epsilon);
+    append_double(oss, ic.k_decay);
+    oss << ic.source_channels.size() << '|';
+    for (int idx : ic.source_channels) oss << idx << ';';
+    oss << '|'
+        << static_cast<int>(ic.nernst_enabled) << '|';
+    append_double(oss, ic.nernst_Ca_o);
+    append_double(oss, ic.nernst_z);
+    append_double(oss, ic.nernst_R);
+    append_double(oss, ic.nernst_F);
+    append_double(oss, ic.nernst_T);
+    append_vm_expr(oss, ic.nernst_vm);
+    append_vm_expr(oss, ic.ode_vm);
+    oss << ic.modulations.size() << '|';
+    for (const auto& mod : ic.modulations) append_modulation(oss, mod);
+}
+
+std::string make_pool_key(const NeuronModelSpec& spec) {
+    std::ostringstream oss;
+    oss << std::setprecision(17);
+
+    append_string(oss, spec.name);
+    append_double(oss, spec.C_m);
+    append_double(oss, spec.V_init);
+    oss << static_cast<int>(spec.is_izhikevich) << '|';
+    oss << spec.gates.size() << '|';
+    for (const auto& gate : spec.gates) append_gate(oss, gate);
+    oss << spec.channels.size() << '|';
+    for (const auto& ch : spec.channels) append_channel(oss, ch);
+    oss << spec.intracellular.size() << '|';
+    for (const auto& ic : spec.intracellular) append_intracellular(oss, ic);
+
+    return oss.str();
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Helpers to initialize substance state from spec
@@ -31,6 +153,7 @@ static void init_substances(const NeuronModelSpec& spec,
 
 ComposableNeuron::ComposableNeuron(const NeuronModelSpec& spec)
     : spec_(spec),
+      pool_key_(make_pool_key(spec)),
       V_(spec.V_init),
       gate_states_(spec.gates.size())
 {
@@ -58,6 +181,7 @@ void ComposableNeuron::set_model(const NeuronModelSpec& spec) {
         }
     }
     spec_ = spec;
+    pool_key_ = make_pool_key(spec_);
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +192,7 @@ double ComposableNeuron::membrane_potential() const { return V_; }
 void ComposableNeuron::set_membrane_potential(double V) { V_ = V; }
 std::string ComposableNeuron::type_name() const { return "Composable:" + spec_.name; }
 const NeuronModelSpec& ComposableNeuron::model_spec() const { return spec_; }
+const std::string& ComposableNeuron::pool_key() const { return pool_key_; }
 const std::vector<double>& ComposableNeuron::gate_states() const { return gate_states_; }
 
 void ComposableNeuron::set_gate_states(const std::vector<double>& states) {

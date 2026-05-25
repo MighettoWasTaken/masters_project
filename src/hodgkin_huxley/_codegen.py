@@ -6,15 +6,15 @@ SymPy expression compilation infrastructure for the hodgkin-huxley library.
 
 Provides:
   - Pre-defined SymPy symbols (V, Ca, V_pre, V_post, S, ...)
-  - EigenPrinter  — generates Eigen C++ from SymPy (vectorized, SIMD); reserved for task17 GPU codegen
-  - CUDAPrinter   — stub placeholder (task17)
+  - EigenPrinter  — generates Eigen C++ from SymPy (vectorized, SIMD)
+  - CUDAPrinter   — generates scalar CUDA device code from SymPy / VM expressions
   - Pattern matching catalog (10 forms: 6 tau + 4 rate + Boltzmann)
   - TaggedExpr    — SymPy expr with pre-matched parameter metadata
   - compile_to_vm_bytecode — cross-platform VM bytecode for all custom expressions
   - HHEquationError — raised when expression compilation fails
 
 Insertion points for future tasks:
-  - task17: replace CUDAPrinter stub with full nvcc pipeline (EigenPrinter already available)
+  - task17 extension: wire generated CUDA code into the runtime pool builders
   - task13 extension: add more patterns to PATTERN_CATALOG as new forms are added
 """
 
@@ -265,16 +265,16 @@ class EigenPrinter(CodePrinter):
 
 
 # =============================================================================
-# CUDAPrinter (stub — task17)
+# CUDAPrinter
 # =============================================================================
 
 class CUDAPrinter(CodePrinter):
     """
-    Placeholder CUDA printer.
+    Print SymPy scalar expressions as CUDA-ready C code.
 
-    # TODO task17: full CUDA JIT pipeline not implemented.
-    Generates a minimal __device__ function stub using sympy.ccode() for the
-    expression body. No Eigen — GPU parallelism is across threads, not SIMD.
+    Unlike :class:`EigenPrinter`, this printer emits plain scalar math suitable
+    for ``__device__`` helper functions inside CUDA kernels. Symbol names may be
+    remapped at construction time so callers can target existing kernel locals.
     """
 
     _default_settings: dict = {
@@ -288,14 +288,29 @@ class CUDAPrinter(CodePrinter):
         "contract": True,
     }
 
+    def __init__(self, symbol_map: dict[str, str] | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self._sym_map = dict(symbol_map or {})
+
+    def _format_code(self, lines):
+        return lines
+
     def doprint(self, expr, assign_to=None) -> str:  # type: ignore[override]
-        # TODO task17: full CUDA JIT pipeline not implemented.
-        from sympy.printing.c import ccode
-        # Use standard scalar C code
-        body = ccode(expr)
+        from sympy.printing.c import C99CodePrinter
+        import re
+
+        code = C99CodePrinter().doprint(expr)
+        for sym, cname in self._sym_map.items():
+            code = re.sub(r"\b" + re.escape(sym) + r"\b", cname, code)
+        return code
+
+    def print_device_fn(self, fn_name: str, params: list[str], expr,
+                        return_type: str = "double") -> str:
+        body = self.doprint(expr)
+        param_str = ", ".join(params)
         return (
-            "// TODO task17: full CUDA JIT pipeline not implemented\n"
-            "__device__ static inline double fn(double V) {\n"
+            f"__device__ __forceinline__ {return_type} {fn_name}"
+            f"({param_str}) {{\n"
             f"    return {body};\n"
             "}"
         )
@@ -899,6 +914,255 @@ class HHEquationError(Exception):
             f"--- error ---\n{stderr}\n"
             f"--- source ---\n{source}"
         )
+
+
+def _float_code(value) -> str:
+    """Format a Python / C++ numeric value as CUDA scalar source."""
+    val = float(value)
+    if not _math.isfinite(val):
+        raise HHEquationError(source=str(value), stderr="non-finite constant in CUDA codegen")
+    return repr(val)
+
+
+def _expr_attr(obj, name: str):
+    """Return a raw SymPy expression if *obj* exposes one, else None."""
+    raw = getattr(obj, name, None)
+    if isinstance(raw, TaggedExpr):
+        return raw.expr
+    if isinstance(raw, sympy.Basic):
+        return raw
+    return None
+
+
+def _vm_nonempty(vm) -> bool:
+    return bool(vm is not None and hasattr(vm, "empty") and not vm.empty())
+
+
+def _dep_param_name(gate_spec) -> str:
+    dep = getattr(getattr(gate_spec, "dependency", None), "name", "")
+    return "dep" if dep == "INTRACELLULAR" else "V"
+
+
+def _vmexpr_to_cuda_expr(prog, *, dep_name="V", s_name="x", a_name="A",
+                         gate_names: list[str] | None = None,
+                         x_names: list[str] | None = None) -> str:
+    """Rebuild a scalar CUDA expression string from a VmExpr program."""
+    from hodgkin_huxley._core import VmOp
+
+    stack: list[str] = []
+
+    def pop1() -> str:
+        if not stack:
+            raise HHEquationError(source=str(prog), stderr="VM stack underflow during CUDA emission")
+        return stack.pop()
+
+    def pop2() -> tuple[str, str]:
+        rhs = pop1()
+        lhs = pop1()
+        return lhs, rhs
+
+    for ins in prog.instructions:
+        if ins.op == VmOp.PUSH_DEP:
+            stack.append(dep_name)
+        elif ins.op == VmOp.PUSH_CONST:
+            stack.append(_float_code(prog.constants[ins.operand]))
+        elif ins.op == VmOp.PUSH_S:
+            stack.append(s_name)
+        elif ins.op == VmOp.PUSH_A:
+            stack.append(a_name)
+        elif ins.op == VmOp.PUSH_GATE:
+            if gate_names is not None and 0 <= ins.operand < len(gate_names):
+                stack.append(gate_names[ins.operand])
+            else:
+                stack.append(f"gate_{ins.operand}")
+        elif ins.op == VmOp.PUSH_X:
+            if x_names is not None and 0 <= ins.operand < len(x_names):
+                stack.append(x_names[ins.operand])
+            else:
+                stack.append(f"X_{ins.operand}")
+        elif ins.op == VmOp.ADD:
+            lhs, rhs = pop2()
+            stack.append(f"(({lhs}) + ({rhs}))")
+        elif ins.op == VmOp.MUL:
+            lhs, rhs = pop2()
+            stack.append(f"(({lhs}) * ({rhs}))")
+        elif ins.op == VmOp.NEG:
+            stack.append(f"(-({pop1()}))")
+        elif ins.op == VmOp.RCP:
+            stack.append(f"(1.0 / ({pop1()}))")
+        elif ins.op == VmOp.POW_INT:
+            stack.append(f"pow({pop1()}, {_float_code(ins.operand)})")
+        elif ins.op == VmOp.POW_HALF:
+            stack.append(f"sqrt({pop1()})")
+        elif ins.op == VmOp.POW_GEN:
+            lhs, rhs = pop2()
+            stack.append(f"pow(({lhs}), ({rhs}))")
+        elif ins.op == VmOp.EXP:
+            stack.append(f"exp({pop1()})")
+        elif ins.op == VmOp.LOG:
+            stack.append(f"log({pop1()})")
+        elif ins.op == VmOp.TANH:
+            stack.append(f"tanh({pop1()})")
+        elif ins.op == VmOp.SIN:
+            stack.append(f"sin({pop1()})")
+        elif ins.op == VmOp.COS:
+            stack.append(f"cos({pop1()})")
+        elif ins.op == VmOp.SQRT:
+            stack.append(f"sqrt({pop1()})")
+        elif ins.op == VmOp.ABS:
+            stack.append(f"fabs({pop1()})")
+        else:
+            raise HHEquationError(source=str(prog), stderr=f"unsupported VM opcode {ins.op!r}")
+
+    if len(stack) != 1:
+        raise HHEquationError(source=str(prog), stderr="VM program did not reduce to one CUDA expression")
+    return stack[0]
+
+
+def _boltzmann_cuda_expr(params, dep_name="V") -> str:
+    return (
+        f"(1.0 / (1.0 + exp(-(({dep_name}) - {_float_code(params.v_half)})"
+        f" / {_float_code(params.k)})))"
+    )
+
+
+def _tau_cuda_expr(params, dep_name="V") -> str:
+    from hodgkin_huxley._core import TauForm
+
+    p = [params.get_param(i) for i in range(8)]
+    if params.form == TauForm.CONSTANT:
+        return _float_code(p[0])
+    if params.form == TauForm.BOLTZMANN:
+        return (
+            f"({_float_code(p[0])} + {_float_code(p[1])} / "
+            f"(1.0 + exp(-(({dep_name}) - {_float_code(p[2])}) / {_float_code(p[3])})))"
+        )
+    if params.form == TauForm.DOUBLE_EXP_SUM:
+        return (
+            f"({_float_code(p[0])} + {_float_code(p[1])} / "
+            f"(exp((({dep_name}) + {_float_code(p[2])}) / {_float_code(p[3])}) + "
+            f"exp(-(({dep_name}) + {_float_code(p[5])}) / {_float_code(p[6])})))"
+        )
+    if params.form == TauForm.OFFSET_DOUBLE_EXP:
+        return (
+            f"({_float_code(p[0])}"
+            f" + {_float_code(p[1])} * exp(-pow((({dep_name}) + {_float_code(p[2])}) / {_float_code(p[3])}, 2.0))"
+            f" + {_float_code(p[4])} * exp(-pow((({dep_name}) + {_float_code(p[5])}) / {_float_code(p[6])}, 2.0)))"
+        )
+    if params.form == TauForm.SCALED_EXP:
+        return (
+            f"({_float_code(p[0])} / cosh((({dep_name}) - {_float_code(p[1])})"
+            f" / {_float_code(2.0 * p[2])}))"
+        )
+    if params.form == TauForm.COMPOUND_AB:
+        return (
+            f"(1.0 / ("
+            f"{_float_code(p[0])} * exp((({dep_name}) + {_float_code(p[1])}) / {_float_code(p[2])}) + "
+            f"{_float_code(p[3])} * exp((({dep_name}) + {_float_code(p[4])}) / {_float_code(p[5])})"
+            f"))"
+        )
+    raise HHEquationError(source=str(params), stderr="unsupported TauForm in CUDA codegen")
+
+
+def _rate_cuda_expr(params, dep_name="V") -> str:
+    from hodgkin_huxley._core import RateFuncForm
+
+    x = f"(({dep_name}) + {_float_code(params.B)})"
+    xc = f"({x} / {_float_code(params.C)})"
+    if params.form == RateFuncForm.LINEAR_OVER_EXP:
+        return (
+            f"((fabs({xc}) < 1e-6)"
+            f" ? ({_float_code(params.A)} * {_float_code(params.C)} * (1.0 + 0.5 * ({xc})))"
+            f" : ({_float_code(params.A)} * {x} / (exp({xc}) - 1.0)))"
+        )
+    if params.form == RateFuncForm.EXP_DECAY:
+        return f"({_float_code(params.A)} * exp({xc}))"
+    if params.form == RateFuncForm.LINEAR_OVER_EXPM1:
+        return (
+            f"((fabs({xc}) < 1e-6)"
+            f" ? ({_float_code(params.A)} * {_float_code(params.C)} * (1.0 + 0.5 * ({xc})))"
+            f" : ({_float_code(params.A)} * {x} / (1.0 - exp(-({xc})))))"
+        )
+    if params.form == RateFuncForm.SIGMOID:
+        return f"({_float_code(params.A)} / (1.0 + exp({xc})))"
+    raise HHEquationError(source=str(params), stderr="unsupported RateFuncForm in CUDA codegen")
+
+
+def compile_gate_cuda(gate_spec, fn_prefix: str) -> str:
+    """
+    Generate CUDA ``__device__`` helpers for one gate specification.
+
+    The live project stores either:
+      1. raw SymPy expressions on higher-level helper objects, or
+      2. matched parameter structs / VM bytecode on the compiled core GateSpec.
+
+    This helper supports both forms and emits only the functions that are
+    actually defined for the given gate.
+    """
+    printer = CUDAPrinter({"V": "V", "Ca": "dep", "x": "x", "S": "x", "A": "A"})
+    dep_name = _dep_param_name(gate_spec)
+    update_name = getattr(getattr(gate_spec, "update_form", None), "name", "")
+    pieces: list[str] = []
+
+    def add_expr_fn(suffix: str, params: list[str], expr) -> None:
+        pieces.append(printer.print_device_fn(f"{fn_prefix}_{suffix}", params, expr))
+
+    def add_code_fn(suffix: str, params: list[str], expr_code: str) -> None:
+        pieces.append(
+            f"__device__ __forceinline__ double {fn_prefix}_{suffix}"
+            f"({', '.join(params)}) {{\n"
+            f"    return {expr_code};\n"
+            "}"
+        )
+
+    inf_expr = _expr_attr(gate_spec, "inf_expr")
+    tau_expr = _expr_attr(gate_spec, "tau_expr")
+    alpha_expr = _expr_attr(gate_spec, "alpha_expr")
+    beta_expr = _expr_attr(gate_spec, "beta_expr")
+    dxdt_expr = _expr_attr(gate_spec, "dxdt_expr")
+
+    if inf_expr is not None:
+        add_expr_fn("inf", [f"double {dep_name}"], inf_expr)
+    elif _vm_nonempty(getattr(gate_spec, "inf_vm", None)):
+        expr_code = _vmexpr_to_cuda_expr(gate_spec.inf_vm, dep_name=dep_name)
+        add_code_fn("inf", [f"double {dep_name}"], expr_code)
+    elif hasattr(gate_spec, "inf") and update_name in {"INF_TAU", "INSTANT"}:
+        add_code_fn("inf", [f"double {dep_name}"], _boltzmann_cuda_expr(gate_spec.inf, dep_name))
+
+    if tau_expr is not None:
+        add_expr_fn("tau", ["double V"], tau_expr)
+    elif _vm_nonempty(getattr(gate_spec, "tau_vm", None)):
+        expr_code = _vmexpr_to_cuda_expr(gate_spec.tau_vm, dep_name="V")
+        add_code_fn("tau", ["double V"], expr_code)
+    elif hasattr(gate_spec, "tau") and update_name == "INF_TAU":
+        add_code_fn("tau", ["double V"], _tau_cuda_expr(gate_spec.tau, "V"))
+
+    if alpha_expr is not None:
+        add_expr_fn("alpha", ["double V"], alpha_expr)
+    elif _vm_nonempty(getattr(gate_spec, "alpha_vm", None)):
+        expr_code = _vmexpr_to_cuda_expr(gate_spec.alpha_vm, dep_name="V")
+        add_code_fn("alpha", ["double V"], expr_code)
+    elif hasattr(gate_spec, "alpha") and update_name == "ALPHA_BETA":
+        add_code_fn("alpha", ["double V"], _rate_cuda_expr(gate_spec.alpha, "V"))
+
+    if beta_expr is not None:
+        add_expr_fn("beta", ["double V"], beta_expr)
+    elif _vm_nonempty(getattr(gate_spec, "beta_vm", None)):
+        expr_code = _vmexpr_to_cuda_expr(gate_spec.beta_vm, dep_name="V")
+        add_code_fn("beta", ["double V"], expr_code)
+    elif hasattr(gate_spec, "beta") and update_name == "ALPHA_BETA":
+        add_code_fn("beta", ["double V"], _rate_cuda_expr(gate_spec.beta, "V"))
+
+    if dxdt_expr is not None:
+        add_expr_fn("dxdt", [f"double {dep_name}", "double x"], dxdt_expr)
+    elif _vm_nonempty(getattr(gate_spec, "dxdt_vm", None)):
+        expr_code = _vmexpr_to_cuda_expr(gate_spec.dxdt_vm, dep_name=dep_name, s_name="x")
+        add_code_fn("dxdt", [f"double {dep_name}", "double x"], expr_code)
+
+    if not pieces:
+        raise HHEquationError(source=repr(gate_spec), stderr="gate has no CUDA-emittable expressions")
+
+    return "\n\n".join(pieces)
 
 
 # =============================================================================

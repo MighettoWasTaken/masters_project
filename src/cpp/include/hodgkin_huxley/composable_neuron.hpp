@@ -18,6 +18,7 @@ public:
     std::string type_name() const override;
 
     const NeuronModelSpec& model_spec() const;
+    const std::string& pool_key() const;
     const std::vector<double>& gate_states() const;
 
     // Substance accessors (backward compat: calcium = X_[0])
@@ -38,6 +39,7 @@ public:
 
 private:
     NeuronModelSpec spec_;
+    std::string pool_key_;
     double V_;
     std::vector<double> gate_states_;
     std::vector<double> X_;        // substance concentrations (X_[0] = calcium by convention)

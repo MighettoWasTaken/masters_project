@@ -19,12 +19,22 @@ namespace hodgkin_huxley {
 
 Network::~Network() {
 #ifdef HH_USE_CUDA
+    free_cuda_runtime();
     if (V_cache_pinned_) cudaFreeHost(V_cache_pinned_);
     if (I_syn_pinned_)   cudaFreeHost(I_syn_pinned_);
 #endif
 }
 
 void Network::set_device(const Device& device) {
+    if (pool_mgr_.on_cuda() &&
+        (device.type != Device::Type::CUDA ||
+         device.index != pool_mgr_.cuda_device_id())) {
+#ifdef HH_USE_CUDA
+        sync_cuda_synapses_to_host(true);
+        free_cuda_runtime();
+#endif
+    }
+
     if (device.type == Device::Type::CUDA)
         pool_mgr_.assign_to_device(device.index);
     else
@@ -50,6 +60,165 @@ void Network::reallocate_pinned_buffers(size_t n) {
     (void)n;
 #endif
 }
+
+#ifdef HH_USE_CUDA
+bool Network::can_use_cuda_synapse_path() const {
+    return pool_mgr_.on_cuda() && sa_.size() > 0 && !has_stdp_ && !has_stp_;
+}
+
+void Network::free_cuda_runtime() {
+    if (d_V_cache_) cudaFree(d_V_cache_);
+    if (d_I_syn_) cudaFree(d_I_syn_);
+    if (d_synapse_g_scale_) cudaFree(d_synapse_g_scale_);
+    d_V_cache_ = nullptr;
+    d_I_syn_ = nullptr;
+    d_synapse_g_scale_ = nullptr;
+    cuda_buffer_size_ = 0;
+    free_device_synapses(dev_syn_);
+}
+
+void Network::ensure_cuda_runtime_buffers(size_t n_neurons) {
+    if (cuda_buffer_size_ == n_neurons && d_V_cache_ && d_I_syn_ && d_synapse_g_scale_)
+        return;
+
+    if (d_V_cache_) cudaFree(d_V_cache_);
+    if (d_I_syn_) cudaFree(d_I_syn_);
+    if (d_synapse_g_scale_) cudaFree(d_synapse_g_scale_);
+    d_V_cache_ = nullptr;
+    d_I_syn_ = nullptr;
+    d_synapse_g_scale_ = nullptr;
+
+    if (n_neurons == 0) {
+        cuda_buffer_size_ = 0;
+        return;
+    }
+
+    if (cudaSetDevice(pool_mgr_.cuda_device_id()) != cudaSuccess)
+        throw std::runtime_error("Network::ensure_cuda_runtime_buffers: cudaSetDevice failed");
+
+    if (cudaMalloc(reinterpret_cast<void**>(&d_V_cache_), n_neurons * sizeof(double)) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&d_I_syn_), n_neurons * sizeof(double)) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void**>(&d_synapse_g_scale_), n_neurons * sizeof(double)) != cudaSuccess) {
+        throw std::runtime_error("Network::ensure_cuda_runtime_buffers: cudaMalloc failed");
+    }
+    cuda_buffer_size_ = n_neurons;
+}
+
+void Network::prepare_cuda_synapses(double dt) {
+    if (!can_use_cuda_synapse_path()) return;
+
+    const size_t n_neurons = neurons_.size();
+    const size_t n_synapses = sa_.size();
+    const size_t ring_size = event_slots_.empty() ? 1 : event_slots_.size();
+    const size_t spec_count = synapse_specs_.size();
+
+    ensure_cuda_runtime_buffers(n_neurons);
+
+    const bool needs_realloc =
+        dev_syn_.neuron_count != n_neurons ||
+        dev_syn_.synapse_count != n_synapses ||
+        dev_syn_.ring_size != ring_size ||
+        dev_syn_.spec_count != spec_count ||
+        dev_syn_.device_id != pool_mgr_.cuda_device_id();
+
+    if (needs_realloc) {
+        allocate_device_synapses(dev_syn_, n_neurons, n_synapses, ring_size,
+                                 spec_count, pool_mgr_.cuda_device_id());
+    }
+
+    std::vector<DeviceSynapseSpecDesc> spec_descs(spec_count);
+    std::vector<VmExpr> vm_exprs;
+
+    auto register_vm = [&](const VmExpr& expr) -> int {
+        if (expr.empty()) return -1;
+        vm_exprs.push_back(expr);
+        return static_cast<int>(vm_exprs.size()) - 1;
+    };
+
+    for (size_t i = 0; i < spec_count; ++i) {
+        const auto& spec = synapse_specs_[i];
+        auto& desc = spec_descs[i];
+        desc.update_form = static_cast<int>(spec.update_form);
+        desc.current_form = static_cast<int>(spec.current_form);
+        desc.power = spec.power;
+        desc.spec_g = spec.g;
+        desc.delta_S = spec.delta_S;
+        desc.delta_A = spec.delta_A;
+        desc.tau_S = spec.tau_S;
+        desc.tau_A = spec.tau_A;
+        desc.norm_factor = spec.norm_factor;
+        desc.tanh_amp = spec.tanh_amp;
+        desc.tanh_vh = spec.tanh_vh;
+        desc.tanh_k = spec.tanh_k;
+        desc.tau_decay = spec.tau_decay;
+        desc.s_inf = spec.s_inf;
+        desc.tau = spec.tau;
+        desc.alpha = spec.alpha;
+        desc.beta = spec.beta;
+        desc.mg_conc = spec.mg_conc;
+        desc.mg_scale = spec.mg_scale;
+        desc.mg_denom = spec.mg_denom;
+        desc.dS_vm_idx = register_vm(spec.dS_dt_vm);
+        desc.dA_vm_idx = register_vm(spec.dA_dt_vm);
+        desc.current_vm_idx = register_vm(spec.current_vm);
+    }
+
+    std::vector<uint8_t> spike_ring(n_synapses * ring_size, 0u);
+    for (size_t arrival_slot = 0; arrival_slot < event_slots_.size(); ++arrival_slot) {
+        for (size_t syn_idx : event_slots_[arrival_slot]) {
+            const size_t write_slot =
+                (arrival_slot + ring_size - (delay_steps_[syn_idx] % ring_size)) % ring_size;
+            spike_ring[syn_idx * ring_size + write_slot] = 1u;
+        }
+    }
+
+    std::vector<uint32_t> spec_idx_u32 = sa_.spec_idx;
+
+    upload_device_synapse_state(
+        dev_syn_,
+        sa_.weight,
+        sa_.g,
+        sa_.S,
+        sa_.A,
+        sa_.E_syn,
+        pre_decoded_,
+        post_decoded_,
+        delay_steps_,
+        spec_idx_u32,
+        spec_descs,
+        vm_exprs,
+        V_prev_,
+        spike_ring,
+        dt,
+        spike_threshold_);
+}
+
+void Network::sync_cuda_synapses_to_host(bool sync_pending_events) {
+    if (!dev_syn_.d_g) return;
+
+    std::vector<uint8_t> spike_ring;
+    std::vector<double> v_prev;
+    download_device_synapse_state(dev_syn_, sa_.g, sa_.S, sa_.A, v_prev,
+                                  sync_pending_events ? &spike_ring : nullptr,
+                                  nullptr);
+    V_prev_ = std::move(v_prev);
+
+    if (!sync_pending_events) return;
+
+    event_slots_.assign(dev_syn_.ring_size, {});
+    for (size_t syn_idx = 0; syn_idx < dev_syn_.synapse_count; ++syn_idx) {
+        const size_t delay = delay_steps_[syn_idx];
+        for (size_t write_slot = 0; write_slot < dev_syn_.ring_size; ++write_slot) {
+            if (!spike_ring[syn_idx * dev_syn_.ring_size + write_slot]) continue;
+            const size_t age = (current_step_ + dev_syn_.ring_size - 1 - write_slot) % dev_syn_.ring_size;
+            if (age > delay) continue;
+            const size_t future_offset = delay - age;
+            const size_t arrival_slot = (current_step_ + future_offset) % dev_syn_.ring_size;
+            event_slots_[arrival_slot].push_back(syn_idx);
+        }
+    }
+}
+#endif
 
 static constexpr double kSynapseEpsilon = 1e-9;
 
@@ -1113,19 +1282,62 @@ void Network::simulate_into_buffers(
     }
 
     ensure_buffers();
-
     const size_t S = sa_.size();
+
+#ifdef HH_USE_CUDA
+    const bool use_cuda_synapses = can_use_cuda_synapse_path();
+    if (use_cuda_synapses && (!use_pinned_memory_ || pinned_size_ != n_neurons))
+        reallocate_pinned_buffers(n_neurons);
+    if (use_cuda_synapses) {
+        prepare_cuda_synapses(dt);
+        if (pool_mgr_.has_synapse_g_mods()) {
+            fill_device_buffer(d_synapse_g_scale_, 1.0, n_neurons);
+            pool_mgr_.scatter_synapse_g_scale_device(d_synapse_g_scale_);
+            pool_mgr_.synchronize_cuda();
+        }
+    }
+    double* V_host = use_pinned_memory_ ? V_cache_pinned_ : V_cache_.data();
+    double* I_host = use_pinned_memory_ ? I_syn_pinned_   : I_syn_buffer_.data();
+    std::vector<uint8_t> spike_arrived_host;
+    if (use_cuda_synapses && spike_event_buf)
+        spike_arrived_host.resize(S);
+#else
+    const bool use_cuda_synapses = false;
+    double* V_host = V_cache_.data();
+    double* I_host = I_syn_buffer_.data();
+#endif
+
     std::vector<double> syn_spike_accum(n_neurons, 0.0);
 
     for (size_t t = 0; t < num_steps; ++t) {
-        pool_mgr_.scatter_all_voltages(V_cache_.data());
+        if (use_cuda_synapses) {
+#ifdef HH_USE_CUDA
+            pool_mgr_.scatter_all_voltages_device(d_V_cache_);
+            pool_mgr_.synchronize_cuda();
+#endif
+        } else {
+            pool_mgr_.scatter_all_voltages(V_cache_.data());
+        }
 
         if (t % interval == 0) {
             size_t tr = t / interval;
 
             if (V_buf) {
+                if (use_cuda_synapses &&
+                    !(gate_buf || calcium_buf || u_buf)) {
+#ifdef HH_USE_CUDA
+                    if (cudaMemcpy(V_host, d_V_cache_,
+                                   n_neurons * sizeof(double),
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        throw std::runtime_error("simulate_into_buffers: cudaMemcpy V_cache D2H failed");
+                    }
+#endif
+                } else {
+                    pool_mgr_.scatter_all_voltages(V_host);
+                }
+
                 for (size_t i = 0; i < n_neurons; ++i)
-                    V_buf[i * n_rec + tr] = V_cache_[i];
+                    V_buf[i * n_rec + tr] = V_host[i];
             }
 
             if (gate_buf && max_gates > 0)
@@ -1138,6 +1350,15 @@ void Network::simulate_into_buffers(
                 pool_mgr_.scatter_recoveries(u_buf, n_rec, tr);
 
             if (g_syn_buf) {
+                if (use_cuda_synapses) {
+#ifdef HH_USE_CUDA
+                    if (cudaMemcpy(sa_.g.data(), dev_syn_.d_g,
+                                   S * sizeof(double),
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        throw std::runtime_error("simulate_into_buffers: cudaMemcpy synapse g D2H failed");
+                    }
+#endif
+                }
                 const double* g = sa_.g.data();
                 for (size_t i = 0; i < S; ++i)
                     g_syn_buf[i * n_rec + tr] = g[i];
@@ -1151,46 +1372,110 @@ void Network::simulate_into_buffers(
             }
         }
 
-        for (size_t i = 0; i < n_neurons; ++i)
-            I_syn_buffer_[i] = I_ext[i][t];
-
-        const double*   g          = sa_.g.data();
-        const float*    E_syn_data = sa_.E_syn.data();  // float; promotes in arithmetic
-        const uint32_t* post       = post_decoded_.data();
-        const double*   V          = V_cache_.data();
-        double*         I_buf      = I_syn_buffer_.data();
-        if (pool_mgr_.has_synapse_g_mods()) {
-            const double* gscale = synapse_g_scale_.data();
-            for (size_t i = 0; i < S; ++i)
-                I_buf[post[i]] += g[i] * gscale[post[i]] * (E_syn_data[i] - V[post[i]]);
-        } else {
-            for (size_t i = 0; i < S; ++i)
-                I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
-        }
-
-        if (I_syn_buf && t % interval == 0) {
-            size_t tr = t / interval;
+        if (use_cuda_synapses) {
+#ifdef HH_USE_CUDA
             for (size_t i = 0; i < n_neurons; ++i)
-                I_syn_buf[i * n_rec + tr] = I_syn_buffer_[i] - I_ext[i][t];
-        }
+                I_host[i] = I_ext[i][t];
 
-        pool_mgr_.gather_all_currents(I_syn_buffer_.data());
-        pool_mgr_.step_all(dt);
-        if (pool_mgr_.has_synapse_g_mods()) {
-            std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
-            pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
-        }
-        pool_mgr_.scatter_all_voltages(V_cache_.data());
+            if (cudaMemcpy(d_I_syn_, I_host, n_neurons * sizeof(double),
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                throw std::runtime_error("simulate_into_buffers: cudaMemcpy I_ext H2D failed");
+            }
 
-        update_synapses_grouped(dt);
+            accumulate_cuda_synaptic_currents(
+                dev_syn_, d_V_cache_, d_I_syn_,
+                pool_mgr_.has_synapse_g_mods() ? d_synapse_g_scale_ : nullptr);
+            if (cudaDeviceSynchronize() != cudaSuccess)
+                throw std::runtime_error("simulate_into_buffers: CUDA synaptic current kernel failed");
 
-        if (spike_event_buf) {
-            for (size_t j = 0; j < S; ++j)
-                if (spike_detected_[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
+            if (I_syn_buf && t % interval == 0) {
+                size_t tr = t / interval;
+                if (cudaMemcpy(I_host, d_I_syn_, n_neurons * sizeof(double),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    throw std::runtime_error("simulate_into_buffers: cudaMemcpy I_syn D2H failed");
+                }
+                for (size_t i = 0; i < n_neurons; ++i)
+                    I_syn_buf[i * n_rec + tr] = I_host[i] - I_ext[i][t];
+            }
+
+            pool_mgr_.gather_all_currents_device(d_I_syn_);
+            pool_mgr_.synchronize_cuda();
+            pool_mgr_.step_all(dt);
+
+            if (pool_mgr_.has_synapse_g_mods()) {
+                fill_device_buffer(d_synapse_g_scale_, 1.0, n_neurons);
+                pool_mgr_.scatter_synapse_g_scale_device(d_synapse_g_scale_);
+                pool_mgr_.synchronize_cuda();
+            }
+
+            pool_mgr_.scatter_all_voltages_device(d_V_cache_);
+            pool_mgr_.synchronize_cuda();
+
+            const size_t step = current_step_++;
+            update_cuda_synapses(dev_syn_, d_V_cache_, step);
+            if (cudaDeviceSynchronize() != cudaSuccess)
+                throw std::runtime_error("simulate_into_buffers: CUDA synapse update kernel failed");
+
+            if (spike_event_buf) {
+                if (cudaMemcpy(spike_arrived_host.data(), dev_syn_.d_spike_arrived,
+                               S * sizeof(uint8_t),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    throw std::runtime_error("simulate_into_buffers: cudaMemcpy spike_arrived D2H failed");
+                }
+                for (size_t j = 0; j < S; ++j)
+                    if (spike_arrived_host[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
+            }
+#endif
+        } else {
+            for (size_t i = 0; i < n_neurons; ++i)
+                I_syn_buffer_[i] = I_ext[i][t];
+
+            const double*   g          = sa_.g.data();
+            const float*    E_syn_data = sa_.E_syn.data();  // float; promotes in arithmetic
+            const uint32_t* post       = post_decoded_.data();
+            const double*   V          = V_cache_.data();
+            double*         I_buf      = I_syn_buffer_.data();
+            if (pool_mgr_.has_synapse_g_mods()) {
+                const double* gscale = synapse_g_scale_.data();
+                for (size_t i = 0; i < S; ++i)
+                    I_buf[post[i]] += g[i] * gscale[post[i]] * (E_syn_data[i] - V[post[i]]);
+            } else {
+                for (size_t i = 0; i < S; ++i)
+                    I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
+            }
+
+            if (I_syn_buf && t % interval == 0) {
+                size_t tr = t / interval;
+                for (size_t i = 0; i < n_neurons; ++i)
+                    I_syn_buf[i * n_rec + tr] = I_syn_buffer_[i] - I_ext[i][t];
+            }
+
+            pool_mgr_.gather_all_currents(I_syn_buffer_.data());
+            pool_mgr_.step_all(dt);
+            if (pool_mgr_.has_synapse_g_mods()) {
+                std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
+                pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
+            }
+            pool_mgr_.scatter_all_voltages(V_cache_.data());
+
+            update_synapses_grouped(dt);
+
+            if (spike_event_buf) {
+                for (size_t j = 0; j < S; ++j)
+                    if (spike_detected_[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
+            }
         }
     }
 
+#ifdef HH_USE_CUDA
+    if (use_cuda_synapses)
+        sync_cuda_synapses_to_host(true);
+#endif
     pool_mgr_.sync_all_to_neurons(neurons_);
+    if (pool_mgr_.has_synapse_g_mods()) {
+        std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
+        pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
+    }
 }
 
 // =============================================================================
@@ -1232,24 +1517,58 @@ void Network::simulate_with_descriptors(
 
     ensure_buffers();
 
+    const size_t S = sa_.size();
 #ifdef HH_USE_CUDA
-    if (pool_mgr_.on_cuda() && (!use_pinned_memory_ || pinned_size_ != n_neurons))
+    const bool use_cuda_synapses = can_use_cuda_synapse_path();
+    if (use_cuda_synapses && (!use_pinned_memory_ || pinned_size_ != n_neurons))
         reallocate_pinned_buffers(n_neurons);
-#endif
+    if (use_cuda_synapses) {
+        prepare_cuda_synapses(dt);
+        if (pool_mgr_.has_synapse_g_mods()) {
+            fill_device_buffer(d_synapse_g_scale_, 1.0, n_neurons);
+            pool_mgr_.scatter_synapse_g_scale_device(d_synapse_g_scale_);
+            pool_mgr_.synchronize_cuda();
+        }
+    }
     double* V_ptr = use_pinned_memory_ ? V_cache_pinned_ : V_cache_.data();
     double* I_ptr = use_pinned_memory_ ? I_syn_pinned_   : I_syn_buffer_.data();
-
-    const size_t S = sa_.size();
+    std::vector<uint8_t> spike_arrived_host;
+    if (use_cuda_synapses && spike_event_buf)
+        spike_arrived_host.resize(S);
+#else
+    const bool use_cuda_synapses = false;
+    double* V_ptr = V_cache_.data();
+    double* I_ptr = I_syn_buffer_.data();
+#endif
     std::vector<double> syn_spike_accum(n_neurons, 0.0);
     std::vector<double> I_stim_cache(n_neurons, 0.0);
 
     for (size_t t = 0; t < num_steps; ++t) {
-        pool_mgr_.scatter_all_voltages(V_ptr);
+        if (use_cuda_synapses) {
+#ifdef HH_USE_CUDA
+            pool_mgr_.scatter_all_voltages_device(d_V_cache_);
+            pool_mgr_.synchronize_cuda();
+#endif
+        } else {
+            pool_mgr_.scatter_all_voltages(V_ptr);
+        }
 
         if (t % interval == 0) {
             size_t tr = t / interval;
 
             if (V_buf) {
+                if (use_cuda_synapses &&
+                    !(gate_buf || calcium_buf || u_buf)) {
+#ifdef HH_USE_CUDA
+                    if (cudaMemcpy(V_ptr, d_V_cache_,
+                                   n_neurons * sizeof(double),
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        throw std::runtime_error("simulate_with_descriptors: cudaMemcpy V_cache D2H failed");
+                    }
+#endif
+                } else {
+                    pool_mgr_.scatter_all_voltages(V_ptr);
+                }
                 for (size_t i = 0; i < n_neurons; ++i)
                     V_buf[i * n_rec + tr] = V_ptr[i];
             }
@@ -1264,6 +1583,15 @@ void Network::simulate_with_descriptors(
                 pool_mgr_.scatter_recoveries(u_buf, n_rec, tr);
 
             if (g_syn_buf) {
+                if (use_cuda_synapses) {
+#ifdef HH_USE_CUDA
+                    if (cudaMemcpy(sa_.g.data(), dev_syn_.d_g,
+                                   S * sizeof(double),
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        throw std::runtime_error("simulate_with_descriptors: cudaMemcpy synapse g D2H failed");
+                    }
+#endif
+                }
                 const double* g = sa_.g.data();
                 for (size_t i = 0; i < S; ++i)
                     g_syn_buf[i * n_rec + tr] = g[i];
@@ -1301,43 +1629,104 @@ void Network::simulate_with_descriptors(
             }
         }
 
-        const double*   g          = sa_.g.data();
-        const float*    E_syn_data = sa_.E_syn.data();  // float; promotes in arithmetic
-        const uint32_t* post       = post_decoded_.data();
-        const double*   V          = V_ptr;
-        double*         I_buf      = I_ptr;
-        if (pool_mgr_.has_synapse_g_mods()) {
-            const double* gscale = synapse_g_scale_.data();
-            for (size_t i : syn_groups_.active_g)
-                I_buf[post[i]] += g[i] * gscale[post[i]] * (E_syn_data[i] - V[post[i]]);
+        if (use_cuda_synapses) {
+#ifdef HH_USE_CUDA
+            if (cudaMemcpy(d_I_syn_, I_ptr, n_neurons * sizeof(double),
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                throw std::runtime_error("simulate_with_descriptors: cudaMemcpy I_ext H2D failed");
+            }
+
+            accumulate_cuda_synaptic_currents(
+                dev_syn_, d_V_cache_, d_I_syn_,
+                pool_mgr_.has_synapse_g_mods() ? d_synapse_g_scale_ : nullptr);
+            if (cudaDeviceSynchronize() != cudaSuccess)
+                throw std::runtime_error("simulate_with_descriptors: CUDA synaptic current kernel failed");
+
+            if (I_syn_buf && t % interval == 0) {
+                size_t tr = t / interval;
+                if (cudaMemcpy(I_ptr, d_I_syn_, n_neurons * sizeof(double),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    throw std::runtime_error("simulate_with_descriptors: cudaMemcpy I_syn D2H failed");
+                }
+                for (size_t i = 0; i < n_neurons; ++i)
+                    I_syn_buf[i * n_rec + tr] = I_ptr[i] - I_stim_cache[i];
+            }
+
+            pool_mgr_.gather_all_currents_device(d_I_syn_);
+            pool_mgr_.synchronize_cuda();
+            pool_mgr_.step_all(dt);
+
+            if (pool_mgr_.has_synapse_g_mods()) {
+                fill_device_buffer(d_synapse_g_scale_, 1.0, n_neurons);
+                pool_mgr_.scatter_synapse_g_scale_device(d_synapse_g_scale_);
+                pool_mgr_.synchronize_cuda();
+            }
+
+            pool_mgr_.scatter_all_voltages_device(d_V_cache_);
+            pool_mgr_.synchronize_cuda();
+
+            const size_t step = current_step_++;
+            update_cuda_synapses(dev_syn_, d_V_cache_, step);
+            if (cudaDeviceSynchronize() != cudaSuccess)
+                throw std::runtime_error("simulate_with_descriptors: CUDA synapse update kernel failed");
+
+            if (spike_event_buf) {
+                if (cudaMemcpy(spike_arrived_host.data(), dev_syn_.d_spike_arrived,
+                               S * sizeof(uint8_t),
+                               cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    throw std::runtime_error("simulate_with_descriptors: cudaMemcpy spike_arrived D2H failed");
+                }
+                for (size_t j = 0; j < S; ++j)
+                    if (spike_arrived_host[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
+            }
+#endif
         } else {
-            for (size_t i : syn_groups_.active_g)
-                I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
-        }
+            const double*   g          = sa_.g.data();
+            const float*    E_syn_data = sa_.E_syn.data();  // float; promotes in arithmetic
+            const uint32_t* post       = post_decoded_.data();
+            const double*   V          = V_ptr;
+            double*         I_buf      = I_ptr;
+            if (pool_mgr_.has_synapse_g_mods()) {
+                const double* gscale = synapse_g_scale_.data();
+                for (size_t i : syn_groups_.active_g)
+                    I_buf[post[i]] += g[i] * gscale[post[i]] * (E_syn_data[i] - V[post[i]]);
+            } else {
+                for (size_t i : syn_groups_.active_g)
+                    I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
+            }
 
-        if (I_syn_buf && t % interval == 0) {
-            size_t tr = t / interval;
-            for (size_t i = 0; i < n_neurons; ++i)
-                I_syn_buf[i * n_rec + tr] = I_ptr[i] - I_stim_cache[i];
-        }
+            if (I_syn_buf && t % interval == 0) {
+                size_t tr = t / interval;
+                for (size_t i = 0; i < n_neurons; ++i)
+                    I_syn_buf[i * n_rec + tr] = I_ptr[i] - I_stim_cache[i];
+            }
 
-        pool_mgr_.gather_all_currents(I_ptr);
-        pool_mgr_.step_all(dt);
-        if (pool_mgr_.has_synapse_g_mods()) {
-            std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
-            pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
-        }
-        pool_mgr_.scatter_all_voltages(V_ptr);
+            pool_mgr_.gather_all_currents(I_ptr);
+            pool_mgr_.step_all(dt);
+            if (pool_mgr_.has_synapse_g_mods()) {
+                std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
+                pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
+            }
+            pool_mgr_.scatter_all_voltages(V_ptr);
 
-        update_synapses_grouped(dt);
+            update_synapses_grouped(dt);
 
-        if (spike_event_buf) {
-            for (size_t j = 0; j < S; ++j)
-                if (spike_detected_[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
+            if (spike_event_buf) {
+                for (size_t j = 0; j < S; ++j)
+                    if (spike_detected_[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
+            }
         }
     }
 
+#ifdef HH_USE_CUDA
+    if (use_cuda_synapses)
+        sync_cuda_synapses_to_host(true);
+#endif
     pool_mgr_.sync_all_to_neurons(neurons_);
+    if (pool_mgr_.has_synapse_g_mods()) {
+        std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
+        pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
+    }
 }
 
 // =============================================================================

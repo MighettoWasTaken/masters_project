@@ -47,10 +47,11 @@ struct WeightDistribution {
 class RegionalNetwork {
 public:
     RegionalNetwork() = default;
+    ~RegionalNetwork();
     RegionalNetwork(const RegionalNetwork&) = delete;
     RegionalNetwork& operator=(const RegionalNetwork&) = delete;
-    RegionalNetwork(RegionalNetwork&&) = default;
-    RegionalNetwork& operator=(RegionalNetwork&&) = default;
+    RegionalNetwork(RegionalNetwork&&) = delete;
+    RegionalNetwork& operator=(RegionalNetwork&&) = delete;
 
     // Add populations
     void add_population(const std::string& name, size_t count,
@@ -144,7 +145,7 @@ public:
     const Network& network() const;
 
 private:
-    Network net_;
+    std::unique_ptr<Network> net_ = std::make_unique<Network>();
     Device  current_device_ = Device::cpu();
     std::vector<Population> populations_;
     std::map<std::string, size_t> pop_index_;

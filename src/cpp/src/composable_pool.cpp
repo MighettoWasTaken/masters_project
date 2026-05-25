@@ -30,6 +30,8 @@ ComposablePool::ComposablePool(const NeuronModelSpec& model, size_t capacity, bo
         }
 }
 
+ComposablePool::~ComposablePool() = default;
+
 void ComposablePool::add(size_t network_idx, double V_init,
                           const std::vector<double>& gate_inits,
                           const std::vector<double>& substance_inits) {

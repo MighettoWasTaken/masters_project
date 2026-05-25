@@ -5,7 +5,7 @@ Unit tests for the SymPy codegen pipeline (_codegen.py).
 
 Covers:
   - EigenPrinter: symbol mapping, node overrides, fast_exp flag, scalar_mode
-  - CUDAPrinterStub: output contains __device__ and TODO marker
+  - CUDAPrinter: scalar CUDA code emission from SymPy and VM-backed gate specs
   - Pattern matching: all 10 standard forms, false negatives, TaggedExpr bypass
   - VM compiler: opcode emission, numerical correctness, edge cases
 """
@@ -19,11 +19,12 @@ import pytest
 import sympy
 
 from hodgkin_huxley._codegen import (
-    V, Ca, V_pre, V_post, S,
+    V, Ca, V_pre, V_post, S, x,
     EigenPrinter, CUDAPrinter, TaggedExpr,
-    try_pattern_match, HHEquationError,
+    try_pattern_match, HHEquationError, compile_gate_cuda,
     compile_to_vm_bytecode, compile_gate_product_vm, gate,
 )
+from hodgkin_huxley._equations import GateSpec as BuildGateSpec, Boltzmann, Tau, NeuronModel
 from hodgkin_huxley._core import (
     BoltzmannParams, TauParams, TauForm, RateFuncParams, RateFuncForm,
 )
@@ -122,18 +123,57 @@ class TestEigenPrinter:
 
 
 # =============================================================================
-# CUDAPrinter stub tests
+# CUDAPrinter tests
 # =============================================================================
 
-class TestCUDAPrinterStub:
+class TestCUDAPrinter:
 
-    def test_device_qualifier(self):
+    def test_doprint_scalar_exp(self):
         code = CUDAPrinter().doprint(sympy.exp(V))
+        assert "exp" in code
+        assert "__device__" not in code
+
+    def test_symbol_map(self):
+        code = CUDAPrinter({"V": "v_i", "Ca": "ca_i"}).doprint(sympy.log(Ca) + V)
+        assert "v_i" in code
+        assert "ca_i" in code
+
+    def test_print_device_fn(self):
+        code = CUDAPrinter().print_device_fn("gate_inf", ["double V"], sympy.exp(V))
+        assert "__device__ __forceinline__ double gate_inf(double V)" in code
+        assert "return exp" in code
+
+
+class TestCompileGateCuda:
+
+    def test_inf_tau_gate_from_core_spec(self):
+        g = BuildGateSpec("m", inf=Boltzmann(-40.0, 8.0), tau=Tau.constant(0.5))
+        code = compile_gate_cuda(g, "m_gate")
+        assert "m_gate_inf" in code
+        assert "m_gate_tau" in code
         assert "__device__" in code
 
-    def test_todo_marker(self):
-        code = CUDAPrinter().doprint(V ** 2)
-        assert "TODO" in code and "task17" in code
+    def test_custom_vm_gate_uses_vm_math(self):
+        expr = sympy.tanh((V + 40) / 8) * sympy.sqrt(sympy.Abs(V + 65) + sympy.Float(0.1))
+        g = BuildGateSpec("m", inf=expr, tau=Tau.constant(1.0))
+        code = compile_gate_cuda(g, "m_gate")
+        assert "m_gate_inf" in code
+        assert "tanh" in code
+        assert "sqrt" in code
+        assert "fabs" in code
+
+    def test_custom_dxdt_gate_emits_x_argument(self):
+        model = NeuronModel("vm_gate")
+        model.add_gate("m", expr=sympy.sin(V / 15) - x, initial_value=0.1)
+        g = model.to_spec().gates[0]
+        code = compile_gate_cuda(g, "m_gate")
+        assert "m_gate_dxdt" in code
+        assert "double x" in code
+        assert "sin" in code
+
+    def test_blank_gate_raises(self):
+        with pytest.raises(HHEquationError):
+            compile_gate_cuda(object(), "blank")
 
 
 # =============================================================================

@@ -16,6 +16,8 @@ IzPool::IzPool(size_t capacity) : N_(0) {
     dv_.resize(capacity); du_.resize(capacity);
 }
 
+IzPool::~IzPool() = default;
+
 void IzPool::add(size_t network_idx, const IzhikevichNeuron::Parameters& params,
                  const IzhikevichNeuron::State& state) {
     size_t i = N_++;

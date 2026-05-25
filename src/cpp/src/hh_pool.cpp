@@ -44,6 +44,8 @@ HHPool::HHPool(size_t capacity, bool fast_math) : N_(0), fast_math_(fast_math) {
     tmp_exp_r_.resize(capacity);
 }
 
+HHPool::~HHPool() = default;
+
 void HHPool::add(size_t network_idx, const HHNeuron::Parameters& params,
                  const HHNeuron::State& state) {
     size_t i = N_++;

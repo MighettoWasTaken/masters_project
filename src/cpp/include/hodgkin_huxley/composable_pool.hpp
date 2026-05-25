@@ -11,6 +11,7 @@ namespace hodgkin_huxley {
 
 class ComposablePool : public PoolBase {
 public:
+    virtual ~ComposablePool();
     ComposablePool() = default;
     explicit ComposablePool(const NeuronModelSpec& model, size_t capacity, bool fast_math = true);
 
@@ -61,7 +62,7 @@ public:
         return 0.0;
     }
 
-private:
+protected:
     NeuronModelSpec model_;
     size_t N_ = 0;
     bool fast_math_ = true;

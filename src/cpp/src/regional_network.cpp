@@ -1,10 +1,19 @@
 #include "hodgkin_huxley/regional_network.hpp"
 #include "hodgkin_huxley/composable_neuron.hpp"
 #include <algorithm>
+#include <unordered_set>
 #include <numeric>
 #include <cmath>
 
 namespace hodgkin_huxley {
+
+RegionalNetwork::~RegionalNetwork() {
+    net_.reset();
+    group_populations_.clear();
+    pop_specs_.clear();
+    pop_index_.clear();
+    populations_.clear();
+}
 
 // =============================================================================
 // WeightDistribution
@@ -47,9 +56,9 @@ void RegionalNetwork::add_population(const std::string& name, size_t count,
     if (pop_index_.count(name)) {
         throw std::runtime_error("Population '" + name + "' already exists");
     }
-    size_t start = net_.num_neurons();
+    size_t start = net_->num_neurons();
     for (size_t i = 0; i < count; ++i) {
-        net_.add_neuron(type);
+        net_->add_neuron(type);
     }
     pop_index_[name] = populations_.size();
     populations_.push_back({name, start, count});
@@ -60,9 +69,9 @@ void RegionalNetwork::add_population(const std::string& name, size_t count,
     if (pop_index_.count(name)) {
         throw std::runtime_error("Population '" + name + "' already exists");
     }
-    size_t start = net_.num_neurons();
+    size_t start = net_->num_neurons();
     for (size_t i = 0; i < count; ++i) {
-        net_.add_neuron(params);
+        net_->add_neuron(params);
     }
     pop_index_[name] = populations_.size();
     populations_.push_back({name, start, count});
@@ -73,9 +82,9 @@ void RegionalNetwork::add_population(const std::string& name, size_t count,
     if (pop_index_.count(name)) {
         throw std::runtime_error("Population '" + name + "' already exists");
     }
-    size_t start = net_.num_neurons();
+    size_t start = net_->num_neurons();
     for (size_t i = 0; i < count; ++i) {
-        net_.add_neuron(params);
+        net_->add_neuron(params);
     }
     pop_index_[name] = populations_.size();
     populations_.push_back({name, start, count});
@@ -90,9 +99,9 @@ void RegionalNetwork::add_population(const std::string& name, size_t count,
     if (pop_index_.count(name)) {
         throw std::runtime_error("Population '" + name + "' already exists");
     }
-    size_t start = net_.num_neurons();
+    size_t start = net_->num_neurons();
     for (size_t i = 0; i < count; ++i) {
-        net_.add_neuron(spec);
+        net_->add_neuron(spec);
     }
     pop_index_[name] = populations_.size();
     populations_.push_back({name, start, count});
@@ -107,12 +116,12 @@ void RegionalNetwork::update_population_spec(const std::string& name,
     // Push updated spec to all ComposableNeuron instances in this population
     const auto& pop = population(name);
     for (size_t i = pop.start_idx; i < pop.end_idx(); ++i) {
-        auto* cn = dynamic_cast<ComposableNeuron*>(&net_.neuron(i));
+        auto* cn = dynamic_cast<ComposableNeuron*>(&net_->neuron(i));
         if (cn) cn->set_model(spec);
     }
 
     // Mark pools dirty so they are rebuilt on the next simulate() call
-    net_.mark_pools_dirty();
+    net_->mark_pools_dirty();
 }
 
 void RegionalNetwork::add_population(const std::string& name,
@@ -120,9 +129,9 @@ void RegionalNetwork::add_population(const std::string& name,
     if (pop_index_.count(name)) {
         throw std::runtime_error("Population '" + name + "' already exists");
     }
-    size_t start = net_.num_neurons();
+    size_t start = net_->num_neurons();
     for (const auto& spec : specs) {
-        net_.add_neuron(spec);
+        net_->add_neuron(spec);
     }
     pop_index_[name] = populations_.size();
     populations_.push_back({name, start, specs.size()});
@@ -168,17 +177,17 @@ size_t RegionalNetwork::num_populations() const {
 // Delegation
 // =============================================================================
 
-size_t RegionalNetwork::num_neurons() const { return net_.num_neurons(); }
-size_t RegionalNetwork::num_synapses() const { return net_.num_synapses(); }
-void RegionalNetwork::set_fast_math(bool enabled) { net_.set_fast_math(enabled); }
-bool RegionalNetwork::fast_math() const { return net_.fast_math(); }
-void RegionalNetwork::reset() { net_.reset(); }
-Network& RegionalNetwork::network() { return net_; }
-const Network& RegionalNetwork::network() const { return net_; }
+size_t RegionalNetwork::num_neurons() const { return net_->num_neurons(); }
+size_t RegionalNetwork::num_synapses() const { return net_->num_synapses(); }
+void RegionalNetwork::set_fast_math(bool enabled) { net_->set_fast_math(enabled); }
+bool RegionalNetwork::fast_math() const { return net_->fast_math(); }
+void RegionalNetwork::reset() { net_->reset(); }
+Network& RegionalNetwork::network() { return *net_; }
+const Network& RegionalNetwork::network() const { return *net_; }
 
 void RegionalNetwork::to(const Device& device) {
     current_device_ = device;
-    net_.set_device(device);
+    net_->set_device(device);
 }
 
 
@@ -204,7 +213,7 @@ void RegionalNetwork::add_connection(const std::string& src, size_t src_local,
     }
     size_t pre = src_pop.start_idx + src_local;
     size_t post = dst_pop.start_idx + dst_local;
-    net_.add_synapse(pre, post, weight, synapse, delay);
+    net_->add_synapse(pre, post, weight, synapse, delay);
 }
 
 void RegionalNetwork::add_connection(const std::string& src, size_t src_local,
@@ -225,7 +234,7 @@ void RegionalNetwork::add_connection(const std::string& src, size_t src_local,
     }
     size_t pre = src_pop.start_idx + src_local;
     size_t post = dst_pop.start_idx + dst_local;
-    net_.add_synapse(pre, post, weight, synapse, delay, plast);
+    net_->add_synapse(pre, post, weight, synapse, delay, plast);
 }
 
 // =============================================================================
@@ -250,7 +259,7 @@ void RegionalNetwork::add_kinetic_connection(const std::string& src, size_t i,
     }
     size_t pre  = src_pop.start_idx + i;
     size_t post = dst_pop.start_idx + j;
-    net_.add_kinetic_synapse(pre, post, weight, spec, delay);
+    net_->add_kinetic_synapse(pre, post, weight, spec, delay);
 }
 
 // =============================================================================
@@ -295,7 +304,7 @@ void RegionalNetwork::generate_connections(
                     size_t pre = src.start_idx + i;
                     size_t post = dst.start_idx + j;
                     if (!allow_self && same_pop && i == j) continue;
-                    net_.add_synapse(pre, post, weight.sample(rng), synapse, delay);
+                    net_->add_synapse(pre, post, weight.sample(rng), synapse, delay);
                 }
             }
             break;
@@ -308,7 +317,7 @@ void RegionalNetwork::generate_connections(
                     dst.name + "': " + std::to_string(dst.count) + ")");
             }
             for (size_t k = 0; k < src.count; ++k) {
-                net_.add_synapse(src.start_idx + k, dst.start_idx + k,
+                net_->add_synapse(src.start_idx + k, dst.start_idx + k,
                                       weight.sample(rng), synapse, delay);
             }
             break;
@@ -323,7 +332,7 @@ void RegionalNetwork::generate_connections(
             int n = static_cast<int>(dst.count);
             for (size_t k = 0; k < src.count; ++k) {
                 int dst_k = (static_cast<int>(k) + ((shift % n) + n)) % n;
-                net_.add_synapse(src.start_idx + k,
+                net_->add_synapse(src.start_idx + k,
                                       dst.start_idx + static_cast<size_t>(dst_k),
                                       weight.sample(rng), synapse, delay);
             }
@@ -335,7 +344,7 @@ void RegionalNetwork::generate_connections(
                 for (size_t j = 0; j < dst.count; ++j) {
                     if (!allow_self && same_pop && i == j) continue;
                     if (coin(rng) < probability) {
-                        net_.add_synapse(src.start_idx + i, dst.start_idx + j,
+                        net_->add_synapse(src.start_idx + i, dst.start_idx + j,
                                               weight.sample(rng), synapse, delay);
                     }
                 }
@@ -353,7 +362,7 @@ void RegionalNetwork::generate_connections(
             std::iota(perm.begin(), perm.end(), 0);
             std::shuffle(perm.begin(), perm.end(), rng);
             for (size_t k = 0; k < src.count; ++k) {
-                net_.add_synapse(src.start_idx + k,
+                net_->add_synapse(src.start_idx + k,
                                       dst.start_idx + perm[k],
                                       weight.sample(rng), synapse, delay);
             }
@@ -380,9 +389,9 @@ void RegionalNetwork::randomize_membrane_potentials(const std::string& name,
     }
     std::normal_distribution<double> dist(mean, std_dev);
     for (size_t i = pop.start_idx; i < pop.end_idx(); ++i) {
-        net_.neuron(i).set_membrane_potential(dist(rng));
+        net_->neuron(i).set_membrane_potential(dist(rng));
         if (reset_gates) {
-            if (auto* cn = dynamic_cast<ComposableNeuron*>(&net_.neuron(i))) {
+            if (auto* cn = dynamic_cast<ComposableNeuron*>(&net_->neuron(i))) {
                 cn->reset_gates_to_steady_state();
             }
         }
@@ -433,14 +442,21 @@ void RegionalNetwork::simulate_parallel(
             for (size_t i = pop.start_idx; i < pop.end_idx(); ++i)
                 nidxs.push_back(i);
 
-            // Pool name is the spec name stored in pop_specs_
-            auto sit = pop_specs_.find(pop_name);
-            if (sit != pop_specs_.end())
-                pnames.push_back(sit->second.name);
+            // Collect the actual composable pool keys present in this population.
+            // This keeps Phase 2 correct even when neurons share a spec name but
+            // differ structurally or parametrically, such as heterogeneous populations.
+            std::unordered_set<std::string> seen;
+            for (size_t i = pop.start_idx; i < pop.end_idx(); ++i) {
+                auto* cn = dynamic_cast<ComposableNeuron*>(&net_->neuron(i));
+                if (!cn) continue;
+                const auto& key = cn->pool_key();
+                if (seen.insert(key).second)
+                    pnames.push_back(key);
+            }
         }
     }
 
-    net_.simulate_with_descriptors_parallel(
+    net_->simulate_with_descriptors_parallel(
         duration, dt, stim,
         group_neurons, group_pools,
         V_buf,

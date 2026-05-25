@@ -85,8 +85,8 @@ class TestRegionalNetworkDevice:
 
     @pytest.mark.skipif(not hh.cuda_is_available(), reason="no CUDA GPU")
     def test_to_cuda_then_simulate(self):
-        # CUDA pools are CPU delegates for now (tasks 17.6-17.8 add real kernels).
-        # This verifies the routing path: pool construction, pinned memory, synchronize.
+        # This exercises the real CUDA routing path: pool construction,
+        # synchronization, and result handoff back to Python.
         rn = _minimal_rn()
         rn.to(hh.Device.cuda(0))
         results = _run(rn)

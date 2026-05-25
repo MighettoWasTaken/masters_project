@@ -34,6 +34,7 @@ namespace hodgkin_huxley {
 
 class PoolManager {
 public:
+    ~PoolManager();
     // Build (or rebuild) pools from the current API neuron state.
     // Called once before the first simulate(); skipped on subsequent calls
     // when pools_dirty_ is false (pools retain state from prior run).
@@ -45,6 +46,8 @@ public:
     void gather_all_currents(const double* I_buf);
     void step_all(double dt);
     void sync_all_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const;
+    void scatter_all_voltages_device(double* d_V_cache) const;
+    void gather_all_currents_device(const double* d_I_buf);
 
     // --- Recording delegates ---
     void scatter_gates(double* gate_buf, size_t max_gates, size_t n_rec, size_t tr) const;
@@ -56,6 +59,7 @@ public:
     void scatter_substances(size_t subst_idx, double* buf, size_t n_rec, size_t tr) const;
     /// Reset buf[net_idx] = 1.0 then let each ComposablePool write its synapse_g_scale
     void scatter_synapse_g_scale(double* buf) const;
+    void scatter_synapse_g_scale_device(double* d_buf) const;
 
     bool empty() const {
         return (!hh_pool_ || hh_pool_->empty()) &&
