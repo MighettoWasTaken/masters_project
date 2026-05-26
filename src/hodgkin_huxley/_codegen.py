@@ -943,6 +943,58 @@ def _dep_param_name(gate_spec) -> str:
     return "dep" if dep == "INTRACELLULAR" else "V"
 
 
+def _sanitize_cuda_ident(name: str, fallback: str) -> str:
+    """Return a CUDA-safe identifier based on *name*."""
+    import re
+
+    ident = re.sub(r"\W+", "_", str(name)).strip("_")
+    if not ident:
+        ident = fallback
+    if ident[0].isdigit():
+        ident = f"{fallback}_{ident}"
+    return ident
+
+
+def _vm_aux_param_names(
+    prog,
+    *,
+    gate_names: list[str] | None = None,
+    x_names: list[str] | None = None,
+    reserved: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return ordered gate/substance parameter names referenced by a VM program."""
+    from hodgkin_huxley._core import VmOp
+
+    reserved = set(reserved or ())
+    gate_params: list[str] = []
+    x_params: list[str] = []
+
+    def add_unique(dest: list[str], value: str) -> None:
+        if value in reserved:
+            value = f"{value}_arg"
+        if value not in reserved and value not in dest:
+            dest.append(value)
+            reserved.add(value)
+
+    for ins in getattr(prog, "instructions", ()):
+        if ins.op == VmOp.PUSH_GATE:
+            raw = (
+                gate_names[ins.operand]
+                if gate_names is not None and 0 <= ins.operand < len(gate_names)
+                else f"gate_{ins.operand}"
+            )
+            add_unique(gate_params, _sanitize_cuda_ident(raw, f"gate_{ins.operand}"))
+        elif ins.op == VmOp.PUSH_X:
+            raw = (
+                x_names[ins.operand]
+                if x_names is not None and 0 <= ins.operand < len(x_names)
+                else f"X_{ins.operand}"
+            )
+            add_unique(x_params, _sanitize_cuda_ident(raw, f"X_{ins.operand}"))
+
+    return gate_params, x_params
+
+
 def _vmexpr_to_cuda_expr(prog, *, dep_name="V", s_name="x", a_name="A",
                          gate_names: list[str] | None = None,
                          x_names: list[str] | None = None) -> str:
@@ -1088,7 +1140,54 @@ def _rate_cuda_expr(params, dep_name="V") -> str:
     raise HHEquationError(source=str(params), stderr="unsupported RateFuncForm in CUDA codegen")
 
 
-def compile_gate_cuda(gate_spec, fn_prefix: str) -> str:
+def _emit_cuda_vm_fn(
+    fn_name: str,
+    prog,
+    *,
+    base_params: list[str],
+    dep_name: str,
+    s_name: str = "x",
+    a_name: str = "A",
+    gate_names: list[str] | None = None,
+    x_names: list[str] | None = None,
+) -> str:
+    """Emit a complete CUDA helper function from a VM program."""
+    reserved = {
+        param.rsplit(" ", 1)[-1]
+        for param in base_params
+    }
+    gate_params, x_params = _vm_aux_param_names(
+        prog,
+        gate_names=gate_names,
+        x_names=x_names,
+        reserved=reserved,
+    )
+    expr_code = _vmexpr_to_cuda_expr(
+        prog,
+        dep_name=dep_name,
+        s_name=s_name,
+        a_name=a_name,
+        gate_names=gate_params or None,
+        x_names=x_params or None,
+    )
+    all_params = list(base_params)
+    all_params.extend(f"double {name}" for name in gate_params)
+    all_params.extend(f"double {name}" for name in x_params)
+    return (
+        f"__device__ __forceinline__ double {fn_name}"
+        f"({', '.join(all_params)}) {{\n"
+        f"    return {expr_code};\n"
+        "}"
+    )
+
+
+def compile_gate_cuda(
+    gate_spec,
+    fn_prefix: str,
+    *,
+    gate_names: list[str] | None = None,
+    x_names: list[str] | None = None,
+) -> str:
     """
     Generate CUDA ``__device__`` helpers for one gate specification.
 
@@ -1099,6 +1198,17 @@ def compile_gate_cuda(gate_spec, fn_prefix: str) -> str:
     This helper supports both forms and emits only the functions that are
     actually defined for the given gate.
     """
+    if gate_names is not None:
+        gate_names = [
+            _sanitize_cuda_ident(name, f"gate_{idx}")
+            for idx, name in enumerate(gate_names)
+        ]
+    if x_names is not None:
+        x_names = [
+            _sanitize_cuda_ident(name, f"X_{idx}")
+            for idx, name in enumerate(x_names)
+        ]
+
     printer = CUDAPrinter({"V": "V", "Ca": "dep", "x": "x", "S": "x", "A": "A"})
     dep_name = _dep_param_name(gate_spec)
     update_name = getattr(getattr(gate_spec, "update_form", None), "name", "")
@@ -1124,43 +1234,203 @@ def compile_gate_cuda(gate_spec, fn_prefix: str) -> str:
     if inf_expr is not None:
         add_expr_fn("inf", [f"double {dep_name}"], inf_expr)
     elif _vm_nonempty(getattr(gate_spec, "inf_vm", None)):
-        expr_code = _vmexpr_to_cuda_expr(gate_spec.inf_vm, dep_name=dep_name)
-        add_code_fn("inf", [f"double {dep_name}"], expr_code)
+        pieces.append(
+            _emit_cuda_vm_fn(
+                f"{fn_prefix}_inf",
+                gate_spec.inf_vm,
+                base_params=[f"double {dep_name}"],
+                dep_name=dep_name,
+                gate_names=gate_names,
+                x_names=x_names,
+            )
+        )
     elif hasattr(gate_spec, "inf") and update_name in {"INF_TAU", "INSTANT"}:
         add_code_fn("inf", [f"double {dep_name}"], _boltzmann_cuda_expr(gate_spec.inf, dep_name))
 
     if tau_expr is not None:
         add_expr_fn("tau", ["double V"], tau_expr)
     elif _vm_nonempty(getattr(gate_spec, "tau_vm", None)):
-        expr_code = _vmexpr_to_cuda_expr(gate_spec.tau_vm, dep_name="V")
-        add_code_fn("tau", ["double V"], expr_code)
+        pieces.append(
+            _emit_cuda_vm_fn(
+                f"{fn_prefix}_tau",
+                gate_spec.tau_vm,
+                base_params=["double V"],
+                dep_name="V",
+                gate_names=gate_names,
+                x_names=x_names,
+            )
+        )
     elif hasattr(gate_spec, "tau") and update_name == "INF_TAU":
         add_code_fn("tau", ["double V"], _tau_cuda_expr(gate_spec.tau, "V"))
 
     if alpha_expr is not None:
         add_expr_fn("alpha", ["double V"], alpha_expr)
     elif _vm_nonempty(getattr(gate_spec, "alpha_vm", None)):
-        expr_code = _vmexpr_to_cuda_expr(gate_spec.alpha_vm, dep_name="V")
-        add_code_fn("alpha", ["double V"], expr_code)
+        pieces.append(
+            _emit_cuda_vm_fn(
+                f"{fn_prefix}_alpha",
+                gate_spec.alpha_vm,
+                base_params=["double V"],
+                dep_name="V",
+                gate_names=gate_names,
+                x_names=x_names,
+            )
+        )
     elif hasattr(gate_spec, "alpha") and update_name == "ALPHA_BETA":
         add_code_fn("alpha", ["double V"], _rate_cuda_expr(gate_spec.alpha, "V"))
 
     if beta_expr is not None:
         add_expr_fn("beta", ["double V"], beta_expr)
     elif _vm_nonempty(getattr(gate_spec, "beta_vm", None)):
-        expr_code = _vmexpr_to_cuda_expr(gate_spec.beta_vm, dep_name="V")
-        add_code_fn("beta", ["double V"], expr_code)
+        pieces.append(
+            _emit_cuda_vm_fn(
+                f"{fn_prefix}_beta",
+                gate_spec.beta_vm,
+                base_params=["double V"],
+                dep_name="V",
+                gate_names=gate_names,
+                x_names=x_names,
+            )
+        )
     elif hasattr(gate_spec, "beta") and update_name == "ALPHA_BETA":
         add_code_fn("beta", ["double V"], _rate_cuda_expr(gate_spec.beta, "V"))
 
     if dxdt_expr is not None:
         add_expr_fn("dxdt", [f"double {dep_name}", "double x"], dxdt_expr)
     elif _vm_nonempty(getattr(gate_spec, "dxdt_vm", None)):
-        expr_code = _vmexpr_to_cuda_expr(gate_spec.dxdt_vm, dep_name=dep_name, s_name="x")
-        add_code_fn("dxdt", [f"double {dep_name}", "double x"], expr_code)
+        pieces.append(
+            _emit_cuda_vm_fn(
+                f"{fn_prefix}_dxdt",
+                gate_spec.dxdt_vm,
+                base_params=[f"double {dep_name}", "double x"],
+                dep_name=dep_name,
+                s_name="x",
+                gate_names=gate_names,
+                x_names=x_names,
+            )
+        )
 
     if not pieces:
         raise HHEquationError(source=repr(gate_spec), stderr="gate has no CUDA-emittable expressions")
+
+    return "\n\n".join(pieces)
+
+
+def compile_intracellular_cuda(
+    intr_spec,
+    fn_prefix: str,
+    *,
+    gate_names: list[str] | None = None,
+    x_names: list[str] | None = None,
+) -> str:
+    """
+    Generate CUDA ``__device__`` helpers for intracellular VM expressions.
+
+    This is the explicit 17.5 -> 17.9 bridge for the same CUSTOM_EXPR ODEs,
+    Nernst overrides, and modulation programs that the CUDA composable runtime
+    evaluates through the VM today.
+    """
+    if gate_names is not None:
+        gate_names = [
+            _sanitize_cuda_ident(name, f"gate_{idx}")
+            for idx, name in enumerate(gate_names)
+        ]
+    if x_names is not None:
+        x_names = [
+            _sanitize_cuda_ident(name, f"X_{idx}")
+            for idx, name in enumerate(x_names)
+        ]
+
+    pieces: list[str] = []
+
+    if _vm_nonempty(getattr(intr_spec, "ode_vm", None)):
+        pieces.append(
+            _emit_cuda_vm_fn(
+                f"{fn_prefix}_ode",
+                intr_spec.ode_vm,
+                base_params=["double I_source", "double x"],
+                dep_name="I_source",
+                s_name="x",
+                gate_names=gate_names,
+                x_names=x_names,
+            )
+        )
+
+    if _vm_nonempty(getattr(intr_spec, "nernst_vm", None)):
+        pieces.append(
+            _emit_cuda_vm_fn(
+                f"{fn_prefix}_nernst",
+                intr_spec.nernst_vm,
+                base_params=["double x"],
+                dep_name="x",
+                s_name="x",
+                gate_names=gate_names,
+                x_names=x_names,
+            )
+        )
+
+    for mod_idx, mod in enumerate(getattr(intr_spec, "modulations", ())):
+        if _vm_nonempty(getattr(mod, "mod_vm", None)):
+            pieces.append(
+                _emit_cuda_vm_fn(
+                    f"{fn_prefix}_mod_{mod_idx}",
+                    mod.mod_vm,
+                    base_params=["double dep"],
+                    dep_name="dep",
+                    s_name="dep",
+                    gate_names=gate_names,
+                    x_names=x_names,
+                )
+            )
+
+    if not pieces:
+        raise HHEquationError(
+            source=repr(intr_spec),
+            stderr="intracellular spec has no CUDA-emittable VM expressions",
+        )
+
+    return "\n\n".join(pieces)
+
+
+def compile_model_cuda(model_spec, fn_prefix: str = "model") -> str:
+    """
+    Emit CUDA helper code for all VM-backed gate and intracellular pieces in a model.
+
+    The generated source is a readable inspection tool today and matches the
+    real custom-gate / intracellular programs that task 17.9 runs on CUDA.
+    """
+    model_prefix = _sanitize_cuda_ident(fn_prefix, "model")
+    gate_names = [getattr(g, "name", "") or f"gate_{idx}" for idx, g in enumerate(model_spec.gates)]
+    x_names = [getattr(ic, "name", "") or f"X_{idx}" for idx, ic in enumerate(model_spec.intracellular)]
+
+    pieces: list[str] = []
+    for idx, gate_spec in enumerate(model_spec.gates):
+        pieces.append(
+            compile_gate_cuda(
+                gate_spec,
+                f"{model_prefix}_gate_{_sanitize_cuda_ident(gate_names[idx], f'gate_{idx}')}",
+                gate_names=gate_names,
+                x_names=x_names,
+            )
+        )
+    for idx, intr_spec in enumerate(model_spec.intracellular):
+        try:
+            pieces.append(
+                compile_intracellular_cuda(
+                    intr_spec,
+                    f"{model_prefix}_x_{_sanitize_cuda_ident(x_names[idx], f'X_{idx}')}",
+                    gate_names=gate_names,
+                    x_names=x_names,
+                )
+            )
+        except HHEquationError:
+            continue
+
+    if not pieces:
+        raise HHEquationError(
+            source=repr(model_spec),
+            stderr="model has no CUDA-emittable gate or intracellular expressions",
+        )
 
     return "\n\n".join(pieces)
 

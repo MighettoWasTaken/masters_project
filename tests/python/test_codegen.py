@@ -22,11 +22,20 @@ from hodgkin_huxley._codegen import (
     V, Ca, V_pre, V_post, S, x,
     EigenPrinter, CUDAPrinter, TaggedExpr,
     try_pattern_match, HHEquationError, compile_gate_cuda,
-    compile_to_vm_bytecode, compile_gate_product_vm, gate,
+    compile_intracellular_cuda, compile_model_cuda,
+    compile_to_vm_bytecode, compile_gate_product_vm, gate, substance,
 )
-from hodgkin_huxley._equations import GateSpec as BuildGateSpec, Boltzmann, Tau, NeuronModel
+from hodgkin_huxley._equations import (
+    GateSpec as BuildGateSpec,
+    Boltzmann,
+    IntracellularDynamics,
+    Modulation,
+    Tau,
+    NeuronModel,
+)
 from hodgkin_huxley._core import (
-    BoltzmannParams, TauParams, TauForm, RateFuncParams, RateFuncForm,
+    BoltzmannParams, GateSpec as CoreGateSpec, GateUpdateForm, TauParams,
+    TauForm, RateFuncParams, RateFuncForm, VmOp,
 )
 
 
@@ -171,9 +180,81 @@ class TestCompileGateCuda:
         assert "double x" in code
         assert "sin" in code
 
+    def test_vm_gate_uses_named_gate_and_substance_params(self):
+        g = CoreGateSpec()
+        g.name = "combo"
+        g.update_form = GateUpdateForm.CUSTOM_EXPR
+        g.inf_vm = compile_to_vm_bytecode(
+            sympy.Symbol("driver") + sympy.Symbol("DA") + sympy.Float(0.25),
+            dep_sym=V,
+            extra_syms={
+                sympy.Symbol("driver"): (VmOp.PUSH_GATE, 0),
+                sympy.Symbol("DA"): (VmOp.PUSH_X, 1),
+            },
+        )
+        code = compile_gate_cuda(
+            g,
+            "combo_gate",
+            gate_names=["driver"],
+            x_names=["Ca", "DA"],
+        )
+        assert "combo_gate_inf(double V, double driver, double DA)" in code
+        assert "driver" in code
+        assert "DA" in code
+
     def test_blank_gate_raises(self):
         with pytest.raises(HHEquationError):
             compile_gate_cuda(object(), "blank")
+
+
+class TestCompileModelCuda:
+
+    def test_intracellular_cuda_emits_ode_and_modulation_helpers(self):
+        dyn = IntracellularDynamics(
+            "DA",
+            ode=-(substance("DA") ** 2 + substance("DA")) / sympy.Float(100.0),
+            initial=0.4,
+            modulations=[
+                Modulation.synapse_g(
+                    1 / (1 + sympy.exp(-10 * (substance("DA") - sympy.Float(0.5))))
+                )
+            ],
+        )
+        gate_names = ["m"]
+        intr_spec = dyn.to_spec(["Leak"], gate_names, {})
+        code = compile_intracellular_cuda(
+            intr_spec,
+            "demo_DA",
+            gate_names=gate_names,
+            x_names=["DA"],
+        )
+        assert "demo_DA_ode(double x)" not in code
+        assert "demo_DA_ode(double I_source, double x)" in code
+        assert "demo_DA_mod_0(double dep)" in code
+        assert "exp" in code
+
+    def test_compile_model_cuda_links_gate_and_intracellular_paths(self):
+        model = NeuronModel("bridge", C_m=1.0, V_init=-65.0)
+        model.add_gate(
+            "m",
+            inf=(1 / (1 + sympy.exp(-(V + 40) / 8))) * sympy.Float(0.999) + sympy.Float(0.001),
+            tau=sympy.Float(2.0) + sympy.sqrt(V**2 + 1) * sympy.Float(0.0),
+        )
+        model.add_channel("Leak", g=0.1, E_rev=-65.0)
+        spec = model.to_spec()
+        dyn = IntracellularDynamics(
+            "DA",
+            ode=-(substance("DA") ** 2 + substance("DA")) / sympy.Float(80.0),
+            initial=0.5,
+            modulations=[Modulation.synapse_g(sympy.Float(0.5))],
+        )
+        spec.intracellular.append(dyn.to_spec(["Leak"], ["m"], {}))
+
+        code = compile_model_cuda(spec, "bridge")
+        assert "bridge_gate_m_inf" in code
+        assert "bridge_gate_m_tau" in code
+        assert "bridge_x_DA_ode" in code
+        assert "bridge_x_DA_mod_0" in code
 
 
 # =============================================================================
