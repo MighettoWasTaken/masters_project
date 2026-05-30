@@ -23,6 +23,7 @@
 #  include "hodgkin_huxley/cuda_hh_pool.hpp"
 #  include "hodgkin_huxley/cuda_iz_pool.hpp"
 #  include "hodgkin_huxley/cuda_composable_pool.hpp"
+#  include <cuda_runtime.h>
 #endif
 #include <map>
 #include <memory>
@@ -79,6 +80,14 @@ public:
     bool on_cuda() const { return use_cuda_; }
     int  cuda_device_id() const { return device_id_; }
     void synchronize_cuda() const;
+
+#ifdef HH_USE_CUDA
+    // Returns true iff on CUDA and all pools are coop-kernel capable
+    bool has_coop_capable_cuda_pools() const;
+    void collect_hh_descs(std::vector<CudaHHDesc>& out) const;
+    void collect_iz_descs(std::vector<CudaIzDesc>& out) const;
+    void collect_comp_descs(std::vector<CudaComposableDesc>& out) const;
+#endif
 
     // --- Per-group ops for Phase 2 parallel simulation ---
     // ComposablePool subset (by spec name)

@@ -1099,6 +1099,7 @@ class RegionalNetwork:
                                       cfg.interval, selected, gate_names)
             return PopulationMetricsResult(result_mr, pop_info, record)
 
+        _on_cuda = (self._rnet.current_device().type.name == "CUDA")
         result = _run_recording(
             self._rnet.network(),
             duration,
@@ -1108,6 +1109,7 @@ class RegionalNetwork:
             pop_info,
             detection_threshold=detection_threshold,
             stim_plan=stim_plan,
+            on_cuda=_on_cuda,
         )
 
         if record is None:

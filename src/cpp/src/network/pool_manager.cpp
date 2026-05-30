@@ -4,6 +4,7 @@
 #include "hodgkin_huxley/composable_neuron.hpp"
 #ifdef HH_USE_CUDA
 #  include <cuda_runtime_api.h>
+#  include "hodgkin_huxley/cuda_sim_all.hpp"
 #endif
 #include <map>
 #ifdef HH_USE_OPENMP
@@ -341,5 +342,50 @@ void PoolManager::scatter_recoveries_for_iz(const std::vector<size_t>& local_ind
                                               double* u_buf, size_t n_rec, size_t tr) const {
     iz_pool_->scatter_recoveries_subset(local_indices, u_buf, n_rec, tr);
 }
+
+#ifdef HH_USE_CUDA
+
+bool PoolManager::has_coop_capable_cuda_pools() const {
+    if (!use_cuda_) return false;
+    for (const auto& kv : comp_pools_) {
+        auto* cp = dynamic_cast<CudaComposablePool*>(kv.second.get());
+        if (!cp) return false;
+    }
+    return true;
+}
+
+void PoolManager::collect_hh_descs(std::vector<CudaHHDesc>& out) const {
+    out.clear();
+    if (auto* hh = dynamic_cast<CudaHHPool*>(hh_pool_.get())) {
+        if (!hh->empty()) {
+            out.emplace_back();
+            hh->fill_coop_desc(out.back());
+        }
+    }
+}
+
+void PoolManager::collect_iz_descs(std::vector<CudaIzDesc>& out) const {
+    out.clear();
+    if (auto* iz = dynamic_cast<CudaIzPool*>(iz_pool_.get())) {
+        if (!iz->empty()) {
+            out.emplace_back();
+            iz->fill_coop_desc(out.back());
+        }
+    }
+}
+
+void PoolManager::collect_comp_descs(std::vector<CudaComposableDesc>& out) const {
+    out.clear();
+    for (const auto& kv : comp_pools_) {
+        if (auto* cp = dynamic_cast<CudaComposablePool*>(kv.second.get())) {
+            if (!cp->empty()) {
+                out.emplace_back();
+                cp->fill_coop_desc(out.back());
+            }
+        }
+    }
+}
+
+#endif // HH_USE_CUDA
 
 } // namespace hodgkin_huxley

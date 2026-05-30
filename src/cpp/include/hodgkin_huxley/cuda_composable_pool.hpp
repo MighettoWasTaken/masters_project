@@ -8,6 +8,9 @@
 
 namespace hodgkin_huxley {
 
+// Forward declaration to avoid circular include with cuda_sim_all.hpp
+struct CudaComposableDesc;
+
 struct CudaGateDesc {
     int update_form = 0;
     int dependency = 0;
@@ -105,6 +108,9 @@ public:
     void scatter_voltages_device(double* d_V_buf) const;
     void gather_currents_device(const double* d_I_buf);
     void scatter_synapse_g_scale_device(double* d_buf) const;
+    void fill_coop_desc(CudaComposableDesc& out) const;
+
+    bool needs_vm_programs() const;
 
     bool is_cuda()                const override { return true; }
     int  device_id()              const override { return device_id_; }
@@ -125,12 +131,13 @@ private:
     double* d_synapse_g_scale_ = nullptr;
     size_t* d_net_idx_ = nullptr;
 
-    std::vector<double*> gate_device_ptrs_;
-    std::vector<double*> substance_device_ptrs_;
-    std::vector<double*> nernst_device_ptrs_;
-    double** d_gate_ptrs_ = nullptr;
-    double** d_substance_ptrs_ = nullptr;
-    double** d_nernst_ptrs_ = nullptr;
+    // Flat state storage (Stage 1: single-indirection, coalesced — like the HH
+    // pool's flat d_m/d_h/d_n). Gate g of neuron i lives at
+    // d_gate_state_[g * capacity_ + i]; capacity_ is the stride. Replaces the
+    // former jagged double** array-of-pointers that forced a pointer chase.
+    double* d_gate_state_      = nullptr;  // n_gates      * capacity_
+    double* d_substance_state_ = nullptr;  // n_substances * capacity_
+    double* d_nernst_state_    = nullptr;  // n_substances * capacity_
 
     CudaGateDesc* d_gate_descs_ = nullptr;
     CudaChannelDesc* d_channel_descs_ = nullptr;
@@ -147,7 +154,6 @@ private:
     void upload_state();
     void upload_currents();
     void upload_index_map();
-    void upload_pointer_tables();
     void upload_model_metadata();
     void download_state() const;
     void ensure_device_state();

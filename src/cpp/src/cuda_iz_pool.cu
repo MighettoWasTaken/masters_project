@@ -219,6 +219,20 @@ void CudaIzPool::gather_currents_device(const double* d_I_buf) {
     check_cuda(cudaGetLastError(), "CudaIzPool gather_by_index_kernel");
 }
 
+void CudaIzPool::fill_coop_desc(CudaIzDesc& out) const {
+    if (!device_ready_) const_cast<CudaIzPool*>(this)->ensure_device_state();
+    out.d_v      = d_v_;
+    out.d_u      = d_u_;
+    out.d_I_ext  = d_I_ext_;
+    out.d_a      = d_a_;
+    out.d_b      = d_b_;
+    out.d_c      = d_c_;
+    out.d_d      = d_d_;
+    out.d_net_idx = d_net_idx_;
+    out.n        = static_cast<int>(N_);
+    out.threshold = SPIKE_THRESHOLD;
+}
+
 void CudaIzPool::sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const {
     ensure_host_state();
     IzPool::sync_to_neurons(neurons);

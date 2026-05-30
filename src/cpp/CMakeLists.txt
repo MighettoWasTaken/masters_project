@@ -36,11 +36,26 @@ if(CUDAToolkit_FOUND AND CMAKE_CUDA_COMPILER)
         src/cuda_iz_pool.cu
         src/cuda_composable_pool.cu
         src/cuda_synapse.cu
+        src/cuda_sim_all.cu
     )
     target_link_libraries(hodgkin_huxley_core PUBLIC CUDA::cudart)
     target_compile_definitions(hodgkin_huxley_core PUBLIC HH_USE_CUDA)
     # Separable compilation (-rdc=true) is not needed — kernels are
     # self-contained within their own .cu files and don't call across them.
+
+    # cooperative_groups.h (cuda_sim_all.cu only) requires MSVC's conforming
+    # preprocessor. Apply /Zc:preprocessor to that one file only so the other
+    # CUDA files are unaffected.
+    if(MSVC)
+        set_source_files_properties(src/cuda_sim_all.cu PROPERTIES
+            COMPILE_OPTIONS "-Xcompiler=/Zc:preprocessor")
+    endif()
+
+    target_compile_options(hodgkin_huxley_core PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+    target_compile_options(hodgkin_huxley_core PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4068>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4068>)
 endif()
 
 # Enable position independent code for shared library linking

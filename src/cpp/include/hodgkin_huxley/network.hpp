@@ -13,6 +13,7 @@
 #include "hodgkin_huxley/ion_channels.hpp"
 #include "hodgkin_huxley/network/pool_manager.hpp"
 #include "hodgkin_huxley/device.hpp"
+#include "hodgkin_huxley/stim_plan.hpp"
 #ifdef HH_USE_CUDA
 #  include "hodgkin_huxley/cuda_synapse.hpp"
 #endif
@@ -22,35 +23,6 @@
 #include <cstdint>
 
 namespace hodgkin_huxley {
-
-// =============================================================================
-// Compact stimulation plan — avoids dense (n_neurons × n_steps) I_ext matrix
-// =============================================================================
-
-/// A rectangular current pulse applied to a contiguous neuron range.
-struct PulseEvent {
-    size_t neuron_start;  ///< First neuron index (inclusive)
-    size_t neuron_end;    ///< Last neuron index (exclusive)
-    size_t onset_step;    ///< First time step of pulse (inclusive)
-    size_t end_step;      ///< First time step after pulse (exclusive)
-    double amplitude;     ///< Current amplitude (µA/cm²)
-};
-
-/// A periodic DBS pulse train applied to a contiguous neuron range.
-struct DBSEvent {
-    size_t neuron_start;  ///< First neuron index (inclusive)
-    size_t neuron_end;    ///< Last neuron index (exclusive)
-    size_t isi_steps;     ///< Inter-stimulus interval in time steps
-    size_t pw_steps;      ///< Pulse width in time steps
-    double amplitude;     ///< Current amplitude (µA/cm²)
-};
-
-/// Compact representation of all external stimulation for one simulation run.
-struct StimPlan {
-    std::vector<double>     I_const;   ///< Per-neuron constant baseline current
-    std::vector<PulseEvent> pulses;    ///< Sparse rectangular pulse events
-    std::vector<DBSEvent>   dbs;       ///< Periodic DBS pulse trains
-};
 
 /**
  * @brief Network of neurons connected by synapses.
@@ -217,6 +189,7 @@ public:
         double* g_syn_buf,
         double* I_syn_buf,
         double* spike_event_buf,
+        uint8_t* spike_buf_uint8,
         size_t  interval,
         size_t  n_rec,
         double  spike_threshold = 0.0
@@ -393,6 +366,12 @@ private:
     double* d_synapse_g_scale_ = nullptr;
     size_t  cuda_buffer_size_  = 0;
     DeviceSynapseArrays dev_syn_;
+
+    cudaStream_t sim_stream_      = nullptr;
+    double*      d_V_out_         = nullptr;
+    size_t       d_V_out_cap_     = 0;
+    uint8_t*     d_spike_buf_     = nullptr;
+    size_t       d_spike_buf_cap_ = 0;
 #endif
 
     // Forward-injection spike delivery state (task26)

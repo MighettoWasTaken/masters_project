@@ -6,6 +6,7 @@
 #include "hodgkin_huxley/model/synapse_spec.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <cuda_runtime.h>
 #include <vector>
 
 namespace hodgkin_huxley {
@@ -50,6 +51,9 @@ struct DeviceSynapseArrays {
     size_t synapse_count = 0;
     size_t ring_size = 0;
     size_t spec_count = 0;
+    // Minimum delay across all synapses, in steps. If >= 1, the GPU kernel
+    // can skip the P6→P7 within-step barrier (since write_slot != read_slot).
+    uint32_t min_delay_steps = 0;
 
     double* d_weight = nullptr;
     double* d_g = nullptr;

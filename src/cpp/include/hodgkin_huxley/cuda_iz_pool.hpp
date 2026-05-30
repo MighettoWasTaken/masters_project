@@ -3,6 +3,7 @@
 #ifdef HH_USE_CUDA
 
 #include "hodgkin_huxley/iz_pool.hpp"
+#include "hodgkin_huxley/cuda_pool_descs.hpp"
 #include <cuda_runtime.h>
 
 namespace hodgkin_huxley {
@@ -18,6 +19,7 @@ public:
     void sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const override;
     void scatter_voltages_device(double* d_V_buf) const;
     void gather_currents_device(const double* d_I_buf);
+    void fill_coop_desc(CudaIzDesc& out) const;
 
     bool is_cuda()                const override { return true; }
     int  device_id()              const override { return device_id_; }

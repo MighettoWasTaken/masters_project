@@ -39,6 +39,7 @@ from hodgkin_huxley import (
     SynapseModel,
     V,
     analyze_beta_power,
+    Device
 )
 from hodgkin_huxley._codegen import Ca, I_source
 
@@ -684,9 +685,10 @@ def simulate_ctxbgth(
     """
     net = build_network(n=n, pd=pd, seed=seed)
 
+    net.to(Device.cuda(0))
     POPULATIONS = ["TH", "STN", "GPe", "GPi", "Str_D2", "Str_D1", "CTX_e", "CTX_i"]
-    groups = {f"g{i}": [name] for i, name in enumerate(POPULATIONS)}
-    net.set_thread_groups(groups)   # Phase 2: one thread per population
+    #groups = {f"g{i}": [name] for i, name in enumerate(POPULATIONS)}
+    #net.set_thread_groups(groups)   # Phase 2: one thread per population
 
     # ---- External currents -------------------------------------------------
     I_ext: dict = {

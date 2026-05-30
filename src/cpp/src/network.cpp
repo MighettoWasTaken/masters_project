@@ -2,6 +2,7 @@
 #include "hodgkin_huxley/model/kinetics.hpp"
 #ifdef HH_USE_CUDA
 #  include <cuda_runtime_api.h>
+#  include "hodgkin_huxley/cuda_sim_all.hpp"
 #endif
 #include <stdexcept>
 #include <cmath>
@@ -11,6 +12,8 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <sstream>
+#include <limits>
 #ifdef HH_USE_OPENMP
 #  include <omp.h>
 #endif
@@ -67,6 +70,9 @@ bool Network::can_use_cuda_synapse_path() const {
 }
 
 void Network::free_cuda_runtime() {
+    if (sim_stream_) { cudaStreamDestroy(sim_stream_); sim_stream_ = nullptr; }
+    if (d_V_out_)    { cudaFree(d_V_out_);    d_V_out_    = nullptr; d_V_out_cap_    = 0; }
+    if (d_spike_buf_){ cudaFree(d_spike_buf_); d_spike_buf_= nullptr; d_spike_buf_cap_= 0; }
     if (d_V_cache_) cudaFree(d_V_cache_);
     if (d_I_syn_) cudaFree(d_I_syn_);
     if (d_synapse_g_scale_) cudaFree(d_synapse_g_scale_);
@@ -125,6 +131,16 @@ void Network::prepare_cuda_synapses(double dt) {
         allocate_device_synapses(dev_syn_, n_neurons, n_synapses, ring_size,
                                  spec_count, pool_mgr_.cuda_device_id());
     }
+
+    // Compute min delay across all synapses for kernel barrier optimization.
+    // delay_steps_ was populated in build_injection_tables() before this call.
+    uint32_t min_delay = std::numeric_limits<uint32_t>::max();
+    for (size_t i = 0; i < n_synapses; ++i) {
+        if (delay_steps_[i] < min_delay) min_delay = delay_steps_[i];
+    }
+    dev_syn_.min_delay_steps = (n_synapses == 0)
+        ? std::numeric_limits<uint32_t>::max()  // no synapses → no race possible
+        : min_delay;
 
     std::vector<DeviceSynapseSpecDesc> spec_descs(spec_count);
     std::vector<VmExpr> vm_exprs;
@@ -1492,6 +1508,7 @@ void Network::simulate_with_descriptors(
     double* g_syn_buf,
     double* I_syn_buf,
     double* spike_event_buf,
+    uint8_t* spike_buf_uint8,
     size_t  interval,
     size_t  n_rec,
     double  spike_threshold
@@ -1518,85 +1535,117 @@ void Network::simulate_with_descriptors(
     ensure_buffers();
 
     const size_t S = sa_.size();
+
 #ifdef HH_USE_CUDA
-    const bool use_cuda_synapses = can_use_cuda_synapse_path();
-    if (use_cuda_synapses && (!use_pinned_memory_ || pinned_size_ != n_neurons))
-        reallocate_pinned_buffers(n_neurons);
-    if (use_cuda_synapses) {
+    // Cooperative kernel path: entire simulation on-device, no per-step CPU round-trips
+    if (pool_mgr_.on_cuda() && !has_stdp_ && !has_stp_
+        && pool_mgr_.has_coop_capable_cuda_pools()
+        && !gate_buf && !calcium_buf && !u_buf && !g_syn_buf && !I_syn_buf && !spike_event_buf) {
+
+        if (!use_pinned_memory_ || pinned_size_ != n_neurons)
+            reallocate_pinned_buffers(n_neurons);
+        ensure_cuda_runtime_buffers(n_neurons);
         prepare_cuda_synapses(dt);
-        if (pool_mgr_.has_synapse_g_mods()) {
-            fill_device_buffer(d_synapse_g_scale_, 1.0, n_neurons);
-            pool_mgr_.scatter_synapse_g_scale_device(d_synapse_g_scale_);
-            pool_mgr_.synchronize_cuda();
+
+        if (!sim_stream_) {
+            if (cudaStreamCreate(&sim_stream_) != cudaSuccess)
+                throw std::runtime_error("simulate_with_descriptors: cudaStreamCreate failed");
         }
+
+        // Allocate device recording buffers
+        const size_t v_needed = V_buf ? n_neurons * n_rec : 0;
+        if (v_needed > d_V_out_cap_) {
+            if (d_V_out_) cudaFree(d_V_out_);
+            if (v_needed > 0 &&
+                cudaMalloc(reinterpret_cast<void**>(&d_V_out_),
+                           v_needed * sizeof(double)) != cudaSuccess)
+                throw std::runtime_error("simulate_with_descriptors: cudaMalloc d_V_out_ failed");
+            d_V_out_cap_ = v_needed;
+        }
+        const size_t s_needed = spike_buf_uint8 ? n_neurons * n_rec : 0;
+        if (s_needed > d_spike_buf_cap_) {
+            if (d_spike_buf_) cudaFree(d_spike_buf_);
+            if (s_needed > 0 &&
+                cudaMalloc(reinterpret_cast<void**>(&d_spike_buf_),
+                           s_needed * sizeof(uint8_t)) != cudaSuccess)
+                throw std::runtime_error("simulate_with_descriptors: cudaMalloc d_spike_buf_ failed");
+            d_spike_buf_cap_ = s_needed;
+        }
+        if (spike_buf_uint8 && d_spike_buf_)
+            cudaMemset(d_spike_buf_, 0, s_needed * sizeof(uint8_t));
+
+        // Collect pool descriptors (ensures device state is ready)
+        std::vector<CudaHHDesc>         hh_descs;
+        std::vector<CudaIzDesc>         iz_descs;
+        std::vector<CudaComposableDesc> comp_descs;
+        pool_mgr_.collect_hh_descs(hh_descs);
+        pool_mgr_.collect_iz_descs(iz_descs);
+        pool_mgr_.collect_comp_descs(comp_descs);
+
+        CudaStimRaw   stim_raw = upload_stim_raw(stim, n_neurons, pool_mgr_.cuda_device_id());
+        DeviceSynapseRaw syn_raw = make_syn_raw(dev_syn_);
+
+        simulate_all_steps(
+            hh_descs.data(),  static_cast<int>(hh_descs.size()),
+            iz_descs.data(),  static_cast<int>(iz_descs.size()),
+            comp_descs.data(), static_cast<int>(comp_descs.size()),
+            syn_raw, stim_raw,
+            d_V_cache_, d_I_syn_,
+            V_buf           ? d_V_out_     : nullptr,
+            spike_buf_uint8 ? d_spike_buf_ : nullptr,
+            n_neurons, num_steps, dt,
+            current_step_, interval, n_rec,
+            sim_stream_);
+
+        current_step_ += num_steps;
+
+        if (V_buf && d_V_out_)
+            cudaMemcpy(V_buf, d_V_out_, v_needed * sizeof(double), cudaMemcpyDeviceToHost);
+        if (spike_buf_uint8 && d_spike_buf_)
+            cudaMemcpy(spike_buf_uint8, d_spike_buf_, s_needed * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+
+        sync_cuda_synapses_to_host(true);
+        free_stim_raw(stim_raw);
+
+        pool_mgr_.sync_all_to_neurons(neurons_);
+        return;
     }
-    double* V_ptr = use_pinned_memory_ ? V_cache_pinned_ : V_cache_.data();
-    double* I_ptr = use_pinned_memory_ ? I_syn_pinned_   : I_syn_buffer_.data();
-    std::vector<uint8_t> spike_arrived_host;
-    if (use_cuda_synapses && spike_event_buf)
-        spike_arrived_host.resize(S);
-#else
-    const bool use_cuda_synapses = false;
+#endif
+
     double* V_ptr = V_cache_.data();
     double* I_ptr = I_syn_buffer_.data();
+#ifdef HH_USE_CUDA
+    if (pool_mgr_.on_cuda()) {
+        if (!use_pinned_memory_ || pinned_size_ != n_neurons)
+            reallocate_pinned_buffers(n_neurons);
+        V_ptr = V_cache_pinned_;
+        I_ptr = I_syn_pinned_;
+    }
 #endif
+
     std::vector<double> syn_spike_accum(n_neurons, 0.0);
     std::vector<double> I_stim_cache(n_neurons, 0.0);
 
     for (size_t t = 0; t < num_steps; ++t) {
-        if (use_cuda_synapses) {
-#ifdef HH_USE_CUDA
-            pool_mgr_.scatter_all_voltages_device(d_V_cache_);
-            pool_mgr_.synchronize_cuda();
-#endif
-        } else {
-            pool_mgr_.scatter_all_voltages(V_ptr);
-        }
+        pool_mgr_.scatter_all_voltages(V_ptr);
 
         if (t % interval == 0) {
             size_t tr = t / interval;
-
             if (V_buf) {
-                if (use_cuda_synapses &&
-                    !(gate_buf || calcium_buf || u_buf)) {
-#ifdef HH_USE_CUDA
-                    if (cudaMemcpy(V_ptr, d_V_cache_,
-                                   n_neurons * sizeof(double),
-                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-                        throw std::runtime_error("simulate_with_descriptors: cudaMemcpy V_cache D2H failed");
-                    }
-#endif
-                } else {
-                    pool_mgr_.scatter_all_voltages(V_ptr);
-                }
                 for (size_t i = 0; i < n_neurons; ++i)
                     V_buf[i * n_rec + tr] = V_ptr[i];
             }
-
             if (gate_buf && max_gates > 0)
                 pool_mgr_.scatter_gates(gate_buf, max_gates, n_rec, tr);
-
             if (calcium_buf)
                 pool_mgr_.scatter_calcium(calcium_buf, n_rec, tr);
-
             if (u_buf)
                 pool_mgr_.scatter_recoveries(u_buf, n_rec, tr);
-
             if (g_syn_buf) {
-                if (use_cuda_synapses) {
-#ifdef HH_USE_CUDA
-                    if (cudaMemcpy(sa_.g.data(), dev_syn_.d_g,
-                                   S * sizeof(double),
-                                   cudaMemcpyDeviceToHost) != cudaSuccess) {
-                        throw std::runtime_error("simulate_with_descriptors: cudaMemcpy synapse g D2H failed");
-                    }
-#endif
-                }
                 const double* g = sa_.g.data();
                 for (size_t i = 0; i < S; ++i)
                     g_syn_buf[i * n_rec + tr] = g[i];
             }
-
             if (spike_event_buf) {
                 for (size_t i = 0; i < n_neurons; ++i) {
                     spike_event_buf[i * n_rec + tr] = syn_spike_accum[i];
@@ -1605,123 +1654,64 @@ void Network::simulate_with_descriptors(
             }
         }
 
-        // Seed from compact descriptors
         for (size_t i = 0; i < n_neurons; ++i)
             I_ptr[i] = I_stim_cache[i] = stim.I_const[i];
-
         for (const auto& p : stim.pulses) {
-            if (t >= p.onset_step && t < p.end_step) {
+            if (t >= p.onset_step && t < p.end_step)
                 for (size_t i = p.neuron_start; i < p.neuron_end; ++i) {
-                    I_ptr[i]          += p.amplitude;
-                    I_stim_cache[i]   += p.amplitude;
+                    I_ptr[i] += p.amplitude;
+                    I_stim_cache[i] += p.amplitude;
                 }
-            }
         }
-
         for (const auto& d : stim.dbs) {
             if (d.isi_steps == 0) continue;
             size_t phase = t % d.isi_steps;
-            if (phase < d.pw_steps) {
+            if (phase < d.pw_steps)
                 for (size_t i = d.neuron_start; i < d.neuron_end; ++i) {
-                    I_ptr[i]         += d.amplitude;
-                    I_stim_cache[i]  += d.amplitude;
+                    I_ptr[i] += d.amplitude;
+                    I_stim_cache[i] += d.amplitude;
                 }
-            }
         }
 
-        if (use_cuda_synapses) {
-#ifdef HH_USE_CUDA
-            if (cudaMemcpy(d_I_syn_, I_ptr, n_neurons * sizeof(double),
-                           cudaMemcpyHostToDevice) != cudaSuccess) {
-                throw std::runtime_error("simulate_with_descriptors: cudaMemcpy I_ext H2D failed");
-            }
-
-            accumulate_cuda_synaptic_currents(
-                dev_syn_, d_V_cache_, d_I_syn_,
-                pool_mgr_.has_synapse_g_mods() ? d_synapse_g_scale_ : nullptr);
-            if (cudaDeviceSynchronize() != cudaSuccess)
-                throw std::runtime_error("simulate_with_descriptors: CUDA synaptic current kernel failed");
-
-            if (I_syn_buf && t % interval == 0) {
-                size_t tr = t / interval;
-                if (cudaMemcpy(I_ptr, d_I_syn_, n_neurons * sizeof(double),
-                               cudaMemcpyDeviceToHost) != cudaSuccess) {
-                    throw std::runtime_error("simulate_with_descriptors: cudaMemcpy I_syn D2H failed");
-                }
-                for (size_t i = 0; i < n_neurons; ++i)
-                    I_syn_buf[i * n_rec + tr] = I_ptr[i] - I_stim_cache[i];
-            }
-
-            pool_mgr_.gather_all_currents_device(d_I_syn_);
-            pool_mgr_.synchronize_cuda();
-            pool_mgr_.step_all(dt);
-
-            if (pool_mgr_.has_synapse_g_mods()) {
-                fill_device_buffer(d_synapse_g_scale_, 1.0, n_neurons);
-                pool_mgr_.scatter_synapse_g_scale_device(d_synapse_g_scale_);
-                pool_mgr_.synchronize_cuda();
-            }
-
-            pool_mgr_.scatter_all_voltages_device(d_V_cache_);
-            pool_mgr_.synchronize_cuda();
-
-            const size_t step = current_step_++;
-            update_cuda_synapses(dev_syn_, d_V_cache_, step);
-            if (cudaDeviceSynchronize() != cudaSuccess)
-                throw std::runtime_error("simulate_with_descriptors: CUDA synapse update kernel failed");
-
-            if (spike_event_buf) {
-                if (cudaMemcpy(spike_arrived_host.data(), dev_syn_.d_spike_arrived,
-                               S * sizeof(uint8_t),
-                               cudaMemcpyDeviceToHost) != cudaSuccess) {
-                    throw std::runtime_error("simulate_with_descriptors: cudaMemcpy spike_arrived D2H failed");
-                }
-                for (size_t j = 0; j < S; ++j)
-                    if (spike_arrived_host[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
-            }
-#endif
+        const double*   g          = sa_.g.data();
+        const float*    E_syn_data = sa_.E_syn.data();
+        const uint32_t* post       = post_decoded_.data();
+        const double*   V          = V_ptr;
+        double*         I_buf      = I_ptr;
+        if (pool_mgr_.has_synapse_g_mods()) {
+            const double* gscale = synapse_g_scale_.data();
+            for (size_t i : syn_groups_.active_g)
+                I_buf[post[i]] += g[i] * gscale[post[i]] * (E_syn_data[i] - V[post[i]]);
         } else {
-            const double*   g          = sa_.g.data();
-            const float*    E_syn_data = sa_.E_syn.data();  // float; promotes in arithmetic
-            const uint32_t* post       = post_decoded_.data();
-            const double*   V          = V_ptr;
-            double*         I_buf      = I_ptr;
-            if (pool_mgr_.has_synapse_g_mods()) {
-                const double* gscale = synapse_g_scale_.data();
-                for (size_t i : syn_groups_.active_g)
-                    I_buf[post[i]] += g[i] * gscale[post[i]] * (E_syn_data[i] - V[post[i]]);
-            } else {
-                for (size_t i : syn_groups_.active_g)
-                    I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
-            }
+            for (size_t i : syn_groups_.active_g)
+                I_buf[post[i]] += g[i] * (E_syn_data[i] - V[post[i]]);
+        }
 
-            if (I_syn_buf && t % interval == 0) {
-                size_t tr = t / interval;
-                for (size_t i = 0; i < n_neurons; ++i)
-                    I_syn_buf[i * n_rec + tr] = I_ptr[i] - I_stim_cache[i];
-            }
+        if (I_syn_buf && t % interval == 0) {
+            size_t tr = t / interval;
+            for (size_t i = 0; i < n_neurons; ++i)
+                I_syn_buf[i * n_rec + tr] = I_ptr[i] - I_stim_cache[i];
+        }
 
-            pool_mgr_.gather_all_currents(I_ptr);
-            pool_mgr_.step_all(dt);
-            if (pool_mgr_.has_synapse_g_mods()) {
-                std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
-                pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
-            }
-            pool_mgr_.scatter_all_voltages(V_ptr);
+        pool_mgr_.gather_all_currents(I_ptr);
+        pool_mgr_.step_all(dt);
+        if (pool_mgr_.has_synapse_g_mods()) {
+            std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);
+            pool_mgr_.scatter_synapse_g_scale(synapse_g_scale_.data());
+        }
+        pool_mgr_.scatter_all_voltages(V_ptr);
+#ifdef HH_USE_CUDA
+        if (pool_mgr_.on_cuda())
+            std::copy(V_ptr, V_ptr + n_neurons, V_cache_.data());
+#endif
+        update_synapses_grouped(dt);
 
-            update_synapses_grouped(dt);
-
-            if (spike_event_buf) {
-                for (size_t j = 0; j < S; ++j)
-                    if (spike_detected_[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
-            }
+        if (spike_event_buf) {
+            for (size_t j = 0; j < S; ++j)
+                if (spike_detected_[j]) syn_spike_accum[post_decoded_[j]] += 1.0;
         }
     }
 
-#ifdef HH_USE_CUDA
-    if (use_cuda_synapses)
-        sync_cuda_synapses_to_host(true);
-#endif
     pool_mgr_.sync_all_to_neurons(neurons_);
     if (pool_mgr_.has_synapse_g_mods()) {
         std::fill(synapse_g_scale_.begin(), synapse_g_scale_.end(), 1.0);

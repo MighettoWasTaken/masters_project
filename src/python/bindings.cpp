@@ -505,6 +505,7 @@ PYBIND11_MODULE(_core, m) {
                py::array_t<double> g_syn_buf,
                py::array_t<double> I_syn_buf,
                py::array_t<double> spike_event_buf,
+               py::array_t<uint8_t> spike_buf_uint8,
                size_t interval,
                double spike_threshold) {
                 StimPlan stim;
@@ -527,21 +528,22 @@ PYBIND11_MODULE(_core, m) {
                                    ? static_cast<size_t>(gate_buf.shape(1)) : 0;
                 net.simulate_with_descriptors(
                     dur, dt, stim,
-                    V_buf.size()           ? V_buf.mutable_data()           : nullptr,
-                    gate_buf.size()        ? gate_buf.mutable_data()        : nullptr, max_gates,
-                    calcium_buf.size()     ? calcium_buf.mutable_data()     : nullptr,
-                    u_buf.size()           ? u_buf.mutable_data()           : nullptr,
-                    g_syn_buf.size()       ? g_syn_buf.mutable_data()       : nullptr,
-                    I_syn_buf.size()       ? I_syn_buf.mutable_data()       : nullptr,
-                    spike_event_buf.size() ? spike_event_buf.mutable_data() : nullptr,
+                    V_buf.size()              ? V_buf.mutable_data()              : nullptr,
+                    gate_buf.size()           ? gate_buf.mutable_data()           : nullptr, max_gates,
+                    calcium_buf.size()        ? calcium_buf.mutable_data()        : nullptr,
+                    u_buf.size()              ? u_buf.mutable_data()              : nullptr,
+                    g_syn_buf.size()          ? g_syn_buf.mutable_data()          : nullptr,
+                    I_syn_buf.size()          ? I_syn_buf.mutable_data()          : nullptr,
+                    spike_event_buf.size()    ? spike_event_buf.mutable_data()    : nullptr,
+                    spike_buf_uint8.size()    ? spike_buf_uint8.mutable_data()    : nullptr,
                     interval, n_rec, spike_threshold);
             },
             py::arg("duration"), py::arg("dt"), py::arg("I_const"),
             py::arg("pulses"), py::arg("dbs_events"),
             py::arg("V_buf"), py::arg("gate_buf"), py::arg("calcium_buf"),
             py::arg("u_buf"), py::arg("g_syn_buf"), py::arg("I_syn_buf"),
-            py::arg("spike_event_buf"), py::arg("interval"),
-            py::arg("spike_threshold") = 0.0)
+            py::arg("spike_event_buf"), py::arg("spike_buf_uint8"),
+            py::arg("interval"), py::arg("spike_threshold") = 0.0)
 
         // Python special methods
         .def("__repr__", [](const Network& net) {

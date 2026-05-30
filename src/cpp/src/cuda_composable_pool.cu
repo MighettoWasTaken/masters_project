@@ -1,4 +1,5 @@
 #include "hodgkin_huxley/cuda_composable_pool.hpp"
+#include "hodgkin_huxley/cuda_sim_all.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -477,25 +478,22 @@ void CudaComposablePool::allocate_device() {
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_net_idx_), capacity_ * sizeof(size_t)),
                "CudaComposablePool cudaMalloc net_idx");
 
-    gate_device_ptrs_.assign(model_.gates.size(), nullptr);
-    for (auto& ptr : gate_device_ptrs_) alloc(ptr);
-    substance_device_ptrs_.assign(model_.intracellular.size(), nullptr);
-    nernst_device_ptrs_.assign(model_.intracellular.size(), nullptr);
-    for (auto& ptr : substance_device_ptrs_) alloc(ptr);
-    for (auto& ptr : nernst_device_ptrs_) alloc(ptr);
-
-    if (!gate_device_ptrs_.empty()) {
-        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_gate_ptrs_),
-                              gate_device_ptrs_.size() * sizeof(double*)),
-                   "CudaComposablePool cudaMalloc gate ptrs");
+    // Flat single-block allocations (stride = capacity_). One cudaMalloc each
+    // instead of one per gate/substance — eliminates the pointer table.
+    const size_t n_gates = model_.gates.size();
+    const size_t n_subst = model_.intracellular.size();
+    if (n_gates > 0) {
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_gate_state_),
+                              n_gates * capacity_ * sizeof(double)),
+                   "CudaComposablePool cudaMalloc gate_state");
     }
-    if (!substance_device_ptrs_.empty()) {
-        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_substance_ptrs_),
-                              substance_device_ptrs_.size() * sizeof(double*)),
-                   "CudaComposablePool cudaMalloc substance ptrs");
-        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_nernst_ptrs_),
-                              nernst_device_ptrs_.size() * sizeof(double*)),
-                   "CudaComposablePool cudaMalloc nernst ptrs");
+    if (n_subst > 0) {
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_substance_state_),
+                              n_subst * capacity_ * sizeof(double)),
+                   "CudaComposablePool cudaMalloc substance_state");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_nernst_state_),
+                              n_subst * capacity_ * sizeof(double)),
+                   "CudaComposablePool cudaMalloc nernst_state");
     }
 
     device_ready_ = true;
@@ -513,19 +511,9 @@ void CudaComposablePool::free_device() {
     if (d_net_idx_) cudaFree(d_net_idx_);
     d_net_idx_ = nullptr;
 
-    for (auto& ptr : gate_device_ptrs_) free_ptr(ptr);
-    for (auto& ptr : substance_device_ptrs_) free_ptr(ptr);
-    for (auto& ptr : nernst_device_ptrs_) free_ptr(ptr);
-    gate_device_ptrs_.clear();
-    substance_device_ptrs_.clear();
-    nernst_device_ptrs_.clear();
-
-    if (d_gate_ptrs_) cudaFree(d_gate_ptrs_);
-    if (d_substance_ptrs_) cudaFree(d_substance_ptrs_);
-    if (d_nernst_ptrs_) cudaFree(d_nernst_ptrs_);
-    d_gate_ptrs_ = nullptr;
-    d_substance_ptrs_ = nullptr;
-    d_nernst_ptrs_ = nullptr;
+    free_ptr(d_gate_state_);
+    free_ptr(d_substance_state_);
+    free_ptr(d_nernst_state_);
 
     if (d_gate_descs_) cudaFree(d_gate_descs_);
     if (d_channel_descs_) cudaFree(d_channel_descs_);
@@ -547,25 +535,6 @@ void CudaComposablePool::free_device() {
 
     device_ready_ = false;
     host_state_dirty_ = false;
-}
-
-void CudaComposablePool::upload_pointer_tables() {
-    if (!gate_device_ptrs_.empty()) {
-        check_cuda(cudaMemcpy(d_gate_ptrs_, gate_device_ptrs_.data(),
-                              gate_device_ptrs_.size() * sizeof(double*),
-                              cudaMemcpyHostToDevice),
-                   "CudaComposablePool upload gate ptrs");
-    }
-    if (!substance_device_ptrs_.empty()) {
-        check_cuda(cudaMemcpy(d_substance_ptrs_, substance_device_ptrs_.data(),
-                              substance_device_ptrs_.size() * sizeof(double*),
-                              cudaMemcpyHostToDevice),
-                   "CudaComposablePool upload substance ptrs");
-        check_cuda(cudaMemcpy(d_nernst_ptrs_, nernst_device_ptrs_.data(),
-                              nernst_device_ptrs_.size() * sizeof(double*),
-                              cudaMemcpyHostToDevice),
-                   "CudaComposablePool upload nernst ptrs");
-    }
 }
 
 void CudaComposablePool::upload_model_metadata() {
@@ -716,15 +685,15 @@ void CudaComposablePool::upload_state() {
                                cudaMemcpyHostToDevice, stream_),
                "CudaComposablePool upload V");
     for (size_t g = 0; g < gate_states_.size(); ++g) {
-        check_cuda(cudaMemcpyAsync(gate_device_ptrs_[g], gate_states_[g].data(),
+        check_cuda(cudaMemcpyAsync(d_gate_state_ + g * capacity_, gate_states_[g].data(),
                                    N_ * sizeof(double), cudaMemcpyHostToDevice, stream_),
                    "CudaComposablePool upload gates");
     }
     for (size_t s = 0; s < X_.size(); ++s) {
-        check_cuda(cudaMemcpyAsync(substance_device_ptrs_[s], X_[s].data(),
+        check_cuda(cudaMemcpyAsync(d_substance_state_ + s * capacity_, X_[s].data(),
                                    N_ * sizeof(double), cudaMemcpyHostToDevice, stream_),
                    "CudaComposablePool upload substances");
-        check_cuda(cudaMemcpyAsync(nernst_device_ptrs_[s], E_nernst_[s].data(),
+        check_cuda(cudaMemcpyAsync(d_nernst_state_ + s * capacity_, E_nernst_[s].data(),
                                    N_ * sizeof(double), cudaMemcpyHostToDevice, stream_),
                    "CudaComposablePool upload nernst");
     }
@@ -781,7 +750,6 @@ void CudaComposablePool::download_state() const {
 
 void CudaComposablePool::ensure_device_state() {
     allocate_device();
-    upload_pointer_tables();
     upload_model_metadata();
     upload_state();
     upload_currents();
@@ -879,6 +847,61 @@ void CudaComposablePool::scatter_synapse_g_scale_device(double* d_buf) const {
     scatter_by_index_kernel<<<grid, block, 0, stream_>>>(d_net_idx_, d_synapse_g_scale_, d_buf,
                                                           static_cast<int>(N_));
     check_cuda(cudaGetLastError(), "CudaComposablePool scatter synapse_g_scale device");
+}
+
+void CudaComposablePool::fill_coop_desc(CudaComposableDesc& out) const {
+    if (!device_ready_) const_cast<CudaComposablePool*>(this)->ensure_device_state();
+
+    int n_gate_refs = 0;
+    for (const auto& ch : model_.channels)
+        n_gate_refs += static_cast<int>(ch.gates.size());
+
+    int n_mods = 0;
+    for (const auto& s : model_.intracellular)
+        n_mods += static_cast<int>(s.modulations.size());
+
+    out.d_V                    = d_V_;
+    out.d_I_ext                = d_I_ext_;
+    out.d_synapse_g_scale      = d_synapse_g_scale_;
+    out.d_gate_ptrs            = d_gate_ptrs_;
+    out.d_substance_ptrs       = d_substance_ptrs_;
+    out.d_nernst_ptrs          = d_nernst_ptrs_;
+    out.d_gate_descs           = d_gate_descs_;
+    out.d_channel_descs        = d_channel_descs_;
+    out.d_channel_gate_refs    = d_channel_gate_refs_;
+    out.d_intr_descs           = d_intr_descs_;
+    out.d_intr_source_channels = d_intr_source_channels_;
+    out.d_mod_descs            = d_mod_descs_;
+    out.d_vm_programs          = d_vm_programs_;
+    out.d_net_idx              = d_net_idx_;
+    out.n                      = static_cast<int>(N_);
+    out.n_gates                = static_cast<int>(model_.gates.size());
+    out.n_channels             = static_cast<int>(model_.channels.size());
+    out.n_intracellulars       = static_cast<int>(model_.intracellular.size());
+    out.n_gate_refs            = n_gate_refs;
+    out.n_mods                 = n_mods;
+    out.C_m                    = model_.C_m;
+    // Gate-major fast path is valid only for pure pattern-matched models:
+    // no VM programs (custom expressions) and no modulations.
+    out.fast_path              = (!needs_vm_programs() && n_mods == 0) ? 1 : 0;
+}
+
+bool CudaComposablePool::needs_vm_programs() const {
+    for (const auto& g : model_.gates) {
+        if (!g.inf_vm.empty() || !g.tau_vm.empty() ||
+            !g.alpha_vm.empty() || !g.beta_vm.empty() || !g.dxdt_vm.empty())
+            return true;
+    }
+    for (const auto& c : model_.channels) {
+        if (!c.gate_product_vm.empty()) return true;
+    }
+    for (const auto& s : model_.intracellular) {
+        if (!s.nernst_vm.empty() || !s.ode_vm.empty()) return true;
+        for (const auto& m : s.modulations) {
+            if (!m.mod_vm.empty()) return true;
+        }
+    }
+    return false;
 }
 
 void CudaComposablePool::synchronize() {

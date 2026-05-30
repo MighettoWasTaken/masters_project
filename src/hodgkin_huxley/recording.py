@@ -355,7 +355,8 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
                    I_ext_list, config: RecordingConfig,
                    pop_info: dict | None = None,
                    detection_threshold: float | None = None,
-                   stim_plan: "_StimPlan | None" = None) -> MetricsResult:
+                   stim_plan: "_StimPlan | None" = None,
+                   on_cuda: bool = False) -> MetricsResult:
     """
     Allocate output buffers, run simulation, build MetricsResult.
 
@@ -393,13 +394,29 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
     need_I_syn   = "I_syn"        in metrics
     need_sevents = "spike_events" in metrics
 
+    # When only spike-derived metrics are needed (not the V trace itself and not
+    # mean_V which requires the trace), use a compact uint8 spike buffer instead of
+    # a full float64 V trace.  Only applies on the descriptor path with synapses
+    # (the GPU cooperative kernel uses syn.d_V_prev / d_neuron_spiked for detection).
+    _spike_only_metrics = metrics - RecordingConfig.DERIVED_FROM_V - {"spike_count_per_synapse"}
+    need_spike_compact = (
+        need_V and
+        "V" not in metrics and
+        "mean_V" not in metrics and
+        stim_plan is not None and
+        on_cuda and
+        n_synapses > 0 and
+        not _spike_only_metrics
+    )
+
     max_gates = network_core.max_gate_count() if need_gates else 0
 
     # Allocate buffers (empty array for skipped metrics)
-    def alloc(shape):
-        return np.zeros(shape, dtype=np.float64) if shape else np.empty(0, dtype=np.float64)
+    def alloc(shape, dtype=np.float64):
+        return np.zeros(shape, dtype=dtype) if shape else np.empty(0, dtype=dtype)
 
-    V_buf            = alloc((n_neurons, n_rec)            if need_V       else ())
+    V_buf            = alloc((n_neurons, n_rec) if (need_V and not need_spike_compact) else ())
+    spike_compact_buf= alloc((n_neurons, n_rec), dtype=np.uint8) if need_spike_compact else np.empty(0, dtype=np.uint8)
     gate_buf         = alloc((n_neurons, max_gates, n_rec) if need_gates   else ())
     calcium_buf      = alloc((n_neurons, n_rec)            if need_calcium else ())
     u_buf            = alloc((n_neurons, n_rec)            if need_u       else ())
@@ -414,7 +431,7 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
             duration, dt, stim_plan.I_const,
             stim_plan.pulses, stim_plan.dbs,
             V_buf, gate_buf, calcium_buf, u_buf, g_syn_buf, I_syn_buf,
-            spike_event_buf, interval, det_thresh)
+            spike_event_buf, spike_compact_buf, interval, det_thresh)
     else:
         network_core._simulate_into_buffers(
             duration, dt, I_ext_list,
@@ -438,8 +455,14 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
     derived_requested = metrics & (RecordingConfig.DERIVED_FROM_V |
                                    {"spike_count_per_synapse"})
     if derived_requested:
-        V_sel = V_buf[selected]
-        spikes = _detect_spikes(V_sel, interval * dt, config.spike_threshold)
+        if need_spike_compact:
+            # Compact path: spike_compact_buf is uint8 (1 = spike occurred at that recording step)
+            spike_compact_sel = spike_compact_buf[selected]
+            spikes = [np.where(spike_compact_sel[i] > 0)[0].astype(np.float64) * (interval * dt)
+                      for i in range(len(selected))]
+        else:
+            V_sel = V_buf[selected]
+            spikes = _detect_spikes(V_sel, interval * dt, config.spike_threshold)
 
         if "spikes"      in metrics: data["spikes"]      = spikes
         if "spike_count" in metrics: data["spike_count"] = np.array([len(s) for s in spikes])
@@ -451,9 +474,12 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
 
         if "spike_count_per_synapse" in metrics:
             pre_idx = np.array(network_core.get_synapse_pre_indices(), dtype=np.int64)
-            # Need spike counts for ALL neurons
-            all_spikes = _detect_spikes(V_buf, interval * dt, config.spike_threshold)
-            all_sc = np.array([len(s) for s in all_spikes])
+            if need_spike_compact:
+                all_sc = np.array([int(np.count_nonzero(spike_compact_buf[i]))
+                                   for i in range(n_neurons)])
+            else:
+                all_spikes = _detect_spikes(V_buf, interval * dt, config.spike_threshold)
+                all_sc = np.array([len(s) for s in all_spikes])
             data["spike_count_per_synapse"] = all_sc[pre_idx]
 
     gate_names = _extract_gate_names(network_core, selected) if need_gates else None

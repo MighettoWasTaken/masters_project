@@ -324,6 +324,24 @@ void CudaHHPool::gather_currents_device(const double* d_I_buf) {
     check_cuda(cudaGetLastError(), "CudaHHPool gather_by_index_kernel");
 }
 
+void CudaHHPool::fill_coop_desc(CudaHHDesc& out) const {
+    if (!device_ready_) const_cast<CudaHHPool*>(this)->ensure_device_state();
+    out.d_V      = d_V_;
+    out.d_m      = d_m_;
+    out.d_h      = d_h_;
+    out.d_n      = d_n_;
+    out.d_I_ext  = d_I_ext_;
+    out.d_C_m    = d_C_m_;
+    out.d_g_Na   = d_g_Na_;
+    out.d_g_K    = d_g_K_;
+    out.d_g_L    = d_g_L_;
+    out.d_E_Na   = d_E_Na_;
+    out.d_E_K    = d_E_K_;
+    out.d_E_L    = d_E_L_;
+    out.d_net_idx = d_net_idx_;
+    out.n        = static_cast<int>(N_);
+}
+
 void CudaHHPool::sync_to_neurons(std::vector<std::unique_ptr<NeuronBase>>& neurons) const {
     ensure_host_state();
     HHPool::sync_to_neurons(neurons);
