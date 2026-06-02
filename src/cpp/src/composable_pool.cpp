@@ -105,8 +105,19 @@ void ComposablePool::finalize() {
     }
 
     // Per-channel current cache: only needed when substances reference source channels.
-    if (has_intracellular_)
+    if (has_intracellular_) {
         I_channel_.assign(nc, Eigen::ArrayXd::Zero(N_));
+        // Unique set of channels that feed any substance's I_source. Their
+        // currents are recomputed at the post-V-update voltage each step.
+        std::vector<char> seen(nc, 0);
+        ca_source_channels_.clear();
+        for (const auto& ic : model_.intracellular)
+            for (int ch_idx : ic.source_channels)
+                if (ch_idx >= 0 && ch_idx < static_cast<int>(nc) && !seen[ch_idx]) {
+                    seen[ch_idx] = 1;
+                    ca_source_channels_.push_back(ch_idx);
+                }
+    }
 
     ch_E_rev_.resize(nc);
     for (size_t ci = 0; ci < nc; ++ci)
@@ -200,6 +211,57 @@ void ComposablePool::update_substances(double dt, Eigen::ArrayXd* fexp) {
                                 / (ic.nernst_z * ic.nernst_F)
                                 * (ic.nernst_Ca_o / tmp2_).log();
             }
+        }
+    }
+}
+
+void ComposablePool::recompute_source_channel_currents(Eigen::ArrayXd* fexp) {
+    // Recompute I_channel_ for calcium-source channels at the CURRENT V_ (called
+    // after the voltage update). Mirrors the per-channel computation in step()'s
+    // main channel loop exactly, but evaluates the driving force (V_ - E_rev) at
+    // the post-update voltage. Only source channels are touched — they are the
+    // only ones update_substances() reads.
+    const size_t ng = model_.gates.size();
+    for (int ci : ca_source_channels_) {
+        const auto& ch = model_.channels[ci];
+
+        Eigen::ArrayXd gate_prod;
+        if (!ch.gate_product_vm.empty()) {
+            gate_prod = hodgkin_huxley::vm_eval_gate_product_vec(
+                ch.gate_product_vm, V_, gate_states_, fexp);
+        } else {
+            gate_prod = Eigen::ArrayXd::Ones(N_);
+            for (const auto& gp : ch.gates) {
+                int idx = gp.first, power = gp.second;
+                if (idx >= 0 && idx < static_cast<int>(ng)) {
+                    for (int p = 0; p < power; ++p)
+                        gate_prod *= gate_states_[idx];
+                }
+            }
+        }
+
+        const Eigen::ArrayXd& E_rev =
+            (has_any_mods_ && mod_ch_E_ovr_[ci].size()) ? mod_ch_E_ovr_[ci]
+            : (ch.nernst_substance_idx >= 0
+               && ch.nernst_substance_idx < static_cast<int>(E_nernst_.size()))
+                ? E_nernst_[ch.nernst_substance_idx]
+                : ch_E_rev_[ci];
+
+        Eigen::ArrayXd& I_ci = I_channel_[ci];
+        if (ch.is_ahp) {
+            int aidx = ch.ahp_substance_idx;
+            const Eigen::ArrayXd& X_ahp = (aidx >= 0 && aidx < static_cast<int>(X_.size()))
+                ? X_[aidx] : (tmp2_.setZero(), tmp2_);
+            Eigen::ArrayXd ca_factor = X_ahp / (X_ahp + ch.ahp_k1).max(1e-10);
+            if (has_any_mods_)
+                I_ci = ch.g * mod_ch_g_[ci] * ca_factor * (V_ - E_rev);
+            else
+                I_ci = ch.g * ca_factor * (V_ - E_rev);
+        } else {
+            if (has_any_mods_)
+                I_ci = ch.g * mod_ch_g_[ci] * gate_prod * (V_ - E_rev);
+            else
+                I_ci = ch.g * gate_prod * (V_ - E_rev);
         }
     }
 }
@@ -505,6 +567,13 @@ void ComposablePool::step(double dt) {
     // =========================================================================
     // 4. Update intracellular substances (uses post-voltage-update gate/channel state)
     // =========================================================================
+    // Recompute calcium source-channel currents at the post-update V so the
+    // substance ODE's I_source uses the new voltage's driving force. The main
+    // loop above cached I_channel_ at the PRE-update V (needed for the V step);
+    // reusing that stale cache here shifts Ca2+-dependent dynamics (STN drift).
+    if (has_intracellular_)
+        recompute_source_channel_currents(fexp);
+
     update_substances(dt, fexp);
 
     // synapse_g_scale_ is already populated from apply_modulations (step 0),

@@ -1,0 +1,49 @@
+================================================================================================
+QUANTITATIVE COMPARISON - MATLAB reference vs Library model
+(25 healthy / 39 PD trials;  d = Library - MATLAB,  rel = d / MATLAB mean)
+================================================================================================
+
+Per-trial population-mean firing rate (Hz)
+------------------------------------------------------------------------------------------------
+Metric        Cond       MAT mean     MAT [min,max]  LIB mean     LIB [min,max]   d(L-M)     rel
+TH            Healthy       27.47       [25.8,29.4]     27.37       [25.1,29.2]    -0.10   -0.4%
+TH            PD            18.44       [16.4,20.4]     18.74       [17.6,20.1]    +0.30   +1.6%
+STN           Healthy        8.22        [6.3,12.7]      9.62        [7.8,16.1]    +1.40  +17.0%
+STN           PD            17.83       [15.8,23.0]     18.58       [15.6,23.5]    +0.74   +4.2%
+GPe           Healthy       42.10       [39.6,45.1]     41.64       [38.3,44.2]    -0.47   -1.1%
+GPe           PD            25.34       [23.4,28.1]     25.38       [23.0,28.9]    +0.04   +0.2%
+GPi           Healthy       23.05       [19.8,26.6]     23.37       [19.9,27.7]    +0.32   +1.4%
+GPi           PD            40.57       [36.5,43.9]     40.14       [36.9,42.5]    -0.43   -1.0%
+Str_D2        Healthy        0.00         [0.0,0.0]      0.04         [0.0,0.1]    +0.04   +nan%
+Str_D2        PD             4.15         [3.8,4.5]      4.37         [4.0,4.8]    +0.22   +5.3%
+Str_D1        Healthy        0.00         [0.0,0.0]      0.04         [0.0,0.1]    +0.04   +nan%
+Str_D1        PD             0.00         [0.0,0.0]      0.06         [0.0,0.1]    +0.06   +nan%
+CTX_e         Healthy        3.24         [2.5,4.2]      3.24         [2.6,4.0]    -0.00   -0.1%
+CTX_e         PD             4.35         [3.9,4.8]      4.42         [4.0,4.8]    +0.06   +1.5%
+CTX_i         Healthy        2.34         [1.4,3.7]      2.33         [1.2,4.7]    -0.01   -0.4%
+CTX_i         PD             3.99         [2.2,5.2]      4.15         [2.6,6.5]    +0.16   +4.0%
+
+GPi beta-band power (7-35 Hz, a.u.)
+------------------------------------------------------------------------------------------------
+Metric        Cond       MAT mean     MAT [min,max]  LIB mean     LIB [min,max]   d(L-M)     rel
+GPi beta-pow  Healthy       408.5         [275,491]     368.8         [262,517]    -39.7   -9.7%
+GPi beta-pow  PD            635.0         [577,698]     642.3         [584,683]     +7.4   +1.2%
+
+Per-trial agreement: MATLAB vs Library  (paired by trial configuration)
+  CCC = Lin's concordance (1 = perfect); r = Pearson, pooled over all trials.
+  Wilcoxon p = systematic bias of paired (Library - MATLAB); high p = no bias.
+------------------------------------------------------------------------------------------------
+Metric            n   Pearson r   Lin CCC  Wilcoxon p (Healthy)   Wilcoxon p (PD)
+TH               64       0.963     0.962                 0.968             0.104
+STN              64       0.887     0.868                 0.003             0.094
+GPe              64       0.971     0.970                 0.467             0.913
+GPi              64       0.959     0.958                 0.634             0.290
+Str_D2           64       0.996     0.992                <0.001            <0.001
+Str_D1           64         nan     0.000                <0.001            <0.001
+CTX_e            64       0.803     0.801                 0.831             0.159
+CTX_i            64       0.507     0.497                 0.677             0.759
+GPi beta-pow     64       0.878     0.861                 0.052             0.162
+
+Library simulation runtime (s per trial)
+------------------------------------------------------------------------------------------------
+  mean=1.73s   span=[1.27, 2.31]s   range=1.04s   total=110.9s   n=64

@@ -750,18 +750,35 @@ def _structural_rate_linear_over_expm1(expr, V_sym):
     return None
 
 
-def try_pattern_match(expr, dep_sym=None):
+def try_pattern_match(expr, dep_sym=None, kind=None):
     """
-    Attempt to match ``expr`` against all known standard forms.
+    Attempt to match ``expr`` against known standard forms.
 
     Returns a tuple ``(params, form_enum)`` where ``params`` is a
     BoltzmannParams | TauParams | RateFuncParams instance, or ``(None, None)``
     if no pattern matches.
 
+    ``kind`` optionally restricts which catalogs are tried so the result type is
+    valid for the slot the expression is destined for. It defaults to ``None``
+    (try everything, legacy behaviour — nothing older breaks):
+      - ``None``   : Boltzmann, then Tau, then RateFunc (original order).
+      - ``"inf"``  : steady-state activation  -> Boltzmann only.
+      - ``"tau"``  : time constant            -> Tau forms only.
+      - ``"rate"`` : alpha/beta rate function -> RateFunc forms only.
+
+    The ``"rate"`` kind exists because a unit-amplitude sigmoid ``1/(1+exp(..))``
+    is structurally BOTH a Boltzmann and the SIGMOID rate form; under ``None`` the
+    Boltzmann match wins (it is tried first), which is wrong for an alpha/beta
+    slot (e.g. the standard HH ``beta_h``). Boltzmann is just the A=1 special
+    case of SIGMOID, so a rate slot should resolve it as SIGMOID.
+
     Uses structural coefficient extraction via sympy.Poly rather than Wild-based
     pattern matching, so it correctly handles expressions with Python float
     constants (which SymPy eagerly evaluates, changing structural form).
     """
+    do_boltz = kind in (None, "inf")
+    do_tau   = kind in (None, "tau")
+    do_rate  = kind in (None, "rate")
     from hodgkin_huxley._core import (
         BoltzmannParams as _BoltzmannParams,
         TauParams as _TauParams,
@@ -782,7 +799,7 @@ def try_pattern_match(expr, dep_sym=None):
     # ------------------------------------------------------------------
     # 1. Boltzmann: 1 / (1 + exp(a*V + b))
     # ------------------------------------------------------------------
-    bm = _structural_boltzmann(norm, V_sym)
+    bm = _structural_boltzmann(norm, V_sym) if do_boltz else None
     if bm is not None:
         v_half, k = bm
         bp = _BoltzmannParams()
@@ -793,7 +810,7 @@ def try_pattern_match(expr, dep_sym=None):
     # ------------------------------------------------------------------
     # 2. TauParams — CONSTANT
     # ------------------------------------------------------------------
-    if _is_number(norm):
+    if do_tau and _is_number(norm):
         tp = _TauParams()
         tp.form = TauForm.CONSTANT
         tp.set_param(0, float(norm))
@@ -802,7 +819,7 @@ def try_pattern_match(expr, dep_sym=None):
     # ------------------------------------------------------------------
     # 3. TauParams — BOLTZMANN: base + amp / (1 + exp(linear))
     # ------------------------------------------------------------------
-    tb = _structural_tau_boltzmann(norm, V_sym)
+    tb = _structural_tau_boltzmann(norm, V_sym) if do_tau else None
     if tb is not None:
         base, amp, v_half, k = tb
         tp = _TauParams()
@@ -814,7 +831,7 @@ def try_pattern_match(expr, dep_sym=None):
     # ------------------------------------------------------------------
     # 3.5. TauParams — DOUBLE_EXP_SUM: base + amp/(exp((V+v1)/s1)+exp(-(V+v2)/s2))
     # ------------------------------------------------------------------
-    des = _structural_tau_double_exp_sum(norm, V_sym)
+    des = _structural_tau_double_exp_sum(norm, V_sym) if do_tau else None
     if des is not None:
         base, amp, v1, s1, v2, s2 = des
         tp = _TauParams()
@@ -828,7 +845,7 @@ def try_pattern_match(expr, dep_sym=None):
     # ------------------------------------------------------------------
     # 4. RateFuncParams — LINEAR_OVER_EXP: A*(V+B)/(exp((V+B)/C)-1)
     # ------------------------------------------------------------------
-    loe = _structural_rate_linear_over_exp(norm, V_sym)
+    loe = _structural_rate_linear_over_exp(norm, V_sym) if do_rate else None
     if loe is not None:
         A, B, C = loe
         rp = _RateFuncParams()
@@ -839,7 +856,7 @@ def try_pattern_match(expr, dep_sym=None):
     # ------------------------------------------------------------------
     # 5. RateFuncParams — EXP_DECAY: A*exp((V+B)/C)
     # ------------------------------------------------------------------
-    ed = _structural_rate_exp_decay(norm, V_sym)
+    ed = _structural_rate_exp_decay(norm, V_sym) if do_rate else None
     if ed is not None:
         A, B, C = ed
         rp = _RateFuncParams()
@@ -850,7 +867,7 @@ def try_pattern_match(expr, dep_sym=None):
     # ------------------------------------------------------------------
     # 6. RateFuncParams — LINEAR_OVER_EXPM1: A*(V+B)/(1-exp(-(V+B)/C))
     # ------------------------------------------------------------------
-    loem1 = _structural_rate_linear_over_expm1(norm, V_sym)
+    loem1 = _structural_rate_linear_over_expm1(norm, V_sym) if do_rate else None
     if loem1 is not None:
         A, B, C = loem1
         rp = _RateFuncParams()
@@ -861,7 +878,7 @@ def try_pattern_match(expr, dep_sym=None):
     # ------------------------------------------------------------------
     # 7. RateFuncParams — SIGMOID: A/(1+exp((V+B)/C))
     # ------------------------------------------------------------------
-    sg = _structural_rate_sigmoid(norm, V_sym)
+    sg = _structural_rate_sigmoid(norm, V_sym) if do_rate else None
     if sg is not None:
         A, B, C = sg
         rp = _RateFuncParams()
@@ -873,11 +890,11 @@ def try_pattern_match(expr, dep_sym=None):
     # 8. TauParams — COMPOUND_AB: 1/(alpha + beta) where each is a rate form
     # ------------------------------------------------------------------
     try:
-        recip = sympy.simplify(1 / norm)
-        if recip.is_Add and len(recip.args) == 2:
+        recip = sympy.simplify(1 / norm) if do_tau else None
+        if recip is not None and recip.is_Add and len(recip.args) == 2:
             a_expr, b_expr = recip.args
-            r_a = try_pattern_match(a_expr, dep_sym)
-            r_b = try_pattern_match(b_expr, dep_sym)
+            r_a = try_pattern_match(a_expr, dep_sym, kind="rate")
+            r_b = try_pattern_match(b_expr, dep_sym, kind="rate")
             if (r_a[0] is not None and isinstance(r_a[0], _RateFuncParams) and
                     r_b[0] is not None and isinstance(r_b[0], _RateFuncParams)):
                 tp = _TauParams()

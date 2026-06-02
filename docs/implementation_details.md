@@ -560,6 +560,8 @@ struct Device {
 
 `Network::to(device)` moves all pool state to the target device. For multi-GPU simulation (task19), `RegionalNetwork::assign(population, device)` maps individual populations to devices; the `SpikeTransport` abstraction (task16) handles inter-device spike delivery without changing the delay-decomposition algorithm.
 
+> **GPU execution is implemented.** The on-device cooperative kernel, composable-model specialization (flat state, per-bucket unrolled kernels), and the model-layout fusion are documented in **[cuda_simulation.md](cuda_simulation.md)** — read that before touching `src/cpp/src/cuda_sim_all.cu` or the CUDA pools.
+
 ---
 
 ## Data Flow: Simulation

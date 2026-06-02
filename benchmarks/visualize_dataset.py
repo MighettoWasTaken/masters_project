@@ -31,6 +31,11 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 
+try:
+    from scipy import stats as _sps
+except ImportError:
+    _sps = None
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
@@ -105,9 +110,10 @@ def collect_all(mat_paths: list[str], seed_offset: int,
         rates, beta_power, _, _, _ = run_library(
             mat["tmax"], mat["n"], mat["pd"], seed
         )
-        print(f"{timer() - t0:.1f}s", flush=True)
+        t_run = timer() - t0
+        print(f"{t_run:.1f}s", flush=True)
         lib_results.append({"rates": rates, "beta_power": beta_power,
-                             "pd": mat["pd"]})
+                             "pd": mat["pd"], "runtime": t_run})
 
     print(f"\nAll {total} simulations complete in "
           f"{timer() - t_total:.0f}s.", flush=True)
@@ -289,6 +295,165 @@ def plot_beta_power(mat_con, lib_con, mat_pd, lib_pd, out_path: str,
 
 
 # ---------------------------------------------------------------------------
+# Quantitative report — accompanies the plots
+# ---------------------------------------------------------------------------
+
+def _stats(vals):
+    """(mean, min, max) of a 1-D sequence."""
+    a = np.asarray(vals, dtype=float)
+    return float(a.mean()), float(a.min()), float(a.max())
+
+
+def _lin_ccc(x, y) -> float:
+    """Lin's concordance correlation coefficient (1 = perfect agreement)."""
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if len(x) < 2:
+        return float("nan")
+    mx, my = x.mean(), y.mean()
+    vx, vy = x.var(), y.var()
+    cov = ((x - mx) * (y - my)).mean()
+    den = vx + vy + (mx - my) ** 2
+    return float(2.0 * cov / den) if den > 0 else float("nan")
+
+
+def _pearson(x, y) -> float:
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    if len(x) < 2 or x.std() == 0 or y.std() == 0:
+        return float("nan")
+    if _sps is not None:
+        try:
+            return float(_sps.pearsonr(x, y)[0])
+        except Exception:
+            pass
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _wilcoxon_p(lib_vals, mat_vals) -> float:
+    """Paired Wilcoxon signed-rank p on (Library - MATLAB); high p = no bias."""
+    if _sps is None:
+        return float("nan")
+    d = np.asarray(lib_vals, dtype=float) - np.asarray(mat_vals, dtype=float)
+    if len(d) < 1 or np.all(d == 0):
+        return float("nan")
+    try:
+        return float(_sps.wilcoxon(d).pvalue)
+    except Exception:
+        return float("nan")
+
+
+def _fmt_p(p: float) -> str:
+    if not np.isfinite(p):
+        return "n/a"
+    return "<0.001" if p < 0.001 else f"{p:.3f}"
+
+
+def comparison_report(mat_con, lib_con, mat_pd, lib_pd, out_path: str) -> None:
+    """
+    Quantify the MATLAB-vs-Library agreement that the box plots show visually:
+    for every plotted metric (per-population firing rate and GPi β-band power),
+    by condition, report each side's mean and [min, max] span, the delta
+    (Library − MATLAB) of the means, and that delta as a percent of the MATLAB
+    mean. Also summarizes the library simulation runtimes. Prints and saves.
+    """
+    lines: list[str] = []
+    def w(s: str = "") -> None: lines.append(s)
+
+    n_con, n_pd = len(mat_con), len(mat_pd)
+    w("=" * 96)
+    w("QUANTITATIVE COMPARISON - MATLAB reference vs Library model")
+    w(f"({n_con} healthy / {n_pd} PD trials;  d = Library - MATLAB,  rel = d / MATLAB mean)")
+    w("=" * 96)
+
+    hdr = (f"{'Metric':<14}{'Cond':<9}{'MAT mean':>10}{'MAT [min,max]':>18}"
+           f"{'LIB mean':>10}{'LIB [min,max]':>18}{'d(L-M)':>9}{'rel':>8}")
+
+    # Per-population firing rates (per-trial population mean, Hz) — matches the plot.
+    w("")
+    w("Per-trial population-mean firing rate (Hz)")
+    w("-" * 96)
+    w(hdr)
+    for pop in POPS:
+        for label, mres, lres in [("Healthy", mat_con, lib_con), ("PD", mat_pd, lib_pd)]:
+            if not mres:
+                continue
+            mm, mlo, mhi = _stats([d["rates"][pop].mean() for d in mres])
+            lm, llo, lhi = _stats([d["rates"][pop].mean() for d in lres])
+            delta = lm - mm
+            rel = (delta / mm * 100.0) if mm != 0 else float("nan")
+            w(f"{pop:<14}{label:<9}"
+              f"{mm:>10.2f}{('[%.1f,%.1f]' % (mlo, mhi)):>18}"
+              f"{lm:>10.2f}{('[%.1f,%.1f]' % (llo, lhi)):>18}"
+              f"{delta:>+9.2f}{rel:>+7.1f}%")
+
+    # GPi beta-band power.
+    w("")
+    w("GPi beta-band power (7-35 Hz, a.u.)")
+    w("-" * 96)
+    w(hdr)
+    for label, mres, lres in [("Healthy", mat_con, lib_con), ("PD", mat_pd, lib_pd)]:
+        if not mres:
+            continue
+        mm, mlo, mhi = _stats([d["beta_power"] for d in mres])
+        lm, llo, lhi = _stats([d["beta_power"] for d in lres])
+        delta = lm - mm
+        rel = (delta / mm * 100.0) if mm != 0 else float("nan")
+        w(f"{'GPi beta-pow':<14}{label:<9}"
+          f"{mm:>10.1f}{('[%.0f,%.0f]' % (mlo, mhi)):>18}"
+          f"{lm:>10.1f}{('[%.0f,%.0f]' % (llo, lhi)):>18}"
+          f"{delta:>+9.1f}{rel:>+7.1f}%")
+
+    # Per-trial agreement (paired by trial configuration). Library and MATLAB
+    # trials share the same (n, pd, tmax) configuration but use different random
+    # realizations, so within-condition scatter partly reflects intrinsic trial
+    # variability, not model error. CCC / r are pooled across all trials (so the
+    # healthy→PD range provides spread); the Wilcoxon test detects systematic
+    # bias of the matched (Library − MATLAB) pairs within each condition.
+    w("")
+    w("Per-trial agreement: MATLAB vs Library  (paired by trial configuration)")
+    w("  CCC = Lin's concordance (1 = perfect); r = Pearson, pooled over all trials.")
+    w("  Wilcoxon p = systematic bias of paired (Library - MATLAB); high p = no bias.")
+    w("-" * 96)
+    w(f"{'Metric':<14}{'n':>5}{'Pearson r':>12}{'Lin CCC':>10}"
+      f"{'Wilcoxon p (Healthy)':>22}{'Wilcoxon p (PD)':>18}")
+
+    mat_all = mat_con + mat_pd
+    lib_all = lib_con + lib_pd
+    metrics = [(p, (lambda d, _p=p: float(d["rates"][_p].mean()))) for p in POPS]
+    metrics.append(("GPi beta-pow", lambda d: float(d["beta_power"])))
+    for label, fn in metrics:
+        x = [fn(d) for d in mat_all]
+        y = [fn(d) for d in lib_all]
+        r = _pearson(x, y)
+        ccc = _lin_ccc(x, y)
+        p_con = _wilcoxon_p([fn(d) for d in lib_con], [fn(d) for d in mat_con])
+        p_pd = _wilcoxon_p([fn(d) for d in lib_pd], [fn(d) for d in mat_pd])
+        w(f"{label:<14}{len(x):>5}{r:>12.3f}{ccc:>10.3f}"
+          f"{_fmt_p(p_con):>22}{_fmt_p(p_pd):>18}")
+    if _sps is None:
+        w("  (SciPy not installed — Pearson via numpy; Wilcoxon unavailable.)")
+
+    # Library simulation runtimes.
+    rt = [d["runtime"] for d in (lib_con + lib_pd) if d.get("runtime") is not None]
+    w("")
+    w("Library simulation runtime (s per trial)")
+    w("-" * 96)
+    if rt:
+        a = np.asarray(rt, dtype=float)
+        w(f"  mean={a.mean():.2f}s   span=[{a.min():.2f}, {a.max():.2f}]s   "
+          f"range={a.max() - a.min():.2f}s   total={a.sum():.1f}s   n={len(a)}")
+    else:
+        w("  (unavailable — cached results predate runtime capture; re-run with --no-cache)")
+    w("")
+
+    text = "\n".join(lines)
+    print(text)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    print(f"Saved: {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -331,5 +496,9 @@ if __name__ == "__main__":
         mat_con, lib_con, mat_pd, lib_pd,
         out_path=os.path.join(FIG_DIR, "beta_power.png"),
         dpi=args.dpi,
+    )
+    comparison_report(
+        mat_con, lib_con, mat_pd, lib_pd,
+        out_path=os.path.join(FIG_DIR, "comparison_report.txt"),
     )
     print("\nDone.")

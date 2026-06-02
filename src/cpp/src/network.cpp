@@ -401,10 +401,34 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
         throw std::out_of_range("Neuron index out of range");
     }
 
-    // Dedup spec by name; populate spec cache for new entries
+    // Dedup spec by kinetic content; populate spec cache for new entries.
+    // NOTE: must compare the fields that drive synapse_spec_caches_ / spec_descs,
+    // NOT just the name — many distinct kinetics share a name (e.g. every
+    // SynapseModel.double_exponential(...) is named "double_exponential" but may
+    // have different tau_rise/tau_decay/E_syn). Deduping by name alone collapses
+    // them onto the first spec's kinetics (caused the STN firing-rate drift).
+    auto dedup_equal = [](const SynapseSpec& a, const SynapseSpec& b) {
+        using UF = SynapseSpec::UpdateForm;
+        if (a.update_form != b.update_form || a.current_form != b.current_form)
+            return false;
+        // Param-struct / VM forms (s_inf, tau, alpha, beta, *_vm) are not compared
+        // here — treat them as always-distinct to avoid a false merge.
+        if (a.update_form == UF::BOLTZMANN_GATE || a.update_form == UF::ALPHA_BETA
+            || a.update_form == UF::CUSTOM_EXPR)
+            return false;
+        return a.g == b.g && a.E_syn == b.E_syn && a.power == b.power
+            && a.S_init == b.S_init && a.A_init == b.A_init
+            && a.delta_S == b.delta_S && a.delta_A == b.delta_A
+            && a.tau_S == b.tau_S && a.tau_A == b.tau_A
+            && a.norm_factor == b.norm_factor
+            && a.tanh_amp == b.tanh_amp && a.tanh_vh == b.tanh_vh
+            && a.tanh_k == b.tanh_k && a.tau_decay == b.tau_decay
+            && a.mg_conc == b.mg_conc && a.mg_scale == b.mg_scale
+            && a.mg_denom == b.mg_denom;
+    };
     size_t sidx = synapse_specs_.size();
     for (size_t i = 0; i < synapse_specs_.size(); ++i) {
-        if (synapse_specs_[i].name == spec.name) { sidx = i; break; }
+        if (dedup_equal(synapse_specs_[i], spec)) { sidx = i; break; }
     }
     if (sidx == synapse_specs_.size()) {
         synapse_specs_.push_back(spec);

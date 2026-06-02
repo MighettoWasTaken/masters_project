@@ -344,13 +344,14 @@ __global__ void composable_step_kernel(
         gate_vals[g] = clamp01(gate_vals[g]);
     }
 
-    double I_total = 0.0;
-    for (int c = 0; c < n_channels; ++c) {
+    // Channel ionic current at an arbitrary voltage vv (gate/substance state is
+    // fixed for this step; only the V-dependent driving force changes).
+    auto chan_current = [&](int c, double vv) -> double {
         const auto& ch = channel_descs[c];
         double gate_prod = 1.0;
         if (ch.gate_product_vm_idx >= 0) {
             gate_prod = hodgkin_huxley::eval_vm_program(vm_programs[ch.gate_product_vm_idx],
-                                                        v, 0.0, 0.0,
+                                                        vv, 0.0, 0.0,
                                                         gate_vals, n_gates,
                                                         x_vals, n_substances);
         } else {
@@ -369,21 +370,31 @@ __global__ void composable_step_kernel(
                    ? e_nernst[ch.nernst_substance_idx]
                    : ch.E_rev);
 
-        double I_ci = 0.0;
         if (ch.is_ahp) {
             const double x_ahp = (ch.ahp_substance_idx >= 0 && ch.ahp_substance_idx < n_substances)
                 ? x_vals[ch.ahp_substance_idx]
                 : 0.0;
             const double ca_factor = x_ahp / fmax(x_ahp + ch.ahp_k1, 1e-10);
-            I_ci = ch.g * mod_ch_g[c] * ca_factor * (v - E_rev);
-        } else {
-            I_ci = ch.g * mod_ch_g[c] * gate_prod * (v - E_rev);
+            return ch.g * mod_ch_g[c] * ca_factor * (vv - E_rev);
         }
+        return ch.g * mod_ch_g[c] * gate_prod * (vv - E_rev);
+    };
+
+    double I_total = 0.0;
+    for (int c = 0; c < n_channels; ++c) {
+        const double I_ci = chan_current(c, v);
         channel_currents[c] = I_ci;
         I_total += I_ci;
     }
 
     v += dt * (-I_total + current) / C_m;
+
+    // Recompute source-channel currents at the post-update voltage so the Ca2+
+    // driving force uses the new V (matches the reference model); reusing the
+    // pre-update current drifts Ca2+-dependent cells such as the STN.
+    if (n_substances > 0)
+        for (int c = 0; c < n_channels; ++c)
+            channel_currents[c] = chan_current(c, v);
 
     for (int s = 0; s < n_substances; ++s) {
         const auto& intr = intr_descs[s];

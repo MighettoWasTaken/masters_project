@@ -166,9 +166,13 @@ class RateFunc:
 # =============================================================================
 
 
-def _normalize_gate_input(raw):
+def _normalize_gate_input(raw, kind=None):
     """
     Normalize a gate parameter input to (params, expr) tuple.
+
+    ``kind`` ("inf" | "tau" | "rate" | None) is forwarded to
+    ``try_pattern_match`` so a raw SymPy expression is matched against the form
+    catalog appropriate for its slot. Defaults to None (legacy: try all forms).
 
     Returns
     -------
@@ -192,7 +196,7 @@ def _normalize_gate_input(raw):
     if isinstance(raw, _sympy.Basic):
         # Use Ca as the matching symbol when the expression depends on Ca (not V)
         dep_sym = Ca if (Ca in raw.free_symbols and V not in raw.free_symbols) else V
-        params, _ = try_pattern_match(raw, dep_sym=dep_sym)
+        params, _ = try_pattern_match(raw, dep_sym=dep_sym, kind=kind)
         return params, raw  # params may be None if no match
     return raw, None
 
@@ -280,10 +284,10 @@ def GateSpec(  # noqa: N802  (intentional CapWords to match C++ type / old API)
     beta  = None if beta  is _GATE_SPEC_UNSET else beta
 
     # Normalize all inputs
-    inf_p, inf_e    = _normalize_gate_input(inf)
-    tau_p, tau_e    = _normalize_gate_input(tau)
-    alpha_p, alpha_e = _normalize_gate_input(alpha)
-    beta_p, beta_e  = _normalize_gate_input(beta)
+    inf_p, inf_e    = _normalize_gate_input(inf, kind="inf")
+    tau_p, tau_e    = _normalize_gate_input(tau, kind="tau")
+    alpha_p, alpha_e = _normalize_gate_input(alpha, kind="rate")
+    beta_p, beta_e  = _normalize_gate_input(beta, kind="rate")
 
     needs_vm = (
         (inf_e is not None and inf_p is None)
@@ -460,10 +464,10 @@ class NeuronModel:
             return len(self._spec.gates) - 1
 
         # Normalize all inputs to (struct_or_None, sympy_expr_or_None)
-        inf_p, inf_e    = _normalize_gate_input(inf)
-        tau_p, tau_e    = _normalize_gate_input(tau)
-        alpha_p, alpha_e = _normalize_gate_input(alpha)
-        beta_p, beta_e  = _normalize_gate_input(beta)
+        inf_p, inf_e    = _normalize_gate_input(inf, kind="inf")
+        tau_p, tau_e    = _normalize_gate_input(tau, kind="tau")
+        alpha_p, alpha_e = _normalize_gate_input(alpha, kind="rate")
+        beta_p, beta_e  = _normalize_gate_input(beta, kind="rate")
 
         needs_vm = (
             expr is not None
@@ -895,8 +899,8 @@ class SynapseModel:
         s.name = name
         s.update_form = _SynapseUpdateForm.ALPHA_BETA
         s.current_form = _SynapseCurrentForm.LINEAR
-        alpha_p, _ = _normalize_gate_input(alpha)
-        beta_p, _  = _normalize_gate_input(beta)
+        alpha_p, _ = _normalize_gate_input(alpha, kind="rate")
+        beta_p, _  = _normalize_gate_input(beta, kind="rate")
         s.alpha = alpha_p
         s.beta = beta_p
         s.g = g
@@ -1012,8 +1016,8 @@ class KineticSynapseModel:
     ) -> "KineticSynapseModel":
         """Set ALPHA_BETA gating. Accepts TaggedExpr or raw _RateFuncParams."""
         self._spec.update_form = _SynapseUpdateForm.ALPHA_BETA
-        alpha_p, _ = _normalize_gate_input(alpha)
-        beta_p, _  = _normalize_gate_input(beta)
+        alpha_p, _ = _normalize_gate_input(alpha, kind="rate")
+        beta_p, _  = _normalize_gate_input(beta, kind="rate")
         self._spec.alpha = alpha_p  # type: ignore[assignment]
         self._spec.beta = beta_p  # type: ignore[assignment]
         return self

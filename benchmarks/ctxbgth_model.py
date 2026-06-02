@@ -469,7 +469,7 @@ def build_network(n: int = 10, pd: int = 0, seed: int = 42) -> RegionalNetwork:
         delay=5.0,
     )
 
-    # ---- GPe → STN  (shift=0 and shift=1, delay=4ms) ----------------------
+    # ---- GPe →  (shift=0 and shift=1, delay=4ms) ----------------------
     net.connect(
         "GPe", "STN", "one_to_one",
         weight=0.5 * gpeak1,
@@ -685,10 +685,10 @@ def simulate_ctxbgth(
     """
     net = build_network(n=n, pd=pd, seed=seed)
 
-    net.to(Device.cuda(0))
+    #net.to(Device.cuda(0))
     POPULATIONS = ["TH", "STN", "GPe", "GPi", "Str_D2", "Str_D1", "CTX_e", "CTX_i"]
-    #groups = {f"g{i}": [name] for i, name in enumerate(POPULATIONS)}
-    #net.set_thread_groups(groups)   # Phase 2: one thread per population
+    groups = {f"g{i}": [name] for i, name in enumerate(POPULATIONS)}
+    net.set_thread_groups(groups)   # Phase 2: one thread per population
 
     # ---- External currents -------------------------------------------------
     I_ext: dict = {

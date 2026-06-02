@@ -171,7 +171,6 @@ __device__ void composable_step_unrolled(
     double gate_vals[NG];
     double x_vals[NS > 0 ? NS : 1];
     double e_nernst[NS > 0 ? NS : 1];
-    double channel_currents[NC];
 
     #pragma unroll
     for (int g = 0; g < NG; ++g)
@@ -231,7 +230,6 @@ __device__ void composable_step_unrolled(
         const double I_ci = ch.is_ahp
             ? ch.g * (x_vals[ch.ahp_substance_idx] / fmax(x_vals[ch.ahp_substance_idx] + ch.ahp_k1, 1e-10)) * (v - E_rev)
             : ch.g * gate_prod * (v - E_rev);
-        channel_currents[c] = I_ci;
         I_total += I_ci;
     }
 
@@ -245,10 +243,25 @@ __device__ void composable_step_unrolled(
         if (intr.update_form == 0) {            // DECAY
             dX = -intr.k_decay * x_vals[s];
         } else {                                // DRIVEN_DECAY (_NERNST)
+            // Recompute source-channel currents at the post-update voltage so
+            // the Ca2+ driving force uses the new V (matches the reference
+            // model); reusing the pre-update current drifts Ca2+-dependent cells.
             double I_src = 0.0;
             for (int sc = 0; sc < intr.source_count; ++sc) {
                 const int ci = p.d_intr_source_channels[intr.source_start + sc];
-                if (ci >= 0 && ci < NC) I_src += channel_currents[ci];
+                if (ci < 0 || ci >= NC) continue;
+                const auto& ch = p.d_channel_descs[ci];
+                double gate_prod = 1.0;
+                for (int gi = 0; gi < ch.gate_ref_count; ++gi) {
+                    const auto& ref = p.d_channel_gate_refs[ch.gate_ref_start + gi];
+                    if (ref.gate_idx >= 0 && ref.gate_idx < NG)
+                        for (int pp = 0; pp < ref.power; ++pp) gate_prod *= gate_vals[ref.gate_idx];
+                }
+                const double E_rev = (ch.nernst_substance_idx >= 0 && ch.nernst_substance_idx < NS)
+                    ? e_nernst[ch.nernst_substance_idx] : ch.E_rev;
+                I_src += ch.is_ahp
+                    ? ch.g * (x_vals[ch.ahp_substance_idx] / fmax(x_vals[ch.ahp_substance_idx] + ch.ahp_k1, 1e-10)) * (v - E_rev)
+                    : ch.g * gate_prod * (v - E_rev);
             }
             dX = intr.epsilon * (-I_src - intr.k_decay * x_vals[s]);
         }

@@ -107,6 +107,12 @@ protected:
     // Per-channel currents cached during channel loop, reused by update_substances
     std::vector<Eigen::ArrayXd> I_channel_;      // nc × N_
 
+    // Unique channel indices referenced as I_source by any intracellular spec.
+    // Their currents are recomputed at the post-voltage-update V before the
+    // substance ODE, so the Ca2+ driving force uses the new V (matches the
+    // reference model); reusing the pre-update cache drifts Ca2+-dependent cells.
+    std::vector<int> ca_source_channels_;
+
     bool has_intracellular_  = false; // any IntracellularSpec present
     bool has_any_mods_       = false; // any substance has modulations
     bool has_synapse_g_mods_ = false; // any substance has SYNAPSE_G modulation
@@ -114,6 +120,9 @@ protected:
     // Helpers for substance dynamics
     void update_substances(double dt, Eigen::ArrayXd* fexp);
     void apply_modulations(Eigen::ArrayXd* fexp);
+    // Recompute I_channel_ for ca_source_channels_ at the current V_ (called
+    // after the voltage update, before update_substances).
+    void recompute_source_channel_currents(Eigen::ArrayXd* fexp);
 };
 
 } // namespace hodgkin_huxley
