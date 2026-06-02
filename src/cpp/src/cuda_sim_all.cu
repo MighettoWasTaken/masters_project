@@ -150,223 +150,140 @@ __device__ inline double sa_clamp01(double x) {
     return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
 }
 
-// Templated on max gate/channel/substance counts. Sizing scratch arrays from
-// template constants (instead of kMax*) lets the compiler keep them in
-// registers for small models, eliminating local-memory spills. The actual
-// loop bounds (p.n_gates etc.) still come from the descriptor at runtime —
-// the template just gives the compiler an upper bound to allocate against.
+// Lean, fully-specialized composable step (Stage 2). Templated on the EXACT
+// gate/channel/substance counts so loops are compile-time-bounded and unrolled,
+// and the per-thread scratch arrays are exactly sized. Handles only the
+// pattern-matched standard forms with NO modulations and NO VM programs — the
+// mod_* scratch arrays and the entire eval_vm_program path are gone, which is
+// what raises occupancy enough to hide the fp64 transcendental latency.
+// Dispatched per pool by composable_step_dispatch(); pools with modulations or
+// VM programs are routed away from the cooperative kernel entirely.
 template <int NG, int NC, int NS>
-__device__ void composable_step_single_T(
+__device__ void composable_step_unrolled(
     hodgkin_huxley::CudaComposableDesc p, int i, double I_in, double dt)
 {
     using namespace hodgkin_huxley;
+    const int stride = p.state_stride;
 
     double v = p.d_V[i];
-    double current = p.d_I_ext[i] + I_in;
+    const double current = p.d_I_ext[i] + I_in;
 
     double gate_vals[NG];
-    double x_vals[NS];
-    double e_nernst[NS];
+    double x_vals[NS > 0 ? NS : 1];
+    double e_nernst[NS > 0 ? NS : 1];
     double channel_currents[NC];
-    double mod_ch_g[NC];
-    double mod_ch_E[NC];
-    int    has_mod_ch_E[NC];
-    double mod_gate_shift[NG];
-    double mod_gate_scale[NG];
-    double mod_gate_tau[NG];
-    double mod_gate_expr[NG];
-    int    has_mod_gate_expr[NG];
 
-    for (int g = 0; g < p.n_gates; ++g) {
-        gate_vals[g] = p.d_gate_ptrs[g][i];
-        mod_gate_shift[g] = 0.0; mod_gate_scale[g] = 1.0;
-        mod_gate_tau[g] = 1.0;   mod_gate_expr[g] = 0.0;
-        has_mod_gate_expr[g] = 0;
-    }
-    for (int s = 0; s < p.n_intracellulars; ++s) {
-        x_vals[s]  = p.d_substance_ptrs[s][i];
-        e_nernst[s] = p.d_nernst_ptrs[s][i];
-    }
-    for (int c = 0; c < p.n_channels; ++c) {
-        channel_currents[c] = 0.0;
-        mod_ch_g[c] = 1.0; mod_ch_E[c] = 0.0; has_mod_ch_E[c] = 0;
-    }
-    double syn_g_scale = 1.0;
-
-    // Modulations
-    for (int s = 0; s < p.n_intracellulars; ++s) {
-        const auto& intr = p.d_intr_descs[s];
-        for (int m = 0; m < intr.mod_count; ++m) {
-            const auto& mod = p.d_mod_descs[intr.mod_start + m];
-            const int sidx = mod.substance_idx;
-            const double xmod = (sidx >= 0 && sidx < p.n_intracellulars) ? x_vals[sidx] : 0.0;
-            switch (mod.target) {
-                case 0: // CHANNEL_G
-                    if (mod.target_idx >= 0 && mod.target_idx < p.n_channels) {
-                        const double val = (mod.vm_idx >= 0)
-                            ? eval_vm_program(p.d_vm_programs[mod.vm_idx],xmod,xmod,0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars)
-                            : mod.shift_scale;
-                        mod_ch_g[mod.target_idx] *= val;
-                    }
-                    break;
-                case 1: // CHANNEL_EREV
-                    if (mod.target_idx >= 0 && mod.target_idx < p.n_channels && mod.vm_idx >= 0) {
-                        mod_ch_E[mod.target_idx] = eval_vm_program(p.d_vm_programs[mod.vm_idx],xmod,xmod,0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
-                        has_mod_ch_E[mod.target_idx] = 1;
-                    }
-                    break;
-                case 2: // GATE_INF_SHIFT
-                    if (mod.target_idx >= 0 && mod.target_idx < p.n_gates)
-                        mod_gate_shift[mod.target_idx] += (mod.vm_idx >= 0)
-                            ? eval_vm_program(p.d_vm_programs[mod.vm_idx],xmod,xmod,0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars)
-                            : (mod.shift_scale * xmod);
-                    break;
-                case 3: // GATE_INF_SCALE
-                    if (mod.target_idx >= 0 && mod.target_idx < p.n_gates && mod.vm_idx >= 0)
-                        mod_gate_scale[mod.target_idx] *= eval_vm_program(p.d_vm_programs[mod.vm_idx],xmod,xmod,0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
-                    break;
-                case 4: // GATE_TAU_SCALE
-                    if (mod.target_idx >= 0 && mod.target_idx < p.n_gates && mod.vm_idx >= 0)
-                        mod_gate_tau[mod.target_idx] *= eval_vm_program(p.d_vm_programs[mod.vm_idx],xmod,xmod,0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
-                    break;
-                case 5: // GATE_INF_EXPR
-                    if (mod.target_idx >= 0 && mod.target_idx < p.n_gates && mod.vm_idx >= 0) {
-                        mod_gate_expr[mod.target_idx] = eval_vm_program(p.d_vm_programs[mod.vm_idx],v,xmod,0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
-                        has_mod_gate_expr[mod.target_idx] = 1;
-                    }
-                    break;
-                case 6: // SYNAPSE_G
-                    if (mod.vm_idx >= 0)
-                        syn_g_scale *= eval_vm_program(p.d_vm_programs[mod.vm_idx],xmod,xmod,0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
-                    break;
-            }
-        }
+    #pragma unroll
+    for (int g = 0; g < NG; ++g)
+        gate_vals[g] = p.d_gate_state[g * stride + i];
+    #pragma unroll
+    for (int s = 0; s < NS; ++s) {
+        x_vals[s]   = p.d_substance_state[s * stride + i];
+        e_nernst[s] = p.d_nernst_state[s * stride + i];
     }
 
-    // Gate update
-    for (int g = 0; g < p.n_gates; ++g) {
+    // Gate update — standard forms only.
+    #pragma unroll
+    for (int g = 0; g < NG; ++g) {
         const auto& desc = p.d_gate_descs[g];
-        const double dep_base = (desc.dependency == 1 && desc.intracellular_idx >= 0 && desc.intracellular_idx < p.n_intracellulars)
+        const double dep = (desc.dependency == 1 && desc.intracellular_idx >= 0
+                            && desc.intracellular_idx < NS)
             ? x_vals[desc.intracellular_idx] : v;
-        const double dep = dep_base + mod_gate_shift[g];
         switch (desc.update_form) {
             case 0: { // INF_TAU
-                double xi = sa_boltz(dep, desc.inf) * mod_gate_scale[g];
-                if (has_mod_gate_expr[g]) xi = mod_gate_expr[g];
-                double tau = fmax(sa_tau(v, desc.tau) * mod_gate_tau[g], 1e-10);
-                gate_vals[g] = xi + (gate_vals[g]-xi)*exp(-dt*desc.scale/tau);
+                const double xi  = sa_boltz(dep, desc.inf);
+                const double tau = fmax(sa_tau(v, desc.tau), 1e-10);
+                gate_vals[g] = xi + (gate_vals[g] - xi) * exp(-dt * desc.scale / tau);
                 break;
             }
-            case 1: { // ALPHA_BETA
+            case 1: { // ALPHA_BETA  (tau = 1/(al+be) → exp(-dt*(al+be)))
                 const double al = sa_rate(v, desc.alpha), be = sa_rate(v, desc.beta);
-                const double rt = fmax(al+be,1e-10);
-                double xi = al/rt * mod_gate_scale[g];
-                if (has_mod_gate_expr[g]) xi = mod_gate_expr[g];
-                double tau = fmax((1.0/rt)*mod_gate_tau[g],1e-10);
-                gate_vals[g] = xi + (gate_vals[g]-xi)*exp(-dt/tau);
+                const double rt = fmax(al + be, 1e-10);
+                const double xi = al / rt;
+                gate_vals[g] = xi + (gate_vals[g] - xi) * exp(-dt * rt);
                 break;
             }
-            case 2: { // INSTANT
-                double xi = sa_boltz(dep, desc.inf)*mod_gate_scale[g];
-                gate_vals[g] = has_mod_gate_expr[g] ? mod_gate_expr[g] : xi;
+            case 2: // INSTANT
+                gate_vals[g] = sa_boltz(dep, desc.inf);
                 break;
-            }
-            case 3: { // DERIVED
-                if (desc.derived_source_gate >= 0 && desc.derived_source_gate < p.n_gates)
-                    gate_vals[g] = desc.derived_a*(desc.derived_b + desc.derived_c*gate_vals[desc.derived_source_gate]);
+            case 3: // DERIVED
+                if (desc.derived_source_gate >= 0 && desc.derived_source_gate < NG)
+                    gate_vals[g] = desc.derived_a * (desc.derived_b
+                        + desc.derived_c * gate_vals[desc.derived_source_gate]);
                 break;
-            }
-            case 4: { // CUSTOM_EXPR (VM)
-                if (desc.dxdt_vm_idx >= 0) {
-                    double dxdt = eval_vm_program(p.d_vm_programs[desc.dxdt_vm_idx],dep,gate_vals[g],0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
-                    gate_vals[g] += dt*desc.scale*dxdt;
-                } else if (desc.inf_vm_idx >= 0 && desc.tau_vm_idx >= 0) {
-                    double xi = eval_vm_program(p.d_vm_programs[desc.inf_vm_idx],dep,gate_vals[g],0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars)*mod_gate_scale[g];
-                    if (has_mod_gate_expr[g]) xi = mod_gate_expr[g];
-                    double tau = fmax(eval_vm_program(p.d_vm_programs[desc.tau_vm_idx],v,gate_vals[g],0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars)*mod_gate_tau[g],1e-10);
-                    gate_vals[g] = xi+(gate_vals[g]-xi)*exp(-dt*desc.scale/tau);
-                } else if (desc.alpha_vm_idx >= 0 && desc.beta_vm_idx >= 0) {
-                    double al = eval_vm_program(p.d_vm_programs[desc.alpha_vm_idx],v,gate_vals[g],0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
-                    double be = eval_vm_program(p.d_vm_programs[desc.beta_vm_idx],v,gate_vals[g],0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
-                    double rt = fmax(al+be,1e-10);
-                    double xi = al/rt*mod_gate_scale[g];
-                    if (has_mod_gate_expr[g]) xi = mod_gate_expr[g];
-                    double tau = fmax((1.0/rt)*mod_gate_tau[g],1e-10);
-                    gate_vals[g] = xi+(gate_vals[g]-xi)*exp(-dt/tau);
-                } else if (desc.inf_vm_idx >= 0) {
-                    double xi = eval_vm_program(p.d_vm_programs[desc.inf_vm_idx],dep,gate_vals[g],0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars)*mod_gate_scale[g];
-                    gate_vals[g] = has_mod_gate_expr[g] ? mod_gate_expr[g] : xi;
-                }
-                break;
-            }
         }
         gate_vals[g] = sa_clamp01(gate_vals[g]);
     }
 
-    // Channel currents
+    // Channel currents.
     double I_total = 0.0;
-    for (int c = 0; c < p.n_channels; ++c) {
+    #pragma unroll
+    for (int c = 0; c < NC; ++c) {
         const auto& ch = p.d_channel_descs[c];
         double gate_prod = 1.0;
-        if (ch.gate_product_vm_idx >= 0) {
-            gate_prod = eval_vm_program(p.d_vm_programs[ch.gate_product_vm_idx],v,0.0,0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
-        } else {
-            for (int gi = 0; gi < ch.gate_ref_count; ++gi) {
-                const auto& ref = p.d_channel_gate_refs[ch.gate_ref_start + gi];
-                if (ref.gate_idx >= 0 && ref.gate_idx < p.n_gates)
-                    for (int pp = 0; pp < ref.power; ++pp)
-                        gate_prod *= gate_vals[ref.gate_idx];
-            }
+        for (int gi = 0; gi < ch.gate_ref_count; ++gi) {
+            const auto& ref = p.d_channel_gate_refs[ch.gate_ref_start + gi];
+            if (ref.gate_idx >= 0 && ref.gate_idx < NG)
+                for (int pp = 0; pp < ref.power; ++pp) gate_prod *= gate_vals[ref.gate_idx];
         }
-        const double E_rev = has_mod_ch_E[c] ? mod_ch_E[c]
-            : ((ch.nernst_substance_idx >= 0 && ch.nernst_substance_idx < p.n_intracellulars)
-               ? e_nernst[ch.nernst_substance_idx] : ch.E_rev);
-        double I_ci = ch.is_ahp
-            ? ch.g * mod_ch_g[c] * (x_vals[ch.ahp_substance_idx] / fmax(x_vals[ch.ahp_substance_idx]+ch.ahp_k1,1e-10)) * (v-E_rev)
-            : ch.g * mod_ch_g[c] * gate_prod * (v-E_rev);
+        const double E_rev = (ch.nernst_substance_idx >= 0 && ch.nernst_substance_idx < NS)
+            ? e_nernst[ch.nernst_substance_idx] : ch.E_rev;
+        const double I_ci = ch.is_ahp
+            ? ch.g * (x_vals[ch.ahp_substance_idx] / fmax(x_vals[ch.ahp_substance_idx] + ch.ahp_k1, 1e-10)) * (v - E_rev)
+            : ch.g * gate_prod * (v - E_rev);
         channel_currents[c] = I_ci;
         I_total += I_ci;
     }
 
     v += dt * (-I_total + current) / p.C_m;
 
-    // Intracellular substances
-    for (int s = 0; s < p.n_intracellulars; ++s) {
+    // Intracellular substances — DECAY / DRIVEN_DECAY(_NERNST) standard forms.
+    #pragma unroll
+    for (int s = 0; s < NS; ++s) {
         const auto& intr = p.d_intr_descs[s];
-        double dX = 0.0;
-        if (intr.update_form == 0) {
+        double dX;
+        if (intr.update_form == 0) {            // DECAY
             dX = -intr.k_decay * x_vals[s];
-        } else if (intr.update_form == 1 || intr.update_form == 2) {
+        } else {                                // DRIVEN_DECAY (_NERNST)
             double I_src = 0.0;
             for (int sc = 0; sc < intr.source_count; ++sc) {
-                int ci = p.d_intr_source_channels[intr.source_start + sc];
-                if (ci >= 0 && ci < p.n_channels) I_src += channel_currents[ci];
+                const int ci = p.d_intr_source_channels[intr.source_start + sc];
+                if (ci >= 0 && ci < NC) I_src += channel_currents[ci];
             }
             dX = intr.epsilon * (-I_src - intr.k_decay * x_vals[s]);
-        } else if (intr.update_form == 3 && intr.ode_vm_idx >= 0) {
-            double I_src = 0.0;
-            for (int sc = 0; sc < intr.source_count; ++sc) {
-                int ci = p.d_intr_source_channels[intr.source_start + sc];
-                if (ci >= 0 && ci < p.n_channels) I_src += channel_currents[ci];
-            }
-            dX = eval_vm_program(p.d_vm_programs[intr.ode_vm_idx],I_src,x_vals[s],0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars);
         }
-        x_vals[s] = fmax(0.0, x_vals[s] + dt*dX);
-        if (intr.nernst_enabled) {
-            e_nernst[s] = (intr.nernst_vm_idx >= 0)
-                ? eval_vm_program(p.d_vm_programs[intr.nernst_vm_idx],x_vals[s],x_vals[s],0.0,gate_vals,p.n_gates,x_vals,p.n_intracellulars)
-                : (intr.nernst_R*intr.nernst_T)/(intr.nernst_z*intr.nernst_F)*log(intr.nernst_Ca_o/fmax(x_vals[s],1e-10));
-        }
+        x_vals[s] = fmax(0.0, x_vals[s] + dt * dX);
+        if (intr.nernst_enabled)
+            e_nernst[s] = (intr.nernst_R * intr.nernst_T) / (intr.nernst_z * intr.nernst_F)
+                * log(intr.nernst_Ca_o / fmax(x_vals[s], 1e-10));
     }
 
-    // Write back
+    // Write back.
     p.d_V[i] = v;
-    p.d_synapse_g_scale[i] = syn_g_scale;
-    for (int g = 0; g < p.n_gates; ++g) p.d_gate_ptrs[g][i] = gate_vals[g];
-    for (int s = 0; s < p.n_intracellulars; ++s) {
-        p.d_substance_ptrs[s][i] = x_vals[s];
-        p.d_nernst_ptrs[s][i]    = e_nernst[s];
+    p.d_synapse_g_scale[i] = 1.0;
+    #pragma unroll
+    for (int g = 0; g < NG; ++g) p.d_gate_state[g * stride + i] = gate_vals[g];
+    #pragma unroll
+    for (int s = 0; s < NS; ++s) {
+        p.d_substance_state[s * stride + i] = x_vals[s];
+        p.d_nernst_state[s * stride + i]    = e_nernst[s];
     }
+}
+
+// Per-pool dispatch on the exact structural signature. The bucket list MUST
+// stay in sync with is_known_composable_bucket() on the host — the cooperative
+// kernel is only launched when every composable pool matches a bucket here, so
+// the default is unreachable in practice.
+__device__ inline void composable_step_dispatch(
+    const hodgkin_huxley::CudaComposableDesc& cd, int i, double I_in, double dt)
+{
+    const int g = cd.n_gates, c = cd.n_channels, s = cd.n_intracellulars;
+    if (g == 3  && c == 3 && s == 0) { composable_step_unrolled<3, 3, 0>(cd, i, I_in, dt);  return; }
+    if (g == 4  && c == 4 && s == 0) { composable_step_unrolled<4, 4, 0>(cd, i, I_in, dt);  return; }
+    if (g == 5  && c == 4 && s == 0) { composable_step_unrolled<5, 4, 0>(cd, i, I_in, dt);  return; }
+    if (g == 6  && c == 6 && s == 1) { composable_step_unrolled<6, 6, 1>(cd, i, I_in, dt);  return; }
+    if (g == 11 && c == 7 && s == 1) { composable_step_unrolled<11, 7, 1>(cd, i, I_in, dt); return; }
+    // Unreachable: routing guarantees only known buckets reach this kernel.
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +387,7 @@ __device__ inline void sync_step(cg::grid_group& grid) {
 // barrier count is 4 per step (down from 7). With delay=0 it's 5.
 // ---------------------------------------------------------------------------
 
-template <bool MultiBlock, int NG, int NC, int NS>
+template <bool MultiBlock>
 __device__ void simulate_all_kernel_impl(
     hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,
     hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,
@@ -590,7 +507,7 @@ __device__ void simulate_all_kernel_impl(
             for (int i = tid; i < cd.n; i += total) {
                 const size_t nidx = cd.d_net_idx[i];
                 const double I = d_I_syn[nidx];
-                composable_step_single_T<NG, NC, NS>(cd, i, I, dt);
+                composable_step_dispatch(cd, i, I, dt);
                 const double v_new = cd.d_V[i];
                 d_V_cache[nidx] = v_new;
                 if (syn.n_synapses > 0 || record_spikes) {
@@ -625,7 +542,6 @@ __device__ void simulate_all_kernel_impl(
     }
 }
 
-template <int NG, int NC, int NS>
 __global__ void simulate_all_kernel_multi(
     hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,
     hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,
@@ -643,13 +559,12 @@ __global__ void simulate_all_kernel_multi(
     int       record_interval,
     int       n_rec)
 {
-    simulate_all_kernel_impl<true, NG, NC, NS>(
+    simulate_all_kernel_impl<true>(
         hh_descs, n_hh, iz_descs, n_iz, comp_descs, n_comp,
         syn, stim, d_V_cache, d_I_syn, d_V_out, d_spike_buf,
         n_neurons, num_steps, dt, step_start, record_interval, n_rec);
 }
 
-template <int NG, int NC, int NS>
 __global__ void simulate_all_kernel_single(
     hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,
     hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,
@@ -667,7 +582,7 @@ __global__ void simulate_all_kernel_single(
     int       record_interval,
     int       n_rec)
 {
-    simulate_all_kernel_impl<false, NG, NC, NS>(
+    simulate_all_kernel_impl<false>(
         hh_descs, n_hh, iz_descs, n_iz, comp_descs, n_comp,
         syn, stim, d_V_cache, d_I_syn, d_V_out, d_spike_buf,
         n_neurons, num_steps, dt, step_start, record_interval, n_rec);
@@ -789,46 +704,26 @@ void simulate_all_steps(
     //   Light HH/Iz kernel (~1 µs/neuron): multi-block SM parallelism wins above
     //   ~256 work items because compute cost shrinks faster than barrier cost.
     // Single-block (no grid.sync, ~10ns __syncthreads) wins only when the
-    // network is too small to usefully fill multiple SMs. Above ~1024 work
+    // network is too small to usefully fill multiple SMs. Above ~256 work
     // items, multi-block's extra SMs outweigh the grid.sync cost — especially
     // for fp64-transcendental-heavy composable models, which are throughput-
     // bound on a single SM (consumer GPUs run fp64 at ~1/64 fp32 rate).
     constexpr int kBlockSize           = 256;
-    const int single_block_max_work    = 1024;
+    const int single_block_max_work    = 256;
     int work_items = static_cast<int>(n_neurons);
     if (syn.n_synapses > work_items) work_items = syn.n_synapses;
     if (stim.n_neurons > work_items) work_items = stim.n_neurons;
     if (work_items < 1) work_items = 1;
-    const bool use_single_block = (work_items <= single_block_max_work);
+    const bool use_single_block = False;
 
     int    i_n_neurons   = static_cast<int>(n_neurons);
     size_t sz_num_steps  = num_steps;
     int    i_rec_iv      = static_cast<int>(record_interval);
     int    i_n_rec       = static_cast<int>(n_rec);
 
-    // Scan composable descriptors for max actual sizes — picks the smallest
-    // template variant that covers all pools, minimizing scratch-array size
-    // and register pressure inside composable_step_single_T.
-    int max_ng = 0, max_nc = 0, max_ns = 0;
-    for (int p = 0; p < n_comp; ++p) {
-        if (comp_descs_h[p].n_gates           > max_ng) max_ng = comp_descs_h[p].n_gates;
-        if (comp_descs_h[p].n_channels        > max_nc) max_nc = comp_descs_h[p].n_channels;
-        if (comp_descs_h[p].n_intracellulars  > max_ns) max_ns = comp_descs_h[p].n_intracellulars;
-    }
-
     int sb_threads = ((work_items + 31) / 32) * 32;
     if (sb_threads < 32)         sb_threads = 32;
     if (sb_threads > kBlockSize) sb_threads = kBlockSize;
-
-    int sm_count = 0, supports_coop = 0;
-    if (!use_single_block) {
-        ck(cudaDeviceGetAttribute(&supports_coop, cudaDevAttrCooperativeLaunch, device),
-           "simulate_all_steps: cudaDeviceGetAttribute cooperative");
-        if (!supports_coop)
-            throw std::runtime_error("simulate_all_steps: GPU does not support cooperative kernel launch");
-        ck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device),
-           "simulate_all_steps: SM count");
-    }
 
     void* args[] = {
         &d_hh,         &n_hh,
@@ -848,50 +743,37 @@ void simulate_all_steps(
         &i_n_rec
     };
 
-    // Dispatch macro selects single- vs multi-block launch with the same NG/NC/NS.
-    // NG/NC/NS must be at least 1 (zero-size arrays aren't valid in C++).
-    #define HH_LAUNCH_VARIANT(NG_, NC_, NS_)                                                \
-        do {                                                                                \
-            if (use_single_block) {                                                         \
-                simulate_all_kernel_single<NG_, NC_, NS_><<<1, sb_threads, 0, stream>>>(    \
-                    d_hh, n_hh, d_iz, n_iz, d_comp, n_comp, syn, stim,                      \
-                    d_V_cache, d_I_syn, d_V_out, d_spike_buf,                               \
-                    i_n_neurons, sz_num_steps, dt, step_start, i_rec_iv, i_n_rec);          \
-                ck(cudaGetLastError(), "simulate_all_steps: single-block launch");          \
-            } else {                                                                        \
-                int max_blocks_sm = 0;                                                      \
-                ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(                           \
-                       &max_blocks_sm,                                                      \
-                       (const void*)simulate_all_kernel_multi<NG_, NC_, NS_>,                \
-                       kBlockSize, 0),                                                      \
-                   "simulate_all_steps: occupancy");                                        \
-                const int blocks_needed = (work_items + kBlockSize - 1) / kBlockSize;       \
-                const int total_blocks  = std::min(blocks_needed, sm_count * max_blocks_sm);\
-                if (total_blocks <= 0)                                                      \
-                    throw std::runtime_error("simulate_all_steps: 0 cooperative blocks");   \
-                ck(cudaLaunchCooperativeKernel(                                             \
-                       reinterpret_cast<void*>(simulate_all_kernel_multi<NG_, NC_, NS_>),    \
-                       dim3(total_blocks), dim3(kBlockSize),                                \
-                       args, 0, stream),                                                    \
-                   "simulate_all_steps: cudaLaunchCooperativeKernel");                      \
-            }                                                                               \
-        } while (0)
-
-    // Pre-instantiated variants, smallest to largest. Pick first that covers
-    // max_ng/max_nc/max_ns. The (1,1,1) variant handles networks with no
-    // composable pools at all (n_comp == 0).
-    if (n_comp == 0) {
-        HH_LAUNCH_VARIANT(1, 1, 1);
-    } else if (max_ng <= 4  && max_nc <= 4  && max_ns <= 2) {
-        HH_LAUNCH_VARIANT(4, 4, 2);
-    } else if (max_ng <= 8  && max_nc <= 8  && max_ns <= 4) {
-        HH_LAUNCH_VARIANT(8, 8, 4);
-    } else if (max_ng <= 16 && max_nc <= 16 && max_ns <= 8) {
-        HH_LAUNCH_VARIANT(16, 16, 8);
+    // Composable pools are dispatched per-pool to fully-specialized unrolled
+    // kernels inside the kernel (composable_step_dispatch), so the launch itself
+    // is no longer templated on gate/channel/substance counts.
+    if (use_single_block) {
+        simulate_all_kernel_single<<<1, sb_threads, 0, stream>>>(
+            d_hh, n_hh, d_iz, n_iz, d_comp, n_comp, syn, stim,
+            d_V_cache, d_I_syn, d_V_out, d_spike_buf,
+            i_n_neurons, sz_num_steps, dt, step_start, i_rec_iv, i_n_rec);
+        ck(cudaGetLastError(), "simulate_all_steps: single-block launch");
     } else {
-        HH_LAUNCH_VARIANT(32, 32, 16);  // full kMax* fallback
+        int supports_coop = 0;
+        ck(cudaDeviceGetAttribute(&supports_coop, cudaDevAttrCooperativeLaunch, device),
+           "simulate_all_steps: cudaDeviceGetAttribute cooperative");
+        if (!supports_coop)
+            throw std::runtime_error("simulate_all_steps: GPU does not support cooperative kernel launch");
+        int sm_count = 0, max_blocks_sm = 0;
+        ck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device),
+           "simulate_all_steps: SM count");
+        ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+               &max_blocks_sm, (const void*)simulate_all_kernel_multi, kBlockSize, 0),
+           "simulate_all_steps: occupancy");
+        const int blocks_needed = (work_items + kBlockSize - 1) / kBlockSize;
+        const int total_blocks  = std::min(blocks_needed, sm_count * max_blocks_sm);
+        if (total_blocks <= 0)
+            throw std::runtime_error("simulate_all_steps: 0 cooperative blocks");
+        ck(cudaLaunchCooperativeKernel(
+               reinterpret_cast<void*>(simulate_all_kernel_multi),
+               dim3(total_blocks), dim3(kBlockSize),
+               args, 0, stream),
+           "simulate_all_steps: cudaLaunchCooperativeKernel");
     }
-    #undef HH_LAUNCH_VARIANT
 
     ck(cudaStreamSynchronize(stream), "simulate_all_steps: stream sync");
 

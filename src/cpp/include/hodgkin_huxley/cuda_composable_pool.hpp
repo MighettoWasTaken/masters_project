@@ -112,6 +112,13 @@ public:
 
     bool needs_vm_programs() const;
 
+    // True iff this pool can run on the cooperative kernel's fast path:
+    // pattern-matched standard forms only (no VM programs, no modulations) AND
+    // its (n_gates, n_channels, n_intracellulars) matches a pre-instantiated
+    // bucket in composable_step_dispatch(). Pools failing this route to the
+    // per-step path instead, so they don't bloat the lean cooperative kernel.
+    bool coop_fast_eligible() const;
+
     bool is_cuda()                const override { return true; }
     int  device_id()              const override { return device_id_; }
     bool requires_pinned_memory() const override { return true; }

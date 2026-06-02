@@ -114,9 +114,10 @@ __global__ void composable_step_kernel(
     double* V,
     double* I_ext,
     double* synapse_g_scale,
-    double* const* gate_ptrs,
-    double* const* substance_ptrs,
-    double* const* nernst_ptrs,
+    double* gate_state,
+    double* substance_state,
+    double* nernst_state,
+    int state_stride,
     const hodgkin_huxley::CudaGateDesc* gate_descs,
     const hodgkin_huxley::CudaChannelDesc* channel_descs,
     const hodgkin_huxley::CudaChannelGateRef* channel_gate_refs,
@@ -151,7 +152,7 @@ __global__ void composable_step_kernel(
     int has_mod_gate_expr[hodgkin_huxley::CudaComposablePool::kMaxGates];
 
     for (int g = 0; g < n_gates; ++g) {
-        gate_vals[g] = gate_ptrs[g][i];
+        gate_vals[g] = gate_state[g * state_stride + i];
         mod_gate_shift[g] = 0.0;
         mod_gate_scale[g] = 1.0;
         mod_gate_tau[g] = 1.0;
@@ -159,8 +160,8 @@ __global__ void composable_step_kernel(
         has_mod_gate_expr[g] = 0;
     }
     for (int s = 0; s < n_substances; ++s) {
-        x_vals[s] = substance_ptrs[s][i];
-        e_nernst[s] = nernst_ptrs[s][i];
+        x_vals[s] = substance_state[s * state_stride + i];
+        e_nernst[s] = nernst_state[s * state_stride + i];
     }
     for (int c = 0; c < n_channels; ++c) {
         channel_currents[c] = 0.0;
@@ -430,10 +431,10 @@ __global__ void composable_step_kernel(
     V[i] = v;
     synapse_g_scale[i] = syn_g_scale;
     for (int g = 0; g < n_gates; ++g)
-        gate_ptrs[g][i] = gate_vals[g];
+        gate_state[g * state_stride + i] = gate_vals[g];
     for (int s = 0; s < n_substances; ++s) {
-        substance_ptrs[s][i] = x_vals[s];
-        nernst_ptrs[s][i] = e_nernst[s];
+        substance_state[s * state_stride + i] = x_vals[s];
+        nernst_state[s * state_stride + i] = e_nernst[s];
     }
 }
 
@@ -726,17 +727,17 @@ void CudaComposablePool::download_state() const {
                "CudaComposablePool download V");
     for (size_t g = 0; g < gate_states_.size(); ++g) {
         check_cuda(cudaMemcpyAsync(const_cast<double*>(gate_states_[g].data()),
-                                   gate_device_ptrs_[g], N_ * sizeof(double),
+                                   d_gate_state_ + g * capacity_, N_ * sizeof(double),
                                    cudaMemcpyDeviceToHost, stream_),
                    "CudaComposablePool download gates");
     }
     for (size_t s = 0; s < X_.size(); ++s) {
         check_cuda(cudaMemcpyAsync(const_cast<double*>(X_[s].data()),
-                                   substance_device_ptrs_[s], N_ * sizeof(double),
+                                   d_substance_state_ + s * capacity_, N_ * sizeof(double),
                                    cudaMemcpyDeviceToHost, stream_),
                    "CudaComposablePool download substances");
         check_cuda(cudaMemcpyAsync(const_cast<double*>(E_nernst_[s].data()),
-                                   nernst_device_ptrs_[s], N_ * sizeof(double),
+                                   d_nernst_state_ + s * capacity_, N_ * sizeof(double),
                                    cudaMemcpyDeviceToHost, stream_),
                    "CudaComposablePool download nernst");
     }
@@ -783,7 +784,8 @@ void CudaComposablePool::step(double dt) {
     const int grid = static_cast<int>((N_ + block - 1) / block);
     composable_step_kernel<<<grid, block, 0, stream_>>>(
         d_V_, d_I_ext_, d_synapse_g_scale_,
-        d_gate_ptrs_, d_substance_ptrs_, d_nernst_ptrs_,
+        d_gate_state_, d_substance_state_, d_nernst_state_,
+        static_cast<int>(capacity_),
         d_gate_descs_, d_channel_descs_, d_channel_gate_refs_,
         d_intr_descs_, d_intr_source_channels_, d_mod_descs_,
         d_vm_programs_,
@@ -863,9 +865,10 @@ void CudaComposablePool::fill_coop_desc(CudaComposableDesc& out) const {
     out.d_V                    = d_V_;
     out.d_I_ext                = d_I_ext_;
     out.d_synapse_g_scale      = d_synapse_g_scale_;
-    out.d_gate_ptrs            = d_gate_ptrs_;
-    out.d_substance_ptrs       = d_substance_ptrs_;
-    out.d_nernst_ptrs          = d_nernst_ptrs_;
+    out.d_gate_state           = d_gate_state_;
+    out.d_substance_state      = d_substance_state_;
+    out.d_nernst_state         = d_nernst_state_;
+    out.state_stride           = static_cast<int>(capacity_);
     out.d_gate_descs           = d_gate_descs_;
     out.d_channel_descs        = d_channel_descs_;
     out.d_channel_gate_refs    = d_channel_gate_refs_;
@@ -901,6 +904,25 @@ bool CudaComposablePool::needs_vm_programs() const {
             if (!m.mod_vm.empty()) return true;
         }
     }
+    return false;
+}
+
+bool CudaComposablePool::coop_fast_eligible() const {
+    if (needs_vm_programs()) return false;
+    // Any modulations require the generic interpreter (not in the lean kernel).
+    for (const auto& s : model_.intracellular)
+        if (!s.modulations.empty()) return false;
+
+    // Must match a pre-instantiated bucket in composable_step_dispatch()
+    // (cuda_sim_all.cu). Keep this list in sync with that switch.
+    const int ng = static_cast<int>(model_.gates.size());
+    const int nc = static_cast<int>(model_.channels.size());
+    const int ns = static_cast<int>(model_.intracellular.size());
+    if (ng == 3  && nc == 3 && ns == 0) return true;  // HH-default
+    if (ng == 4  && nc == 4 && ns == 0) return true;  // Striatum
+    if (ng == 5  && nc == 4 && ns == 0) return true;  // TH
+    if (ng == 6  && nc == 6 && ns == 1) return true;  // GPe / GPi
+    if (ng == 11 && nc == 7 && ns == 1) return true;  // STN
     return false;
 }
 

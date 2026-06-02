@@ -36,7 +36,7 @@ from benchmarks.ctxbgth_model import _make_gpe_spec, _make_stn_spec, _make_th_sp
 # ---------------------------------------------------------------------------
 N_POP      = 8
 N_NEURONS  = 200
-N_SWEEP    = [50, 100, 200, 500]
+N_SWEEP    = [50, 100, 200, 500, 1000, 2000, 4000]
 DURATION   = 200.0
 DT         = 0.05
 N_REPEATS  = 2

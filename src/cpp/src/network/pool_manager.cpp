@@ -350,6 +350,11 @@ bool PoolManager::has_coop_capable_cuda_pools() const {
     for (const auto& kv : comp_pools_) {
         auto* cp = dynamic_cast<CudaComposablePool*>(kv.second.get());
         if (!cp) return false;
+        // The cooperative kernel only carries the lean, pre-instantiated
+        // composable buckets. Pools with VM programs, modulations, or an
+        // unsupported (n_gates,n_channels,n_substances) signature must use the
+        // per-step path so they don't bloat the kernel's register footprint.
+        if (!cp->coop_fast_eligible()) return false;
     }
     return true;
 }
