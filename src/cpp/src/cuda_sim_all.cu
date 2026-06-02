@@ -370,6 +370,18 @@ __device__ inline void sync_step(cg::grid_group& grid) {
     else            __syncthreads();
 }
 
+// Flat neuron-processing layout (model-layout fusion). One entry per neuron in
+// the whole network, ordered HH → Iz → composable-by-bucket so same-type neurons
+// are contiguous. Lets the step phase run as ONE flat loop over all neurons
+// instead of a sequential loop per pool — critical for heterogeneous models
+// with many small pools (e.g. CTX-BG-TH: 8 pools × 10 neurons), where a per-pool
+// loop activates < 1 warp at a time and starves the SM of concurrent warps.
+struct NeuronSlot {
+    int kind;   // 0 = HH, 1 = Izhikevich, 2 = composable
+    int pool;   // index into the corresponding desc array
+    int local;  // neuron index within that pool
+};
+
 // ---------------------------------------------------------------------------
 // Main simulation kernel — templated on MultiBlock.
 // Phase fusion (Phase 1 optimization):
@@ -392,6 +404,7 @@ __device__ void simulate_all_kernel_impl(
     hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,
     hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,
     hodgkin_huxley::CudaComposableDesc* comp_descs, int n_comp,
+    const NeuronSlot*                   layout,
     hodgkin_huxley::DeviceSynapseRaw    syn,
     hodgkin_huxley::CudaStimRaw         stim,
     double*   d_V_cache,
@@ -465,59 +478,37 @@ __device__ void simulate_all_kernel_impl(
             ? static_cast<int>(t / static_cast<size_t>(record_interval)) : 0;
         const bool record_spikes = (d_spike_buf != nullptr) && record_interval > 0 && tr_spike < n_rec;
 
-        for (int p = 0; p < n_hh; ++p) {
-            for (int i = tid; i < hh_descs[p].n; i += total) {
-                const size_t nidx = hh_descs[p].d_net_idx[i];
-                // P3: step
-                double I = d_I_syn[nidx];
-                hh_step_single(hh_descs[p], i, I, dt);
-                // P4: scatter V
-                const double v_new = hh_descs[p].d_V[i];
-                d_V_cache[nidx] = v_new;
-                // P5: detect spike (only if synapses exist or recording spikes)
-                if (syn.n_synapses > 0 || record_spikes) {
-                    const double vp = syn.d_V_prev ? syn.d_V_prev[nidx] : v_new;
-                    const uint8_t spiked = (v_new > syn.spike_threshold && vp <= syn.spike_threshold) ? 1u : 0u;
-                    if (syn.d_neuron_spiked) syn.d_neuron_spiked[nidx] = spiked;
-                    if (syn.d_V_prev)        syn.d_V_prev[nidx] = v_new;
-                    if (record_spikes)
-                        d_spike_buf[nidx * static_cast<size_t>(n_rec) + static_cast<size_t>(tr_spike)] |= spiked;
-                }
+        // Flat fused pass over ALL neurons (model-layout fusion): one strided
+        // loop keeps up to `total` threads active concurrently, instead of a
+        // sequential per-pool loop that activates < 1 warp for small pools.
+        for (int k = tid; k < n_neurons; k += total) {
+            const NeuronSlot sl = layout[k];
+            size_t nidx;
+            double v_new;
+            if (sl.kind == 0) {                 // HH
+                const auto& d = hh_descs[sl.pool];
+                nidx = d.d_net_idx[sl.local];
+                hh_step_single(d, sl.local, d_I_syn[nidx], dt);
+                v_new = d.d_V[sl.local];
+            } else if (sl.kind == 1) {          // Izhikevich
+                const auto& d = iz_descs[sl.pool];
+                nidx = d.d_net_idx[sl.local];
+                iz_step_single(d, sl.local, d_I_syn[nidx], dt);
+                v_new = d.d_v[sl.local];
+            } else {                            // composable
+                const auto& d = comp_descs[sl.pool];
+                nidx = d.d_net_idx[sl.local];
+                composable_step_dispatch(d, sl.local, d_I_syn[nidx], dt);
+                v_new = d.d_V[sl.local];
             }
-        }
-        for (int p = 0; p < n_iz; ++p) {
-            for (int i = tid; i < iz_descs[p].n; i += total) {
-                const size_t nidx = iz_descs[p].d_net_idx[i];
-                double I = d_I_syn[nidx];
-                iz_step_single(iz_descs[p], i, I, dt);
-                const double v_new = iz_descs[p].d_v[i];
-                d_V_cache[nidx] = v_new;
-                if (syn.n_synapses > 0 || record_spikes) {
-                    const double vp = syn.d_V_prev ? syn.d_V_prev[nidx] : v_new;
-                    const uint8_t spiked = (v_new > syn.spike_threshold && vp <= syn.spike_threshold) ? 1u : 0u;
-                    if (syn.d_neuron_spiked) syn.d_neuron_spiked[nidx] = spiked;
-                    if (syn.d_V_prev)        syn.d_V_prev[nidx] = v_new;
-                    if (record_spikes)
-                        d_spike_buf[nidx * static_cast<size_t>(n_rec) + static_cast<size_t>(tr_spike)] |= spiked;
-                }
-            }
-        }
-        for (int p = 0; p < n_comp; ++p) {
-            const hodgkin_huxley::CudaComposableDesc& cd = comp_descs[p];
-            for (int i = tid; i < cd.n; i += total) {
-                const size_t nidx = cd.d_net_idx[i];
-                const double I = d_I_syn[nidx];
-                composable_step_dispatch(cd, i, I, dt);
-                const double v_new = cd.d_V[i];
-                d_V_cache[nidx] = v_new;
-                if (syn.n_synapses > 0 || record_spikes) {
-                    const double vp = syn.d_V_prev ? syn.d_V_prev[nidx] : v_new;
-                    const uint8_t spiked = (v_new > syn.spike_threshold && vp <= syn.spike_threshold) ? 1u : 0u;
-                    if (syn.d_neuron_spiked) syn.d_neuron_spiked[nidx] = spiked;
-                    if (syn.d_V_prev)        syn.d_V_prev[nidx] = v_new;
-                    if (record_spikes)
-                        d_spike_buf[nidx * static_cast<size_t>(n_rec) + static_cast<size_t>(tr_spike)] |= spiked;
-                }
+            d_V_cache[nidx] = v_new;
+            if (syn.n_synapses > 0 || record_spikes) {
+                const double vp = syn.d_V_prev ? syn.d_V_prev[nidx] : v_new;
+                const uint8_t spiked = (v_new > syn.spike_threshold && vp <= syn.spike_threshold) ? 1u : 0u;
+                if (syn.d_neuron_spiked) syn.d_neuron_spiked[nidx] = spiked;
+                if (syn.d_V_prev)        syn.d_V_prev[nidx] = v_new;
+                if (record_spikes)
+                    d_spike_buf[nidx * static_cast<size_t>(n_rec) + static_cast<size_t>(tr_spike)] |= spiked;
             }
         }
         sync_step<MultiBlock>(grid);
@@ -546,6 +537,7 @@ __global__ void simulate_all_kernel_multi(
     hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,
     hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,
     hodgkin_huxley::CudaComposableDesc* comp_descs, int n_comp,
+    const NeuronSlot*                   layout,
     hodgkin_huxley::DeviceSynapseRaw    syn,
     hodgkin_huxley::CudaStimRaw         stim,
     double*   d_V_cache,
@@ -560,7 +552,7 @@ __global__ void simulate_all_kernel_multi(
     int       n_rec)
 {
     simulate_all_kernel_impl<true>(
-        hh_descs, n_hh, iz_descs, n_iz, comp_descs, n_comp,
+        hh_descs, n_hh, iz_descs, n_iz, comp_descs, n_comp, layout,
         syn, stim, d_V_cache, d_I_syn, d_V_out, d_spike_buf,
         n_neurons, num_steps, dt, step_start, record_interval, n_rec);
 }
@@ -569,6 +561,7 @@ __global__ void simulate_all_kernel_single(
     hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,
     hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,
     hodgkin_huxley::CudaComposableDesc* comp_descs, int n_comp,
+    const NeuronSlot*                   layout,
     hodgkin_huxley::DeviceSynapseRaw    syn,
     hodgkin_huxley::CudaStimRaw         stim,
     double*   d_V_cache,
@@ -583,7 +576,7 @@ __global__ void simulate_all_kernel_single(
     int       n_rec)
 {
     simulate_all_kernel_impl<false>(
-        hh_descs, n_hh, iz_descs, n_iz, comp_descs, n_comp,
+        hh_descs, n_hh, iz_descs, n_iz, comp_descs, n_comp, layout,
         syn, stim, d_V_cache, d_I_syn, d_V_out, d_spike_buf,
         n_neurons, num_steps, dt, step_start, record_interval, n_rec);
 }
@@ -692,6 +685,36 @@ void simulate_all_steps(
         ck(cudaMemcpy(d_comp, comp_descs_h, n_comp * sizeof(CudaComposableDesc), cudaMemcpyHostToDevice), "d_comp memcpy");
     }
 
+    // Build the flat neuron-processing layout (model-layout fusion). Order:
+    // HH, then Iz, then composable pools sorted by (n_gates, n_channels,
+    // n_intracellulars) so same-bucket neurons are contiguous (minimizes warp
+    // divergence in the flat step loop). Size == total neurons across pools.
+    std::vector<NeuronSlot> layout;
+    layout.reserve(n_neurons);
+    for (int p = 0; p < n_hh; ++p)
+        for (int i = 0; i < hh_descs_h[p].n; ++i) layout.push_back({0, p, i});
+    for (int p = 0; p < n_iz; ++p)
+        for (int i = 0; i < iz_descs_h[p].n; ++i) layout.push_back({1, p, i});
+    {
+        std::vector<int> comp_order(n_comp);
+        for (int p = 0; p < n_comp; ++p) comp_order[p] = p;
+        std::sort(comp_order.begin(), comp_order.end(), [&](int a, int b) {
+            const auto& A = comp_descs_h[a]; const auto& B = comp_descs_h[b];
+            if (A.n_gates != B.n_gates)               return A.n_gates < B.n_gates;
+            if (A.n_channels != B.n_channels)         return A.n_channels < B.n_channels;
+            return A.n_intracellulars < B.n_intracellulars;
+        });
+        for (int p : comp_order)
+            for (int i = 0; i < comp_descs_h[p].n; ++i) layout.push_back({2, p, i});
+    }
+    NeuronSlot* d_layout = nullptr;
+    if (!layout.empty()) {
+        ck(cudaMalloc(reinterpret_cast<void**>(&d_layout), layout.size() * sizeof(NeuronSlot)),
+           "d_layout alloc");
+        ck(cudaMemcpy(d_layout, layout.data(), layout.size() * sizeof(NeuronSlot),
+                      cudaMemcpyHostToDevice), "d_layout memcpy");
+    }
+
     // Compute work items. Single-block launch (with stride pattern) replaces
     // grid.sync (~10-15 µs WDDM) with __syncthreads (~10 ns) but loses SM
     // parallelism — only one SM does work. The break-even depends on per-unit
@@ -714,7 +737,11 @@ void simulate_all_steps(
     if (syn.n_synapses > work_items) work_items = syn.n_synapses;
     if (stim.n_neurons > work_items) work_items = stim.n_neurons;
     if (work_items < 1) work_items = 1;
-    const bool use_single_block = False;
+    // Single- vs multi-block decision is based on total work (work_items =
+    // max over neurons, synapses, stim). Synapse-heavy networks (e.g. all-to-all)
+    // would overwhelm a single SM, so they must take the multi-block path even
+    // when neuron count is small.
+    const bool use_single_block = (work_items <= single_block_max_work);
 
     int    i_n_neurons   = static_cast<int>(n_neurons);
     size_t sz_num_steps  = num_steps;
@@ -729,6 +756,7 @@ void simulate_all_steps(
         &d_hh,         &n_hh,
         &d_iz,         &n_iz,
         &d_comp,       &n_comp,
+        &d_layout,
         &syn,
         &stim,
         &d_V_cache,
@@ -748,7 +776,7 @@ void simulate_all_steps(
     // is no longer templated on gate/channel/substance counts.
     if (use_single_block) {
         simulate_all_kernel_single<<<1, sb_threads, 0, stream>>>(
-            d_hh, n_hh, d_iz, n_iz, d_comp, n_comp, syn, stim,
+            d_hh, n_hh, d_iz, n_iz, d_comp, n_comp, d_layout, syn, stim,
             d_V_cache, d_I_syn, d_V_out, d_spike_buf,
             i_n_neurons, sz_num_steps, dt, step_start, i_rec_iv, i_n_rec);
         ck(cudaGetLastError(), "simulate_all_steps: single-block launch");
@@ -778,9 +806,10 @@ void simulate_all_steps(
     ck(cudaStreamSynchronize(stream), "simulate_all_steps: stream sync");
 
     // Free temp device descriptor arrays
-    if (d_hh)   cudaFree(d_hh);
-    if (d_iz)   cudaFree(d_iz);
-    if (d_comp) cudaFree(d_comp);
+    if (d_hh)     cudaFree(d_hh);
+    if (d_iz)     cudaFree(d_iz);
+    if (d_comp)   cudaFree(d_comp);
+    if (d_layout) cudaFree(d_layout);
 }
 
 } // namespace hodgkin_huxley
