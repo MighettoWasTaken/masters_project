@@ -660,6 +660,8 @@ def simulate_ctxbgth(
     amplitude: float = 0.0,
     corstim: int = 0,
     seed: int = 42,
+    threaded: bool = True,
+    run_cuda: bool = False
 ):
     """
     Simulate the CTX-BG-TH network and return GPi spectral metrics.
@@ -683,12 +685,20 @@ def simulate_ctxbgth(
     gpi_f               : ndarray — frequency axis
     spike_times         : dict   — {pop: list of spike-time arrays (s)}
     """
+
+    assert(not(run_cuda and threaded))
+
+    POPULATIONS = ["TH", "STN", "GPe", "GPi", "Str_D2", "Str_D1", "CTX_e", "CTX_i"]
     net = build_network(n=n, pd=pd, seed=seed)
 
-    #net.to(Device.cuda(0))
-    POPULATIONS = ["TH", "STN", "GPe", "GPi", "Str_D2", "Str_D1", "CTX_e", "CTX_i"]
-    groups = {f"g{i}": [name] for i, name in enumerate(POPULATIONS)}
-    net.set_thread_groups(groups)   # Phase 2: one thread per population
+    if(threaded):
+        groups = {f"g{i}": [name] for i, name in enumerate(POPULATIONS)}
+        net.set_thread_groups(groups)   # Phase 2: one thread per population
+
+    if run_cuda:
+        net.to(Device.cuda(0))
+
+
 
     # ---- External currents -------------------------------------------------
     I_ext: dict = {

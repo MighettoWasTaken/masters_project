@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.join(_HERE, ".."))
 # Shared simulation parameters (textbook HH, squid giant axon @ 6.3 C)
 # --------------------------------------------------------------------------- #
 DT       = 0.01      # ms
-TMAX     = 1000.0     # ms
+TMAX     = 200.0     # ms
 I_EXT    = 10.0      # uA/cm^2  (constant drive -> repetitive firing)
 THRESH   = -20.0     # mV       spike-detection threshold (upward crossing)
 N_SWEEP  = [1, 10, 100, 500, 1000, 2000, 4000]

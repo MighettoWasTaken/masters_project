@@ -297,14 +297,21 @@ void RegionalNetwork::generate_connections(
 {
     bool same_pop = (src.start_idx == dst.start_idx && src.count == dst.count);
 
+    // Resolve (dedup + cache) the spec once for the whole pattern, then append
+    // synapses via the interned fast path — no per-synapse dedup scan, and the
+    // SoA arrays are reserved up front to avoid incremental reallocation.
+    const size_t sidx = net_->intern_synapse_spec(synapse);
+
     switch (pattern) {
         case ConnectivityPattern::ALL_TO_ALL: {
+            net_->reserve_synapses(src.count * dst.count);
             for (size_t i = 0; i < src.count; ++i) {
                 for (size_t j = 0; j < dst.count; ++j) {
                     size_t pre = src.start_idx + i;
                     size_t post = dst.start_idx + j;
                     if (!allow_self && same_pop && i == j) continue;
-                    net_->add_synapse(pre, post, weight.sample(rng), synapse, delay);
+                    net_->add_synapse_interned(pre, post, weight.sample(rng),
+                                               sidx, synapse, delay);
                 }
             }
             break;
@@ -316,9 +323,10 @@ void RegionalNetwork::generate_connections(
                     src.name + "': " + std::to_string(src.count) + ", '" +
                     dst.name + "': " + std::to_string(dst.count) + ")");
             }
+            net_->reserve_synapses(src.count);
             for (size_t k = 0; k < src.count; ++k) {
-                net_->add_synapse(src.start_idx + k, dst.start_idx + k,
-                                      weight.sample(rng), synapse, delay);
+                net_->add_synapse_interned(src.start_idx + k, dst.start_idx + k,
+                                           weight.sample(rng), sidx, synapse, delay);
             }
             break;
         }
@@ -329,23 +337,28 @@ void RegionalNetwork::generate_connections(
                     src.name + "': " + std::to_string(src.count) + ", '" +
                     dst.name + "': " + std::to_string(dst.count) + ")");
             }
+            net_->reserve_synapses(src.count);
             int n = static_cast<int>(dst.count);
             for (size_t k = 0; k < src.count; ++k) {
                 int dst_k = (static_cast<int>(k) + ((shift % n) + n)) % n;
-                net_->add_synapse(src.start_idx + k,
-                                      dst.start_idx + static_cast<size_t>(dst_k),
-                                      weight.sample(rng), synapse, delay);
+                net_->add_synapse_interned(src.start_idx + k,
+                                           dst.start_idx + static_cast<size_t>(dst_k),
+                                           weight.sample(rng), sidx, synapse, delay);
             }
             break;
         }
         case ConnectivityPattern::RANDOM_SPARSE: {
+            // Reserve the expected count (probability * N*M); reserve() only grows
+            // capacity, so an estimate is safe even if the actual count differs.
+            net_->reserve_synapses(
+                static_cast<size_t>(probability * src.count * dst.count));
             std::uniform_real_distribution<double> coin(0.0, 1.0);
             for (size_t i = 0; i < src.count; ++i) {
                 for (size_t j = 0; j < dst.count; ++j) {
                     if (!allow_self && same_pop && i == j) continue;
                     if (coin(rng) < probability) {
-                        net_->add_synapse(src.start_idx + i, dst.start_idx + j,
-                                              weight.sample(rng), synapse, delay);
+                        net_->add_synapse_interned(src.start_idx + i, dst.start_idx + j,
+                                                   weight.sample(rng), sidx, synapse, delay);
                     }
                 }
             }
@@ -358,13 +371,14 @@ void RegionalNetwork::generate_connections(
                     src.name + "': " + std::to_string(src.count) + ", '" +
                     dst.name + "': " + std::to_string(dst.count) + ")");
             }
+            net_->reserve_synapses(src.count);
             std::vector<size_t> perm(src.count);
             std::iota(perm.begin(), perm.end(), 0);
             std::shuffle(perm.begin(), perm.end(), rng);
             for (size_t k = 0; k < src.count; ++k) {
-                net_->add_synapse(src.start_idx + k,
-                                      dst.start_idx + perm[k],
-                                      weight.sample(rng), synapse, delay);
+                net_->add_synapse_interned(src.start_idx + k,
+                                           dst.start_idx + perm[k],
+                                           weight.sample(rng), sidx, synapse, delay);
             }
             break;
         }

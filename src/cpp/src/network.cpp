@@ -179,12 +179,14 @@ void Network::prepare_cuda_synapses(double dt) {
         desc.current_vm_idx = register_vm(spec.current_vm);
     }
 
-    std::vector<uint8_t> spike_ring(n_synapses * ring_size, 0u);
+    // Per-NEURON spike ring (n_neurons * ring_size): records each neuron's spike
+    // history once, indexed by presynaptic neuron — not duplicated per synapse.
+    std::vector<uint8_t> spike_ring(n_neurons * ring_size, 0u);
     for (size_t arrival_slot = 0; arrival_slot < event_slots_.size(); ++arrival_slot) {
         for (size_t syn_idx : event_slots_[arrival_slot]) {
-            const size_t write_slot =
+            const size_t spike_slot =
                 (arrival_slot + ring_size - (delay_steps_[syn_idx] % ring_size)) % ring_size;
-            spike_ring[syn_idx * ring_size + write_slot] = 1u;
+            spike_ring[pre_decoded_[syn_idx] * ring_size + spike_slot] = 1u;
         }
     }
 
@@ -224,8 +226,9 @@ void Network::sync_cuda_synapses_to_host(bool sync_pending_events) {
     event_slots_.assign(dev_syn_.ring_size, {});
     for (size_t syn_idx = 0; syn_idx < dev_syn_.synapse_count; ++syn_idx) {
         const size_t delay = delay_steps_[syn_idx];
+        const size_t pre_n = pre_decoded_[syn_idx];  // per-neuron ring lookup
         for (size_t write_slot = 0; write_slot < dev_syn_.ring_size; ++write_slot) {
-            if (!spike_ring[syn_idx * dev_syn_.ring_size + write_slot]) continue;
+            if (!spike_ring[pre_n * dev_syn_.ring_size + write_slot]) continue;
             const size_t age = (current_step_ + dev_syn_.ring_size - 1 - write_slot) % dev_syn_.ring_size;
             if (age > delay) continue;
             const size_t future_offset = delay - age;
@@ -395,18 +398,13 @@ const SynapseBase& Network::synapse(size_t idx) const {
 // Unified add_synapse — primary method, all forms
 // =============================================================================
 
-size_t Network::add_synapse(size_t pre, size_t post, double weight,
-                             const SynapseSpec& spec, double delay) {
-    if (pre >= neurons_.size() || post >= neurons_.size()) {
-        throw std::out_of_range("Neuron index out of range");
-    }
-
-    // Dedup spec by kinetic content; populate spec cache for new entries.
-    // NOTE: must compare the fields that drive synapse_spec_caches_ / spec_descs,
-    // NOT just the name — many distinct kinetics share a name (e.g. every
-    // SynapseModel.double_exponential(...) is named "double_exponential" but may
-    // have different tau_rise/tau_decay/E_syn). Deduping by name alone collapses
-    // them onto the first spec's kinetics (caused the STN firing-rate drift).
+// Dedup a spec by kinetic content and populate its cache; returns the spec index.
+// NOTE: must compare the fields that drive synapse_spec_caches_ / spec_descs,
+// NOT just the name — many distinct kinetics share a name (e.g. every
+// SynapseModel.double_exponential(...) is named "double_exponential" but may have
+// different tau_rise/tau_decay/E_syn). Deduping by name alone collapses them onto
+// the first spec's kinetics (caused the STN firing-rate drift).
+size_t Network::intern_synapse_spec(const SynapseSpec& spec) {
     auto dedup_equal = [](const SynapseSpec& a, const SynapseSpec& b) {
         using UF = SynapseSpec::UpdateForm;
         if (a.update_form != b.update_form || a.current_form != b.current_form)
@@ -426,21 +424,28 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
             && a.mg_conc == b.mg_conc && a.mg_scale == b.mg_scale
             && a.mg_denom == b.mg_denom;
     };
-    size_t sidx = synapse_specs_.size();
     for (size_t i = 0; i < synapse_specs_.size(); ++i) {
-        if (dedup_equal(synapse_specs_[i], spec)) { sidx = i; break; }
+        if (dedup_equal(synapse_specs_[i], spec)) return i;
     }
-    if (sidx == synapse_specs_.size()) {
-        synapse_specs_.push_back(spec);
-        SynapseSpecCache c;
-        c.delta_S   = spec.delta_S;
-        c.delta_A   = spec.delta_A;
-        c.tau_S     = spec.tau_S;
-        c.tau_A     = spec.tau_A;
-        c.inv_tau_A = spec.tau_A > 0.0 ? 1.0 / spec.tau_A : 0.0;
-        c.norm      = spec.norm_factor;
-        // decay fields left 0 — filled by rebuild_spec_caches() at simulate time
-        synapse_spec_caches_.push_back(c);
+    synapse_specs_.push_back(spec);
+    SynapseSpecCache c;
+    c.delta_S   = spec.delta_S;
+    c.delta_A   = spec.delta_A;
+    c.tau_S     = spec.tau_S;
+    c.tau_A     = spec.tau_A;
+    c.inv_tau_A = spec.tau_A > 0.0 ? 1.0 / spec.tau_A : 0.0;
+    c.norm      = spec.norm_factor;
+    // decay fields left 0 — filled by rebuild_spec_caches() at simulate time
+    synapse_spec_caches_.push_back(c);
+    return synapse_specs_.size() - 1;
+}
+
+// Append one synapse with a pre-resolved spec index (no per-synapse dedup scan).
+size_t Network::add_synapse_interned(size_t pre, size_t post, double weight,
+                                     size_t sidx, const SynapseSpec& spec,
+                                     double delay) {
+    if (pre >= neurons_.size() || post >= neurons_.size()) {
+        throw std::out_of_range("Neuron index out of range");
     }
 
     // Restore pre/post arrays if they were freed after a prior build
@@ -474,6 +479,28 @@ size_t Network::add_synapse(size_t pre, size_t post, double weight,
     injection_tables_built_ = false;
 
     return sa_.size() - 1;
+}
+
+size_t Network::add_synapse(size_t pre, size_t post, double weight,
+                             const SynapseSpec& spec, double delay) {
+    return add_synapse_interned(pre, post, weight,
+                                intern_synapse_spec(spec), spec, delay);
+}
+
+void Network::add_synapses_bulk(const std::vector<uint32_t>& pre,
+                                const std::vector<uint32_t>& post,
+                                const std::vector<double>& weight,
+                                const SynapseSpec& spec, double delay) {
+    const size_t n = pre.size();
+    if (post.size() != n || weight.size() != n) {
+        throw std::invalid_argument(
+            "add_synapses_bulk: pre/post/weight arrays must have equal length");
+    }
+    const size_t sidx = intern_synapse_spec(spec);
+    reserve_synapses(n);
+    for (size_t k = 0; k < n; ++k) {
+        add_synapse_interned(pre[k], post[k], weight[k], sidx, spec, delay);
+    }
 }
 
 // =============================================================================

@@ -350,6 +350,32 @@ PYBIND11_MODULE(_core, m) {
              "Add a synapse with optional plasticity rule, returns index",
              py::arg("pre"), py::arg("post"), py::arg("weight"),
              py::arg("spec"), py::arg("delay"), py::arg("plasticity"))
+        .def("add_synapses_bulk",
+             [](Network& net,
+                py::array_t<uint32_t, py::array::c_style | py::array::forcecast> pre,
+                py::array_t<uint32_t, py::array::c_style | py::array::forcecast> post,
+                py::array_t<double,   py::array::c_style | py::array::forcecast> weight,
+                py::object spec_obj, double delay) {
+                 auto p = pre.unchecked<1>();
+                 auto q = post.unchecked<1>();
+                 auto w = weight.unchecked<1>();
+                 const size_t n = static_cast<size_t>(p.shape(0));
+                 if (static_cast<size_t>(q.shape(0)) != n ||
+                     static_cast<size_t>(w.shape(0)) != n) {
+                     throw std::invalid_argument(
+                         "add_synapses_bulk: pre/post/weight must have equal length");
+                 }
+                 std::vector<uint32_t> pv(n), qv(n);
+                 std::vector<double>   wv(n);
+                 for (size_t k = 0; k < n; ++k) {
+                     pv[k] = p(k); qv[k] = q(k); wv[k] = w(k);
+                 }
+                 net.add_synapses_bulk(pv, qv, wv,
+                                       synapse_spec_from_py(spec_obj), delay);
+             },
+             "Bulk-add synapses sharing one spec from pre/post/weight arrays",
+             py::arg("pre"), py::arg("post"), py::arg("weight"),
+             py::arg("spec"), py::arg("delay") = 0.0)
         // Legacy wrappers (backward compat)
         .def("add_synapse",
              py::overload_cast<size_t, size_t, double, double, double, double>(

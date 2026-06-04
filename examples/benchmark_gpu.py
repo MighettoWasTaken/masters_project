@@ -8,7 +8,8 @@ vs the CPU C++ backend, across neuron counts, synapse counts, and simulation dur
 Notes:
   - STDP/STP forces CPU synapse fallback; all tests use static weights.
   - Networks with no synapses isolate neuron-update throughput on the GPU.
-  - Each configuration is run once with a warm-up step to avoid first-launch JIT noise.
+  - Each configuration is run N times with a warm-up step before each timed run.
+  - Plots show average wall-clock time across repeats; stdout reports mean ± std.
 
 Outputs:
   examples/figs/benchmark_gpu_time_vs_neurons.png   -- GPU vs CPU per topology (2x2 grid)
@@ -19,6 +20,7 @@ Outputs:
   examples/figs/benchmark_gpu_neuron_types.png
 """
 
+import argparse
 import gc
 import sys
 import time
@@ -41,6 +43,10 @@ _GPU_TOPO_MAX_N = {
     "All-to-All": 2000,   # ~4M synapses
     "Star": None,
 }
+
+# Default number of timed repeats per benchmark configuration. Override with
+# --reps / -r from the command line.
+DEFAULT_REPS = 3
 
 
 # =============================================================================
@@ -137,6 +143,54 @@ def _bench_pair(
     return t_cpu, t_gpu
 
 
+def _mean_std(values: List[float]) -> Tuple[float, float]:
+    """Return sample mean and sample std. Std is 0 for a single repeat."""
+    arr = np.asarray(values, dtype=float)
+    mean = float(arr.mean())
+    std = float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+    return mean, std
+
+
+def _fmt_time(mean: float, std: float, reps: int) -> str:
+    """Human-readable timing summary for stdout."""
+    if reps <= 1:
+        return f"{mean:.3f}s"
+    return f"{mean:.3f}±{std:.3f}s"
+
+
+def _bench_pair_repeated(
+    N: int,
+    neuron_type: str,
+    n_syn_per_neuron: int,
+    duration: float,
+    dt: float,
+    I_val: float,
+    reps: int = DEFAULT_REPS,
+    warmup: bool = True,
+) -> Tuple[float, float, float, float]:
+    """
+    Return (cpu_mean, gpu_mean, cpu_std, gpu_std) over repeated fresh-network runs.
+
+    Fresh networks are built for each repeat because simulate() mutates state.
+    Each timed repeat keeps its own short warm-up to avoid first-launch/setup noise.
+    """
+    cpu_runs: List[float] = []
+    gpu_runs: List[float] = []
+
+    for rep in range(reps):
+        t_cpu, t_gpu = _bench_pair(
+            N, neuron_type, n_syn_per_neuron, duration, dt, I_val, warmup=warmup
+        )
+        cpu_runs.append(t_cpu)
+        gpu_runs.append(t_gpu)
+        if reps > 1:
+            print(f"{rep + 1}/{reps} ", end="", flush=True)
+
+    cpu_mean, cpu_std = _mean_std(cpu_runs)
+    gpu_mean, gpu_std = _mean_std(gpu_runs)
+    return cpu_mean, gpu_mean, cpu_std, gpu_std
+
+
 def _fmt_speedup(t_cpu: float, t_gpu: float) -> str:
     if t_gpu <= 0:
         return "inf"
@@ -154,16 +208,19 @@ def run_neuron_scaling(
     duration: float = 100.0,
     dt: float = 0.05,
     I_val: float = 8.0,
+    reps: int = DEFAULT_REPS,
 ) -> Dict:
     if neuron_counts is None:
         neuron_counts = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 
     cpu_times: List[float] = []
     gpu_times: List[float] = []
+    cpu_stds: List[float] = []
+    gpu_stds: List[float] = []
     syn_counts: List[int] = []
 
     print(f"\n--- Neuron scaling (HH, {n_syn_per_neuron} syn/neuron, "
-          f"duration={duration} ms) ---")
+          f"duration={duration} ms, reps={reps}) ---")
 
     for N in neuron_counts:
         k = min(n_syn_per_neuron, N - 1)
@@ -171,18 +228,27 @@ def run_neuron_scaling(
         syn_counts.append(n_syn)
         print(f"  N={N:>5d}  synapses={n_syn:>8d} ... ", end="", flush=True)
 
-        t_cpu, t_gpu = _bench_pair(N, "HH", n_syn_per_neuron, duration, dt, I_val)
+        t_cpu, t_gpu, cpu_std, gpu_std = _bench_pair_repeated(
+            N, "HH", n_syn_per_neuron, duration, dt, I_val, reps=reps
+        )
         cpu_times.append(t_cpu)
         gpu_times.append(t_gpu)
-        print(f"CPU={t_cpu:.3f}s  GPU={t_gpu:.3f}s  speedup={_fmt_speedup(t_cpu, t_gpu)}")
+        cpu_stds.append(cpu_std)
+        gpu_stds.append(gpu_std)
+        print(f"CPU={_fmt_time(t_cpu, cpu_std, reps)}  "
+              f"GPU={_fmt_time(t_gpu, gpu_std, reps)}  "
+              f"speedup={_fmt_speedup(t_cpu, t_gpu)}")
 
     return {
         "neuron_counts": neuron_counts,
         "syn_counts": syn_counts,
         "cpu": cpu_times,
         "gpu": gpu_times,
+        "cpu_std": cpu_stds,
+        "gpu_std": gpu_stds,
         "n_syn_per_neuron": n_syn_per_neuron,
         "duration": duration,
+        "reps": reps,
     }
 
 
@@ -196,6 +262,7 @@ def run_synapse_scaling(
     duration: float = 100.0,
     dt: float = 0.05,
     I_val: float = 8.0,
+    reps: int = DEFAULT_REPS,
 ) -> Dict:
     if k_values is None:
         # 0 = no synapses (pure neuron update), then increasing k up to all-to-all
@@ -205,19 +272,27 @@ def run_synapse_scaling(
 
     cpu_times: List[float] = []
     gpu_times: List[float] = []
+    cpu_stds: List[float] = []
+    gpu_stds: List[float] = []
     syn_counts: List[int] = []
 
-    print(f"\n--- Synapse scaling (HH, N={N}, duration={duration} ms) ---")
+    print(f"\n--- Synapse scaling (HH, N={N}, duration={duration} ms, reps={reps}) ---")
 
     for k in k_values:
         n_syn = N * k
         syn_counts.append(n_syn)
         print(f"  k={k:>4d}  synapses={n_syn:>8d} ... ", end="", flush=True)
 
-        t_cpu, t_gpu = _bench_pair(N, "HH", k, duration, dt, I_val)
+        t_cpu, t_gpu, cpu_std, gpu_std = _bench_pair_repeated(
+            N, "HH", k, duration, dt, I_val, reps=reps
+        )
         cpu_times.append(t_cpu)
         gpu_times.append(t_gpu)
-        print(f"CPU={t_cpu:.3f}s  GPU={t_gpu:.3f}s  speedup={_fmt_speedup(t_cpu, t_gpu)}")
+        cpu_stds.append(cpu_std)
+        gpu_stds.append(gpu_std)
+        print(f"CPU={_fmt_time(t_cpu, cpu_std, reps)}  "
+              f"GPU={_fmt_time(t_gpu, gpu_std, reps)}  "
+              f"speedup={_fmt_speedup(t_cpu, t_gpu)}")
 
     return {
         "N": N,
@@ -225,7 +300,10 @@ def run_synapse_scaling(
         "syn_counts": syn_counts,
         "cpu": cpu_times,
         "gpu": gpu_times,
+        "cpu_std": cpu_stds,
+        "gpu_std": gpu_stds,
         "duration": duration,
+        "reps": reps,
     }
 
 
@@ -243,6 +321,7 @@ def run_duration_scaling(
     durations: Optional[List[float]] = None,
     dt: float = 0.05,
     I_val: float = 8.0,
+    reps: int = DEFAULT_REPS,
 ) -> Dict:
     if n_values is None:
         n_values = [256, 1024, 4096, 16384]
@@ -250,37 +329,44 @@ def run_duration_scaling(
         durations = [10, 25, 50, 100, 200, 500, 1000, 5000, 10000]
 
     print(f"\n--- Duration scaling (HH, {n_syn_per_neuron} syn/neuron, "
-          f"N={n_values}) ---")
+          f"N={n_values}, reps={reps}) ---")
 
     per_n: Dict[int, Dict] = {}
     for N in n_values:
         n_syn = N * min(n_syn_per_neuron, N - 1)
         print(f"\n  N={N:>6d}  ({n_syn} synapses)")
 
-        rn_cpu = _build_rn(N, "HH", n_syn_per_neuron)
-        rn_gpu = _build_rn(N, "HH", n_syn_per_neuron)
-        _simulate_cpu(rn_cpu, 10.0, dt, I_val)
-        _simulate_gpu(rn_gpu, 10.0, dt, I_val)
-
         cpu_times: List[float] = []
         gpu_times: List[float] = []
+        cpu_stds: List[float] = []
+        gpu_stds: List[float] = []
+
         for dur in durations:
             steps = int(dur / dt)
             print(f"    dur={dur:>7.0f} ms  steps={steps:>7d} ... ",
                   end="", flush=True)
-            t_cpu = _simulate_cpu(rn_cpu, dur, dt, I_val)
-            t_gpu = _simulate_gpu(rn_gpu, dur, dt, I_val)
+            t_cpu, t_gpu, cpu_std, gpu_std = _bench_pair_repeated(
+                N, "HH", n_syn_per_neuron, dur, dt, I_val, reps=reps
+            )
             cpu_times.append(t_cpu)
             gpu_times.append(t_gpu)
-            print(f"CPU={t_cpu:.3f}s  GPU={t_gpu:.3f}s  "
+            cpu_stds.append(cpu_std)
+            gpu_stds.append(gpu_std)
+            print(f"CPU={_fmt_time(t_cpu, cpu_std, reps)}  "
+                  f"GPU={_fmt_time(t_gpu, gpu_std, reps)}  "
                   f"speedup={_fmt_speedup(t_cpu, t_gpu)}")
 
-        del rn_cpu, rn_gpu
         gc.collect()
 
-        per_n[N] = {"cpu": cpu_times, "gpu": gpu_times, "n_syn": n_syn}
+        per_n[N] = {
+            "cpu": cpu_times,
+            "gpu": gpu_times,
+            "cpu_std": cpu_stds,
+            "gpu_std": gpu_stds,
+            "n_syn": n_syn,
+        }
 
-    return {"n_values": n_values, "durations": durations, "per_n": per_n}
+    return {"n_values": n_values, "durations": durations, "per_n": per_n, "reps": reps}
 
 
 # =============================================================================
@@ -293,6 +379,7 @@ def run_neuron_type_comparison(
     duration: float = 100.0,
     dt: float = 0.05,
     I_val: float = 8.0,
+    reps: int = DEFAULT_REPS,
 ) -> Dict:
     if neuron_counts is None:
         neuron_counts = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
@@ -305,26 +392,35 @@ def run_neuron_type_comparison(
     ]:
         cpu_times: List[float] = []
         gpu_times: List[float] = []
+        cpu_stds: List[float] = []
+        gpu_stds: List[float] = []
 
         print(f"\n--- Neuron type: {label} ({n_syn_per_neuron} syn/neuron, "
-              f"duration={duration} ms) ---")
+              f"duration={duration} ms, reps={reps}) ---")
 
         for N in neuron_counts:
             k = min(n_syn_per_neuron, N - 1)
             n_syn = N * k
             print(f"  N={N:>5d}  synapses={n_syn:>8d} ... ", end="", flush=True)
 
-            t_cpu, t_gpu = _bench_pair(N, neuron_type, n_syn_per_neuron,
-                                       duration, dt, i_val)
+            t_cpu, t_gpu, cpu_std, gpu_std = _bench_pair_repeated(
+                N, neuron_type, n_syn_per_neuron, duration, dt, i_val, reps=reps
+            )
             cpu_times.append(t_cpu)
             gpu_times.append(t_gpu)
-            print(f"CPU={t_cpu:.3f}s  GPU={t_gpu:.3f}s  "
+            cpu_stds.append(cpu_std)
+            gpu_stds.append(gpu_std)
+            print(f"CPU={_fmt_time(t_cpu, cpu_std, reps)}  "
+                  f"GPU={_fmt_time(t_gpu, gpu_std, reps)}  "
                   f"speedup={_fmt_speedup(t_cpu, t_gpu)}")
 
         results[label] = {
             "neuron_counts": neuron_counts,
             "cpu": cpu_times,
             "gpu": gpu_times,
+            "cpu_std": cpu_stds,
+            "gpu_std": gpu_stds,
+            "reps": reps,
         }
 
     return results
@@ -336,6 +432,10 @@ def run_neuron_type_comparison(
 
 def _speedups(cpu_times, gpu_times) -> List[float]:
     return [c / g if g > 0 else 0.0 for c, g in zip(cpu_times, gpu_times)]
+
+
+def _reps_label(reps: int) -> str:
+    return f"mean of {reps} runs" if reps > 1 else "single run"
 
 
 def plot_neuron_scaling(data: Dict, figs_dir: Path):
@@ -365,7 +465,11 @@ def plot_neuron_scaling(data: Dict, figs_dir: Path):
     ax.legend()
     ax.grid(True, which="both", alpha=0.3)
 
-    fig.suptitle("GPU vs CPU: Neuron Scaling", fontsize=14, fontweight="bold")
+    fig.suptitle(
+        f"GPU vs CPU: Neuron Scaling ({_reps_label(data.get('reps', 1))})",
+        fontsize=14,
+        fontweight="bold",
+    )
     fig.tight_layout()
     out = figs_dir / "benchmark_gpu_neuron_scaling.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -404,7 +508,11 @@ def plot_synapse_scaling(data: Dict, figs_dir: Path):
     ax.legend()
     ax.grid(True, which="both", alpha=0.3)
 
-    fig.suptitle("GPU vs CPU: Synapse Scaling", fontsize=14, fontweight="bold")
+    fig.suptitle(
+        f"GPU vs CPU: Synapse Scaling ({_reps_label(data.get('reps', 1))})",
+        fontsize=14,
+        fontweight="bold",
+    )
     fig.tight_layout()
     out = figs_dir / "benchmark_gpu_synapse_scaling.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -456,7 +564,11 @@ def plot_duration_scaling(data: Dict, figs_dir: Path):
     ax.legend(fontsize=9)
     ax.grid(True, which="both", alpha=0.3)
 
-    fig.suptitle("GPU vs CPU: Duration Scaling", fontsize=14, fontweight="bold")
+    fig.suptitle(
+        f"GPU vs CPU: Duration Scaling ({_reps_label(data.get('reps', 1))})",
+        fontsize=14,
+        fontweight="bold",
+    )
     fig.tight_layout()
     out = figs_dir / "benchmark_gpu_duration_scaling.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -496,7 +608,12 @@ def plot_neuron_type_comparison(data: Dict, figs_dir: Path):
     ax.legend()
     ax.grid(True, which="both", alpha=0.3)
 
-    fig.suptitle("GPU vs CPU: Neuron Type Comparison", fontsize=14, fontweight="bold")
+    reps = next(iter(data.values())).get("reps", 1) if data else 1
+    fig.suptitle(
+        f"GPU vs CPU: Neuron Type Comparison ({_reps_label(reps)})",
+        fontsize=14,
+        fontweight="bold",
+    )
     fig.tight_layout()
     out = figs_dir / "benchmark_gpu_neuron_types.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -547,11 +664,39 @@ def _bench_topology_pair(
     return t_cpu, t_gpu
 
 
+def _bench_topology_pair_repeated(
+    N: int,
+    synapses,
+    duration: float,
+    dt: float,
+    I_val: float,
+    reps: int = DEFAULT_REPS,
+    warmup: bool = True,
+) -> Tuple[float, float, float, float]:
+    """Return (cpu_mean, gpu_mean, cpu_std, gpu_std) over repeated topology runs."""
+    cpu_runs: List[float] = []
+    gpu_runs: List[float] = []
+
+    for rep in range(reps):
+        t_cpu, t_gpu = _bench_topology_pair(
+            N, synapses, duration, dt, I_val, warmup=warmup
+        )
+        cpu_runs.append(t_cpu)
+        gpu_runs.append(t_gpu)
+        if reps > 1:
+            print(f"{rep + 1}/{reps} ", end="", flush=True)
+
+    cpu_mean, cpu_std = _mean_std(cpu_runs)
+    gpu_mean, gpu_std = _mean_std(gpu_runs)
+    return cpu_mean, gpu_mean, cpu_std, gpu_std
+
+
 def run_topology_benchmarks(
     sizes: Optional[List[int]] = None,
     duration: float = 100.0,
     dt: float = 0.05,
     I_val: float = 8.0,
+    reps: int = DEFAULT_REPS,
 ) -> Dict:
     """
     GPU vs CPU timing for Chain, Ring, All-to-All, and Star topologies.
@@ -565,6 +710,8 @@ def run_topology_benchmarks(
     for topo_name, builder in TOPOLOGIES.items():
         cpu_times: List[float] = []
         gpu_times: List[float] = []
+        cpu_stds: List[float] = []
+        gpu_stds: List[float] = []
         max_n = _GPU_TOPO_MAX_N.get(topo_name)
         topo_sizes = [N for N in sizes if max_n is None or N <= max_n]
 
@@ -577,16 +724,24 @@ def run_topology_benchmarks(
             n_syn = len(synapses)
             print(f"    N={N:>4d}  synapses={n_syn:>7d} ... ", end="", flush=True)
 
-            t_cpu, t_gpu = _bench_topology_pair(N, synapses, duration, dt, I_val)
+            t_cpu, t_gpu, cpu_std, gpu_std = _bench_topology_pair_repeated(
+                N, synapses, duration, dt, I_val, reps=reps
+            )
             cpu_times.append(t_cpu)
             gpu_times.append(t_gpu)
-            print(f"CPU={t_cpu:.3f}s  GPU={t_gpu:.3f}s  "
+            cpu_stds.append(cpu_std)
+            gpu_stds.append(gpu_std)
+            print(f"CPU={_fmt_time(t_cpu, cpu_std, reps)}  "
+                  f"GPU={_fmt_time(t_gpu, gpu_std, reps)}  "
                   f"speedup={_fmt_speedup(t_cpu, t_gpu)}")
 
         results[topo_name] = {
             "sizes": topo_sizes,
             "cpu": cpu_times,
             "gpu": gpu_times,
+            "cpu_std": cpu_stds,
+            "gpu_std": gpu_stds,
+            "reps": reps,
         }
 
     return results
@@ -608,7 +763,12 @@ def plot_topology_timing(results: Dict, figs_dir: Path):
         ax.legend(fontsize=9)
         ax.grid(True, which="both", alpha=0.3)
 
-    fig.suptitle("GPU vs CPU Timing by Topology", fontsize=15, fontweight="bold")
+    reps = next(iter(results.values())).get("reps", 1) if results else 1
+    fig.suptitle(
+        f"GPU vs CPU Timing by Topology ({_reps_label(reps)})",
+        fontsize=15,
+        fontweight="bold",
+    )
     fig.tight_layout()
     out = figs_dir / "benchmark_gpu_time_vs_neurons.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -632,7 +792,12 @@ def plot_topology_speedup(results: Dict, figs_dir: Path):
     ax.set_xscale("log")
     ax.set_xlabel("Number of neurons", fontsize=12)
     ax.set_ylabel("Speedup (CPU time / GPU time)", fontsize=12)
-    ax.set_title("GPU Speedup Over CPU by Topology", fontsize=14, fontweight="bold")
+    reps = next(iter(results.values())).get("reps", 1) if results else 1
+    ax.set_title(
+        f"GPU Speedup Over CPU by Topology ({_reps_label(reps)})",
+        fontsize=14,
+        fontweight="bold",
+    )
     ax.legend(fontsize=10)
     ax.grid(True, which="both", alpha=0.3)
 
@@ -648,6 +813,21 @@ def plot_topology_speedup(results: Dict, figs_dir: Path):
 # =============================================================================
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="GPU-vs-CPU Hodgkin-Huxley benchmark suite."
+    )
+    parser.add_argument(
+        "-r", "--reps",
+        type=int,
+        default=DEFAULT_REPS,
+        help=(
+            "Number of timed repeats per configuration. "
+            f"Default: {DEFAULT_REPS}."
+        ),
+    )
+    args = parser.parse_args()
+    reps = max(1, args.reps)
+
     print("=" * 60)
     print("GPU Benchmark: CUDA vs CPU Simulation")
     print("=" * 60)
@@ -666,7 +846,7 @@ def main():
     dt = 0.05   # ms
     I_val = 8.0
 
-    print(f"\ndt={dt} ms, I_ext={I_val} uA/cm^2")
+    print(f"\ndt={dt} ms, I_ext={I_val} uA/cm^2, reps={reps}")
     print(f"Output: {figs_dir}")
     print("\nNote: all networks use static weights (no STDP/STP) to stay on GPU synapse path.\n")
 
@@ -677,6 +857,7 @@ def main():
         duration=100.0,
         dt=dt,
         I_val=I_val,
+        reps=reps,
     )
     plot_topology_timing(topo_results, figs_dir)
     plot_topology_speedup(topo_results, figs_dir)
@@ -688,6 +869,7 @@ def main():
         duration=100.0,
         dt=dt,
         I_val=I_val,
+        reps=reps,
     )
     plot_neuron_scaling(neuron_data, figs_dir)
 
@@ -698,6 +880,7 @@ def main():
         duration=100.0,
         dt=dt,
         I_val=I_val,
+        reps=reps,
     )
     plot_synapse_scaling(syn_data, figs_dir)
 
@@ -709,6 +892,7 @@ def main():
         durations=[10, 25, 50, 100, 200, 500, 1000, 5000, 10000],
         dt=dt,
         I_val=I_val,
+        reps=reps,
     )
     plot_duration_scaling(dur_data, figs_dir)
 
@@ -718,6 +902,7 @@ def main():
         n_syn_per_neuron=8,
         duration=100.0,
         dt=dt,
+        reps=reps,
     )
     plot_neuron_type_comparison(type_data, figs_dir)
 

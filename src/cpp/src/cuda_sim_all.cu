@@ -166,7 +166,12 @@ __device__ void composable_step_unrolled(
     const int stride = p.state_stride;
 
     double v = p.d_V[i];
-    const double current = p.d_I_ext[i] + I_in;
+    // I_in already carries external + synaptic current (d_I_syn, filled from the
+    // StimRaw constant/pulse/DBS terms in P1). Do NOT add p.d_I_ext here: the pool's
+    // d_I_ext array is only populated by the non-cooperative gather_currents() path;
+    // in the cooperative kernel it is never written and holds uninitialized garbage,
+    // which produced non-deterministic results for every composable model.
+    const double current = I_in;
 
     double gate_vals[NG];
     double x_vals[NS > 0 ? NS : 1];
@@ -320,7 +325,8 @@ __device__ inline void update_synapse_state_single(
 
     const int read_slot = static_cast<int>(
         (step + syn.ring_size - (syn.d_delay_steps[k] % static_cast<uint32_t>(syn.ring_size))) % syn.ring_size);
-    const bool arrived = syn.d_spike_ring[k * syn.ring_size + read_slot] != 0;
+    // Per-neuron ring: read this synapse's PREsynaptic neuron history at its delay.
+    const bool arrived = syn.d_spike_ring[syn.d_pre[k] * syn.ring_size + read_slot] != 0;
     syn.d_spike_arrived[k] = arrived ? 1u : 0u;
 
     const auto& desc = syn.d_spec_descs[syn.d_spec_idx[k]];
@@ -527,10 +533,13 @@ __device__ void simulate_all_kernel_impl(
         sync_step<MultiBlock>(grid);
 
         // ---- P6: update spike ring ----
+        // Per-NEURON ring: record each neuron's spike once (not once per outgoing
+        // synapse). Size n_neurons*ring_size instead of n_synapses*ring_size — for
+        // dense/delayed networks that is orders of magnitude less memory + traffic.
         if (syn.n_synapses > 0) {
             const int write_slot = static_cast<int>(step % static_cast<size_t>(syn.ring_size));
-            for (int s = tid; s < syn.n_synapses; s += total)
-                syn.d_spike_ring[s * syn.ring_size + write_slot] = syn.d_neuron_spiked[syn.d_pre[s]] ? 1u : 0u;
+            for (int i = tid; i < syn.n_neurons; i += total)
+                syn.d_spike_ring[i * syn.ring_size + write_slot] = syn.d_neuron_spiked[i] ? 1u : 0u;
         }
         // P6→P7 barrier — only required when min_delay_steps == 0 (read_slot
         // could equal write_slot). For typical networks with delay >= dt, the

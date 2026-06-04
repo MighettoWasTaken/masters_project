@@ -27,14 +27,14 @@ GPi beta-band power (7-35 Hz, a.u.)
 ------------------------------------------------------------------------------------------------
 Metric        Cond       MAT mean     MAT [min,max]  LIB mean     LIB [min,max]   d(L-M)     rel
 GPi beta-pow  Healthy       408.5         [275,491]     368.8         [262,517]    -39.7   -9.7%
-GPi beta-pow  PD            635.0         [577,698]     642.3         [584,683]     +7.4   +1.2%
+GPi beta-pow  PD            635.0         [577,698]     642.4         [584,683]     +7.4   +1.2%
 
 Per-trial agreement: MATLAB vs Library  (paired by trial configuration)
   CCC = Lin's concordance (1 = perfect); r = Pearson, pooled over all trials.
   Wilcoxon p = systematic bias of paired (Library - MATLAB); high p = no bias.
 ------------------------------------------------------------------------------------------------
 Metric            n   Pearson r   Lin CCC  Wilcoxon p (Healthy)   Wilcoxon p (PD)
-TH               64       0.963     0.962                 0.968             0.104
+TH               64       0.963     0.962                 0.968             0.095
 STN              64       0.887     0.868                 0.003             0.094
 GPe              64       0.971     0.970                 0.467             0.913
 GPi              64       0.959     0.958                 0.634             0.290
@@ -46,4 +46,4 @@ GPi beta-pow     64       0.878     0.861                 0.052             0.16
 
 Library simulation runtime (s per trial)
 ------------------------------------------------------------------------------------------------
-  mean=1.73s   span=[1.27, 2.31]s   range=1.04s   total=110.9s   n=64
+  mean=14.22s   span=[13.58, 15.57]s   range=2.00s   total=909.8s   n=64

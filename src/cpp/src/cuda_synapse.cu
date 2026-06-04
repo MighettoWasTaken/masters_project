@@ -118,15 +118,15 @@ __global__ void detect_neuron_spikes_kernel(
 
 __global__ void update_spike_ring_kernel(
     const uint8_t* neuron_spiked,
-    const uint32_t* pre,
     uint8_t* spike_ring,
-    int n_synapses,
+    int n_neurons,
     int write_slot,
     int ring_size)
 {
-    const int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= n_synapses) return;
-    spike_ring[k * ring_size + write_slot] = neuron_spiked[pre[k]] ? 1u : 0u;
+    // Per-NEURON ring: one entry per neuron, not per synapse.
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_neurons) return;
+    spike_ring[i * ring_size + write_slot] = neuron_spiked[i] ? 1u : 0u;
 }
 
 __global__ void update_synapse_state_kernel(
@@ -154,7 +154,8 @@ __global__ void update_synapse_state_kernel(
 
     const int read_slot = static_cast<int>(
         (current_step + ring_size - (delay_steps[k] % static_cast<uint32_t>(ring_size))) % ring_size);
-    const bool arrived = spike_ring[k * ring_size + read_slot] != 0;
+    // Per-neuron ring: read this synapse's PREsynaptic neuron history at its delay.
+    const bool arrived = spike_ring[pre[k] * ring_size + read_slot] != 0;
     spike_arrived[k] = arrived ? 1u : 0u;
 
     const auto& desc = spec_descs[spec_idx[k]];
@@ -330,7 +331,7 @@ void allocate_device_synapses(DeviceSynapseArrays& dev,
                    "cudaMalloc spec_descs");
     }
 
-    alloc_u8(dev.d_spike_ring, synapse_count * ring_size, "cudaMalloc spike_ring");
+    alloc_u8(dev.d_spike_ring, neuron_count * ring_size, "cudaMalloc spike_ring"); // per-neuron ring
     alloc_u8(dev.d_spike_arrived, synapse_count, "cudaMalloc spike_arrived");
     alloc_u8(dev.d_neuron_spiked, neuron_count, "cudaMalloc neuron_spiked");
     alloc_doubles(dev.d_V_prev, neuron_count, "cudaMalloc V_prev");
@@ -487,7 +488,7 @@ void download_device_synapse_state(
     copy_back(V_prev, dev.d_V_prev, dev.neuron_count, "cudaMemcpy V_prev D2H");
 
     if (spike_ring) {
-        spike_ring->resize(dev.synapse_count * dev.ring_size);
+        spike_ring->resize(dev.neuron_count * dev.ring_size); // per-neuron ring
         if (!spike_ring->empty()) {
             check_cuda(cudaMemcpy(spike_ring->data(), dev.d_spike_ring,
                                   spike_ring->size() * sizeof(uint8_t),
@@ -553,11 +554,12 @@ void update_cuda_synapses(
     const int block_syn = 128;
     const int grid_syn = static_cast<int>((dev.synapse_count + block_syn - 1) / block_syn);
     const int write_slot = static_cast<int>(current_step % dev.ring_size);
-    update_spike_ring_kernel<<<grid_syn, block_syn>>>(
+    // Per-neuron ring: write one entry per neuron (grid sized over neurons).
+    const int grid_neu = static_cast<int>((dev.neuron_count + block_syn - 1) / block_syn);
+    update_spike_ring_kernel<<<grid_neu, block_syn>>>(
         dev.d_neuron_spiked,
-        dev.d_pre,
         dev.d_spike_ring,
-        static_cast<int>(dev.synapse_count),
+        static_cast<int>(dev.neuron_count),
         write_slot,
         static_cast<int>(dev.ring_size));
     check_cuda(cudaGetLastError(), "update_spike_ring_kernel");

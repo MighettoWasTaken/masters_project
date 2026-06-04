@@ -94,6 +94,27 @@ public:
                        const SynapseSpec& spec, double delay,
                        const PlasticitySpec& plast);
 
+    // -------------------------------------------------------------------------
+    // Bulk-construction fast path (used by pattern generators).
+    //   intern_synapse_spec : dedup + cache a spec once, return its index
+    //   reserve_synapses    : pre-reserve SoA capacity for N more synapses
+    //   add_synapse_interned: append one synapse with a pre-resolved spec index
+    //                         (skips the per-synapse dedup scan)
+    // Resolve the spec once, reserve once, then loop add_synapse_interned().
+    // -------------------------------------------------------------------------
+    size_t intern_synapse_spec(const SynapseSpec& spec);
+    void   reserve_synapses(size_t additional) { sa_.reserve_additional(additional); }
+    size_t add_synapse_interned(size_t pre, size_t post, double weight,
+                                size_t sidx, const SynapseSpec& spec, double delay);
+
+    /// Append many synapses sharing one spec from precomputed global index/weight
+    /// arrays in a single call (interns the spec + reserves once). Lets the Python
+    /// connect path build connectivity in numpy and cross into C++ exactly once.
+    void add_synapses_bulk(const std::vector<uint32_t>& pre,
+                           const std::vector<uint32_t>& post,
+                           const std::vector<double>& weight,
+                           const SynapseSpec& spec, double delay);
+
     // Backward-compatible convenience wrappers — delegate to add_synapse()
     void add_synapse(size_t pre_idx, size_t post_idx, double weight,
                      double E_syn = 0.0, double tau = 2.0, double delay = 0.0);
@@ -279,6 +300,17 @@ private:
 
         double cached_dt = -1.0;
         size_t size() const { return S.size(); }  // pre/post may be cleared after build
+
+        // Reserve capacity for `n` additional synapses across all per-synapse
+        // arrays — avoids incremental reallocation during bulk connect.
+        void reserve_additional(size_t n) {
+            const size_t cap = S.size() + n;
+            pre.reserve(cap);   post.reserve(cap);   weight.reserve(cap);
+            g.reserve(cap);     E_syn.reserve(cap);  delay.reserve(cap);
+            S.reserve(cap);     A.reserve(cap);      spec_idx.reserve(cap);
+            plast_type.reserve(cap);        plast_state_idx.reserve(cap);
+            plast_spec_idx_arr.reserve(cap); is_active.reserve(cap);
+        }
 
         void push_defaults() {
             S.push_back(0.0);

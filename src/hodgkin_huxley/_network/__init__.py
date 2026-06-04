@@ -522,23 +522,32 @@ class RegionalNetwork:
                 pattern, src_size, dst_size, shift, probability,
                 allow_self, rng, same_pop=same_pop,
             )
-        for i, j in pairs:  # type: ignore[union-attr]
-            if wdist.type == WeightDistType.CONSTANT:
-                w = wdist.param1
-            elif wdist.type == WeightDistType.UNIFORM:
-                w = rng.uniform(wdist.param1, wdist.param2)
-            else:  # NORMAL
-                w = rng.normal(wdist.param1, wdist.param2)
-            pre = self._rnet.population_start(src) + int(i)
-            post = self._rnet.population_start(dst) + int(j)
-            if plast_spec is not None:
-                self._rnet.network().add_synapse(
-                    pre, post, float(w), synapse, delay, plast_spec
-                )
-            else:
-                self._rnet.network().add_synapse(
-                    pre, post, float(w), synapse, delay
-                )
+        # Vectorize: build global pre/post + weight arrays in numpy, then cross
+        # into C++ exactly once via add_synapses_bulk(). The per-synapse Python
+        # loop (4 pybind calls + SynapseSpec re-marshalling each) was the model-
+        # construction bottleneck. Pair generation and the rng draw order are
+        # unchanged, so seeded connectivity/weights are bit-identical.
+        ij = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        n_syn = ij.shape[0]
+        if n_syn == 0:
+            return
+        pre = (self._rnet.population_start(src) + ij[:, 0]).astype(np.uint32)
+        post = (self._rnet.population_start(dst) + ij[:, 1]).astype(np.uint32)
+        if wdist.type == WeightDistType.CONSTANT:
+            w = np.full(n_syn, wdist.param1, dtype=np.float64)
+        elif wdist.type == WeightDistType.UNIFORM:
+            w = rng.uniform(wdist.param1, wdist.param2, size=n_syn)
+        else:  # NORMAL
+            w = rng.normal(wdist.param1, wdist.param2, size=n_syn)
+
+        net = self._rnet.network()
+        if plast_spec is not None:
+            # Plasticity is per-synapse state — keep the explicit path.
+            for k in range(n_syn):
+                net.add_synapse(int(pre[k]), int(post[k]), float(w[k]),
+                                synapse, delay, plast_spec)
+        else:
+            net.add_synapses_bulk(pre, post, w, synapse, delay)
 
     def add_connection(
         self,
