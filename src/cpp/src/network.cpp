@@ -6,6 +6,8 @@
 #endif
 #include <stdexcept>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <numeric>
 #include <atomic>
@@ -70,9 +72,17 @@ bool Network::can_use_cuda_synapse_path() const {
 }
 
 void Network::free_cuda_runtime() {
-    if (sim_stream_) { cudaStreamDestroy(sim_stream_); sim_stream_ = nullptr; }
-    if (d_V_out_)    { cudaFree(d_V_out_);    d_V_out_    = nullptr; d_V_out_cap_    = 0; }
-    if (d_spike_buf_){ cudaFree(d_spike_buf_); d_spike_buf_= nullptr; d_spike_buf_cap_= 0; }
+    if (sim_stream_)  { cudaStreamDestroy(sim_stream_);  sim_stream_  = nullptr; }
+    if (copy_stream_) { cudaStreamDestroy(copy_stream_); copy_stream_ = nullptr; }
+    for (int b = 0; b < 2; ++b) {
+        if (d_V_out_[b])        { cudaFree(d_V_out_[b]);          d_V_out_[b] = nullptr; }
+        if (d_spike_buf_[b])    { cudaFree(d_spike_buf_[b]);      d_spike_buf_[b] = nullptr; }
+        if (V_stage_pinned_[b]) { cudaFreeHost(V_stage_pinned_[b]); V_stage_pinned_[b] = nullptr; }
+        if (spk_stage_pinned_[b]){ cudaFreeHost(spk_stage_pinned_[b]); spk_stage_pinned_[b] = nullptr; }
+        if (compute_done_[b])   { cudaEventDestroy(compute_done_[b]); compute_done_[b] = nullptr; }
+        if (copy_done_[b])      { cudaEventDestroy(copy_done_[b]);    copy_done_[b] = nullptr; }
+    }
+    rec_buf_cap_ = 0;
     if (d_V_cache_) cudaFree(d_V_cache_);
     if (d_I_syn_) cudaFree(d_I_syn_);
     if (d_synapse_g_scale_) cudaFree(d_synapse_g_scale_);
@@ -1603,57 +1613,119 @@ void Network::simulate_with_descriptors(
                 throw std::runtime_error("simulate_with_descriptors: cudaStreamCreate failed");
         }
 
-        // Allocate device recording buffers
-        const size_t v_needed = V_buf ? n_neurons * n_rec : 0;
-        if (v_needed > d_V_out_cap_) {
-            if (d_V_out_) cudaFree(d_V_out_);
-            if (v_needed > 0 &&
-                cudaMalloc(reinterpret_cast<void**>(&d_V_out_),
-                           v_needed * sizeof(double)) != cudaSuccess)
-                throw std::runtime_error("simulate_with_descriptors: cudaMalloc d_V_out_ failed");
-            d_V_out_cap_ = v_needed;
-        }
-        const size_t s_needed = spike_buf_uint8 ? n_neurons * n_rec : 0;
-        if (s_needed > d_spike_buf_cap_) {
-            if (d_spike_buf_) cudaFree(d_spike_buf_);
-            if (s_needed > 0 &&
-                cudaMalloc(reinterpret_cast<void**>(&d_spike_buf_),
-                           s_needed * sizeof(uint8_t)) != cudaSuccess)
-                throw std::runtime_error("simulate_with_descriptors: cudaMalloc d_spike_buf_ failed");
-            d_spike_buf_cap_ = s_needed;
-        }
-        if (spike_buf_uint8 && d_spike_buf_)
-            cudaMemset(d_spike_buf_, 0, s_needed * sizeof(uint8_t));
-
-        // Collect pool descriptors (ensures device state is ready)
+        // ---- Chunked async recording streaming ----
+        // Collect pool descriptors (ensures device state is ready) + stim/syn.
         std::vector<CudaHHDesc>         hh_descs;
         std::vector<CudaIzDesc>         iz_descs;
         std::vector<CudaComposableDesc> comp_descs;
         pool_mgr_.collect_hh_descs(hh_descs);
         pool_mgr_.collect_iz_descs(iz_descs);
         pool_mgr_.collect_comp_descs(comp_descs);
+        CudaStimRaw      stim_raw = upload_stim_raw(stim, n_neurons, pool_mgr_.cuda_device_id());
+        DeviceSynapseRaw syn_raw  = make_syn_raw(dev_syn_);
 
-        CudaStimRaw   stim_raw = upload_stim_raw(stim, n_neurons, pool_mgr_.cuda_device_id());
-        DeviceSynapseRaw syn_raw = make_syn_raw(dev_syn_);
+        // Chunk size: pick recording-columns-per-chunk so chunk_steps is a
+        // multiple of `interval` by construction. Bounds recording VRAM to
+        // 2 * chunk_rec * bytes_per_col (ping/pong) instead of the whole-sim
+        // n_rec * bytes_per_col, and lets each chunk's D2H copy overlap the
+        // next chunk's compute (no giant blocking end-of-run copy).
+        const size_t bytes_per_col =
+            (V_buf           ? n_neurons * sizeof(double)  : 0) +
+            (spike_buf_uint8 ? n_neurons * sizeof(uint8_t) : 0);
+        size_t kTargetBytes = size_t(48) << 20;   // ~48 MB per device buffer (tunable)
+        if (const char* e = std::getenv("HH_REC_CHUNK_BYTES")) {
+            long v = std::atol(e);
+            if (v > 0) kTargetBytes = static_cast<size_t>(v);
+        }
+        size_t chunk_rec = (bytes_per_col > 0)
+            ? std::max<size_t>(1, std::min<size_t>(n_rec, kTargetBytes / bytes_per_col))
+            : (n_rec > 0 ? n_rec : 1);
+        const size_t chunk_steps = chunk_rec * interval;
 
-        simulate_all_steps(
+        // (Re)allocate ping/pong device + pinned staging buffers when chunk grows.
+        const size_t per_buf = n_neurons * chunk_rec;
+        if (per_buf > rec_buf_cap_) {
+            for (int b = 0; b < 2; ++b) {
+                if (d_V_out_[b])          { cudaFree(d_V_out_[b]);            d_V_out_[b] = nullptr; }
+                if (d_spike_buf_[b])      { cudaFree(d_spike_buf_[b]);        d_spike_buf_[b] = nullptr; }
+                if (V_stage_pinned_[b])   { cudaFreeHost(V_stage_pinned_[b]); V_stage_pinned_[b] = nullptr; }
+                if (spk_stage_pinned_[b]) { cudaFreeHost(spk_stage_pinned_[b]); spk_stage_pinned_[b] = nullptr; }
+                if (V_buf) {
+                    if (cudaMalloc(reinterpret_cast<void**>(&d_V_out_[b]), per_buf*sizeof(double)) != cudaSuccess)
+                        throw std::runtime_error("simulate_with_descriptors: cudaMalloc d_V_out chunk failed");
+                    cudaMallocHost(reinterpret_cast<void**>(&V_stage_pinned_[b]), per_buf*sizeof(double));
+                }
+                if (spike_buf_uint8) {
+                    if (cudaMalloc(reinterpret_cast<void**>(&d_spike_buf_[b]), per_buf*sizeof(uint8_t)) != cudaSuccess)
+                        throw std::runtime_error("simulate_with_descriptors: cudaMalloc d_spike_buf chunk failed");
+                    cudaMallocHost(reinterpret_cast<void**>(&spk_stage_pinned_[b]), per_buf*sizeof(uint8_t));
+                }
+            }
+            rec_buf_cap_ = per_buf;
+        }
+        if (!copy_stream_) cudaStreamCreate(&copy_stream_);
+        for (int b = 0; b < 2; ++b) {
+            if (!compute_done_[b]) cudaEventCreateWithFlags(&compute_done_[b], cudaEventDisableTiming);
+            if (!copy_done_[b])    cudaEventCreateWithFlags(&copy_done_[b],    cudaEventDisableTiming);
+        }
+
+        SimAllPlan plan = simulate_all_plan_create(
             hh_descs.data(),  static_cast<int>(hh_descs.size()),
             iz_descs.data(),  static_cast<int>(iz_descs.size()),
             comp_descs.data(), static_cast<int>(comp_descs.size()),
-            syn_raw, stim_raw,
-            d_V_cache_, d_I_syn_,
-            V_buf           ? d_V_out_     : nullptr,
-            spike_buf_uint8 ? d_spike_buf_ : nullptr,
-            n_neurons, num_steps, dt,
-            current_step_, interval, n_rec,
-            sim_stream_);
+            n_neurons, syn_raw.n_synapses, stim_raw.n_neurons);
+
+        const size_t base_step = current_step_;
+        // Deferred host scatter: pinned staging[chunk j] -> the right columns of
+        // the pageable numpy output. Blocks on chunk j's copy first.
+        auto scatter_chunk = [&](size_t j, size_t off_j, size_t rec_j) {
+            const int bj = static_cast<int>(j & 1);
+            cudaEventSynchronize(copy_done_[bj]);
+            for (size_t i = 0; i < n_neurons; ++i) {
+                if (V_buf)
+                    std::memcpy(V_buf + i*n_rec + off_j, V_stage_pinned_[bj] + i*rec_j, rec_j*sizeof(double));
+                if (spike_buf_uint8)
+                    std::memcpy(spike_buf_uint8 + i*n_rec + off_j, spk_stage_pinned_[bj] + i*rec_j, rec_j*sizeof(uint8_t));
+            }
+        };
+
+        const size_t n_chunks = (num_steps + chunk_steps - 1) / chunk_steps;
+        size_t off = 0, g_step = 0, prev_off = 0, prev_rec = 0;
+        bool have_prev = false;
+        for (size_t k = 0; k < n_chunks; ++k) {
+            const int b = static_cast<int>(k & 1);
+            const size_t this_steps = std::min(chunk_steps, num_steps - g_step);
+            const size_t this_rec   = (this_steps + interval - 1) / interval;
+            const size_t step_start = base_step + g_step;
+
+            if (k >= 2) cudaStreamWaitEvent(sim_stream_, copy_done_[b], 0);   // buffer-reuse guard
+            if (spike_buf_uint8)
+                cudaMemsetAsync(d_spike_buf_[b], 0, n_neurons*this_rec*sizeof(uint8_t), sim_stream_);
+
+            simulate_all_launch(plan, syn_raw, stim_raw, d_V_cache_, d_I_syn_,
+                                V_buf           ? d_V_out_[b]     : nullptr,
+                                spike_buf_uint8 ? d_spike_buf_[b] : nullptr,
+                                n_neurons, this_steps, dt, step_start, interval, this_rec, sim_stream_);
+            cudaEventRecord(compute_done_[b], sim_stream_);
+
+            cudaStreamWaitEvent(copy_stream_, compute_done_[b], 0);
+            if (V_buf)
+                cudaMemcpyAsync(V_stage_pinned_[b], d_V_out_[b],
+                                n_neurons*this_rec*sizeof(double), cudaMemcpyDeviceToHost, copy_stream_);
+            if (spike_buf_uint8)
+                cudaMemcpyAsync(spk_stage_pinned_[b], d_spike_buf_[b],
+                                n_neurons*this_rec*sizeof(uint8_t), cudaMemcpyDeviceToHost, copy_stream_);
+            cudaEventRecord(copy_done_[b], copy_stream_);
+
+            if (have_prev) scatter_chunk(k-1, prev_off, prev_rec);   // overlaps this chunk's compute
+            prev_off = off; prev_rec = this_rec; have_prev = true;
+            off += this_rec; g_step += this_steps;
+        }
+        if (have_prev) scatter_chunk(n_chunks-1, prev_off, prev_rec);   // drain final chunk
+        cudaStreamSynchronize(copy_stream_);
+        simulate_all_plan_destroy(plan);
 
         current_step_ += num_steps;
-
-        if (V_buf && d_V_out_)
-            cudaMemcpy(V_buf, d_V_out_, v_needed * sizeof(double), cudaMemcpyDeviceToHost);
-        if (spike_buf_uint8 && d_spike_buf_)
-            cudaMemcpy(spike_buf_uint8, d_spike_buf_, s_needed * sizeof(uint8_t), cudaMemcpyDeviceToHost);
 
         sync_cuda_synapses_to_host(true);
         free_stim_raw(stim_raw);

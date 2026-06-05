@@ -400,10 +400,18 @@ private:
     DeviceSynapseArrays dev_syn_;
 
     cudaStream_t sim_stream_      = nullptr;
-    double*      d_V_out_         = nullptr;
-    size_t       d_V_out_cap_     = 0;
-    uint8_t*     d_spike_buf_     = nullptr;
-    size_t       d_spike_buf_cap_ = 0;
+    // Chunked async recording streaming: double-buffered (ping/pong) per-chunk
+    // device recording buffers + a dedicated copy stream that overlaps the D2H
+    // of chunk k with the compute of chunk k+1. Bounds recording VRAM to
+    // 2 * (n_neurons * chunk_rec) instead of the whole-sim n_neurons * n_rec.
+    cudaStream_t copy_stream_       = nullptr;
+    double*      d_V_out_[2]        = {nullptr, nullptr};
+    uint8_t*     d_spike_buf_[2]    = {nullptr, nullptr};
+    double*      V_stage_pinned_[2] = {nullptr, nullptr};   // pinned host staging
+    uint8_t*     spk_stage_pinned_[2] = {nullptr, nullptr};
+    cudaEvent_t  compute_done_[2]   = {nullptr, nullptr};
+    cudaEvent_t  copy_done_[2]      = {nullptr, nullptr};
+    size_t       rec_buf_cap_       = 0;  // per-buffer capacity in recording columns (n_neurons*chunk_rec)
 #endif
 
     // Forward-injection spike delivery state (task26)

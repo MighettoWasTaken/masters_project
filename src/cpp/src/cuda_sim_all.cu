@@ -667,6 +667,148 @@ void free_stim_raw(CudaStimRaw& r) {
 // simulate_all_steps — host launch wrapper
 // ---------------------------------------------------------------------------
 
+// Upload pool descriptors + decide launch config. Runs ONCE; the returned plan
+// is reused across all per-chunk launches (so we never cudaMalloc/Free or sync
+// inside the chunk loop — that would serialize the copy/compute pipeline and
+// could free d_layout while a no-sync kernel still reads it).
+SimAllPlan simulate_all_plan_create(
+    const CudaHHDesc* hh_descs_h, int n_hh,
+    const CudaIzDesc* iz_descs_h, int n_iz,
+    const CudaComposableDesc* comp_descs_h, int n_comp,
+    size_t n_neurons, int n_synapses, int stim_n_neurons)
+{
+    SimAllPlan p;
+    p.n_hh = n_hh; p.n_iz = n_iz; p.n_comp = n_comp;
+    ck(cudaGetDevice(&p.device), "simulate_all_plan_create: cudaGetDevice");
+
+    if (n_hh > 0) {
+        ck(cudaMalloc(reinterpret_cast<void**>(&p.d_hh),   n_hh   * sizeof(CudaHHDesc)),   "d_hh alloc");
+        ck(cudaMemcpy(p.d_hh,   hh_descs_h,   n_hh   * sizeof(CudaHHDesc),   cudaMemcpyHostToDevice), "d_hh memcpy");
+    }
+    if (n_iz > 0) {
+        ck(cudaMalloc(reinterpret_cast<void**>(&p.d_iz),   n_iz   * sizeof(CudaIzDesc)),   "d_iz alloc");
+        ck(cudaMemcpy(p.d_iz,   iz_descs_h,   n_iz   * sizeof(CudaIzDesc),   cudaMemcpyHostToDevice), "d_iz memcpy");
+    }
+    if (n_comp > 0) {
+        ck(cudaMalloc(reinterpret_cast<void**>(&p.d_comp), n_comp * sizeof(CudaComposableDesc)), "d_comp alloc");
+        ck(cudaMemcpy(p.d_comp, comp_descs_h, n_comp * sizeof(CudaComposableDesc), cudaMemcpyHostToDevice), "d_comp memcpy");
+    }
+
+    // Flat neuron-processing layout (model-layout fusion): HH → Iz → composable
+    // sorted by (n_gates, n_channels, n_intracellulars) so same-bucket neurons
+    // are contiguous (minimizes warp divergence). Constant across chunks.
+    std::vector<NeuronSlot> layout;
+    layout.reserve(n_neurons);
+    for (int q = 0; q < n_hh; ++q)
+        for (int i = 0; i < hh_descs_h[q].n; ++i) layout.push_back({0, q, i});
+    for (int q = 0; q < n_iz; ++q)
+        for (int i = 0; i < iz_descs_h[q].n; ++i) layout.push_back({1, q, i});
+    {
+        std::vector<int> comp_order(n_comp);
+        for (int q = 0; q < n_comp; ++q) comp_order[q] = q;
+        std::sort(comp_order.begin(), comp_order.end(), [&](int a, int b) {
+            const auto& A = comp_descs_h[a]; const auto& B = comp_descs_h[b];
+            if (A.n_gates != B.n_gates)       return A.n_gates < B.n_gates;
+            if (A.n_channels != B.n_channels) return A.n_channels < B.n_channels;
+            return A.n_intracellulars < B.n_intracellulars;
+        });
+        for (int q : comp_order)
+            for (int i = 0; i < comp_descs_h[q].n; ++i) layout.push_back({2, q, i});
+    }
+    if (!layout.empty()) {
+        NeuronSlot* d_layout = nullptr;
+        ck(cudaMalloc(reinterpret_cast<void**>(&d_layout), layout.size() * sizeof(NeuronSlot)),
+           "d_layout alloc");
+        ck(cudaMemcpy(d_layout, layout.data(), layout.size() * sizeof(NeuronSlot),
+                      cudaMemcpyHostToDevice), "d_layout memcpy");
+        p.d_layout = d_layout;
+    }
+
+    // Single-block vs cooperative decision — work_items is constant across chunks
+    // (neurons/synapses/stim don't change), so decide once.
+    constexpr int kBlockSize        = 256;
+    const int single_block_max_work = 256;
+    int work_items = static_cast<int>(n_neurons);
+    if (n_synapses    > work_items) work_items = n_synapses;
+    if (stim_n_neurons > work_items) work_items = stim_n_neurons;
+    if (work_items < 1) work_items = 1;
+    p.use_single_block = (work_items <= single_block_max_work);
+
+    if (p.use_single_block) {
+        int sb = ((work_items + 31) / 32) * 32;
+        if (sb < 32)         sb = 32;
+        if (sb > kBlockSize) sb = kBlockSize;
+        p.sb_threads = sb;
+    } else {
+        int supports_coop = 0;
+        ck(cudaDeviceGetAttribute(&supports_coop, cudaDevAttrCooperativeLaunch, p.device),
+           "simulate_all_plan_create: cooperative attr");
+        if (!supports_coop)
+            throw std::runtime_error("simulate_all_plan_create: GPU does not support cooperative launch");
+        int sm_count = 0, max_blocks_sm = 0;
+        ck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, p.device),
+           "simulate_all_plan_create: SM count");
+        ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+               &max_blocks_sm, (const void*)simulate_all_kernel_multi, kBlockSize, 0),
+           "simulate_all_plan_create: occupancy");
+        const int blocks_needed = (work_items + kBlockSize - 1) / kBlockSize;
+        p.total_blocks = std::min(blocks_needed, sm_count * max_blocks_sm);
+        if (p.total_blocks <= 0)
+            throw std::runtime_error("simulate_all_plan_create: 0 cooperative blocks");
+    }
+    return p;
+}
+
+// Enqueue one kernel launch on `stream`. No sync, no free — the caller manages
+// streams/events and frees the plan once at the end.
+void simulate_all_launch(
+    const SimAllPlan& plan,
+    DeviceSynapseRaw syn, CudaStimRaw stim,
+    double* d_V_cache, double* d_I_syn, double* d_V_out, uint8_t* d_spike_buf,
+    size_t n_neurons, size_t num_steps, double dt, size_t step_start,
+    size_t record_interval, size_t n_rec, cudaStream_t stream)
+{
+    if (num_steps == 0) return;
+    constexpr int kBlockSize = 256;
+
+    // Locals whose addresses feed the cooperative-launch arg list.
+    CudaHHDesc*         d_hh    = plan.d_hh;   int n_hh   = plan.n_hh;
+    CudaIzDesc*         d_iz    = plan.d_iz;   int n_iz   = plan.n_iz;
+    CudaComposableDesc* d_comp  = plan.d_comp; int n_comp = plan.n_comp;
+    NeuronSlot*         d_layout = static_cast<NeuronSlot*>(plan.d_layout);
+    int    i_n_neurons  = static_cast<int>(n_neurons);
+    size_t sz_num_steps = num_steps;
+    int    i_rec_iv     = static_cast<int>(record_interval);
+    int    i_n_rec      = static_cast<int>(n_rec);
+
+    if (plan.use_single_block) {
+        simulate_all_kernel_single<<<1, plan.sb_threads, 0, stream>>>(
+            d_hh, n_hh, d_iz, n_iz, d_comp, n_comp, d_layout, syn, stim,
+            d_V_cache, d_I_syn, d_V_out, d_spike_buf,
+            i_n_neurons, sz_num_steps, dt, step_start, i_rec_iv, i_n_rec);
+        ck(cudaGetLastError(), "simulate_all_launch: single-block launch");
+    } else {
+        void* args[] = {
+            &d_hh, &n_hh, &d_iz, &n_iz, &d_comp, &n_comp, &d_layout,
+            &syn, &stim, &d_V_cache, &d_I_syn, &d_V_out, &d_spike_buf,
+            &i_n_neurons, &sz_num_steps, &dt, &step_start, &i_rec_iv, &i_n_rec
+        };
+        ck(cudaLaunchCooperativeKernel(
+               reinterpret_cast<void*>(simulate_all_kernel_multi),
+               dim3(plan.total_blocks), dim3(kBlockSize), args, 0, stream),
+           "simulate_all_launch: cudaLaunchCooperativeKernel");
+    }
+}
+
+void simulate_all_plan_destroy(SimAllPlan& plan) {
+    if (plan.d_hh)     cudaFree(plan.d_hh);
+    if (plan.d_iz)     cudaFree(plan.d_iz);
+    if (plan.d_comp)   cudaFree(plan.d_comp);
+    if (plan.d_layout) cudaFree(plan.d_layout);
+    plan = SimAllPlan{};
+}
+
+// Thin wrapper preserving the original blocking, single-launch behavior.
 void simulate_all_steps(
     const CudaHHDesc*          hh_descs_h, int n_hh,
     const CudaIzDesc*          iz_descs_h, int n_iz,
@@ -686,152 +828,13 @@ void simulate_all_steps(
     cudaStream_t               stream)
 {
     if (num_steps == 0) return;
-
-    int device;
-    ck(cudaGetDevice(&device), "simulate_all_steps: cudaGetDevice");
-
-    // Upload pool descriptor arrays to device
-    CudaHHDesc*         d_hh   = nullptr;
-    CudaIzDesc*         d_iz   = nullptr;
-    CudaComposableDesc* d_comp = nullptr;
-    if (n_hh > 0) {
-        ck(cudaMalloc(reinterpret_cast<void**>(&d_hh),   n_hh   * sizeof(CudaHHDesc)),   "d_hh alloc");
-        ck(cudaMemcpy(d_hh,   hh_descs_h,   n_hh   * sizeof(CudaHHDesc),   cudaMemcpyHostToDevice), "d_hh memcpy");
-    }
-    if (n_iz > 0) {
-        ck(cudaMalloc(reinterpret_cast<void**>(&d_iz),   n_iz   * sizeof(CudaIzDesc)),   "d_iz alloc");
-        ck(cudaMemcpy(d_iz,   iz_descs_h,   n_iz   * sizeof(CudaIzDesc),   cudaMemcpyHostToDevice), "d_iz memcpy");
-    }
-    if (n_comp > 0) {
-        ck(cudaMalloc(reinterpret_cast<void**>(&d_comp), n_comp * sizeof(CudaComposableDesc)), "d_comp alloc");
-        ck(cudaMemcpy(d_comp, comp_descs_h, n_comp * sizeof(CudaComposableDesc), cudaMemcpyHostToDevice), "d_comp memcpy");
-    }
-
-    // Build the flat neuron-processing layout (model-layout fusion). Order:
-    // HH, then Iz, then composable pools sorted by (n_gates, n_channels,
-    // n_intracellulars) so same-bucket neurons are contiguous (minimizes warp
-    // divergence in the flat step loop). Size == total neurons across pools.
-    std::vector<NeuronSlot> layout;
-    layout.reserve(n_neurons);
-    for (int p = 0; p < n_hh; ++p)
-        for (int i = 0; i < hh_descs_h[p].n; ++i) layout.push_back({0, p, i});
-    for (int p = 0; p < n_iz; ++p)
-        for (int i = 0; i < iz_descs_h[p].n; ++i) layout.push_back({1, p, i});
-    {
-        std::vector<int> comp_order(n_comp);
-        for (int p = 0; p < n_comp; ++p) comp_order[p] = p;
-        std::sort(comp_order.begin(), comp_order.end(), [&](int a, int b) {
-            const auto& A = comp_descs_h[a]; const auto& B = comp_descs_h[b];
-            if (A.n_gates != B.n_gates)               return A.n_gates < B.n_gates;
-            if (A.n_channels != B.n_channels)         return A.n_channels < B.n_channels;
-            return A.n_intracellulars < B.n_intracellulars;
-        });
-        for (int p : comp_order)
-            for (int i = 0; i < comp_descs_h[p].n; ++i) layout.push_back({2, p, i});
-    }
-    NeuronSlot* d_layout = nullptr;
-    if (!layout.empty()) {
-        ck(cudaMalloc(reinterpret_cast<void**>(&d_layout), layout.size() * sizeof(NeuronSlot)),
-           "d_layout alloc");
-        ck(cudaMemcpy(d_layout, layout.data(), layout.size() * sizeof(NeuronSlot),
-                      cudaMemcpyHostToDevice), "d_layout memcpy");
-    }
-
-    // Compute work items. Single-block launch (with stride pattern) replaces
-    // grid.sync (~10-15 µs WDDM) with __syncthreads (~10 ns) but loses SM
-    // parallelism — only one SM does work. The break-even depends on per-unit
-    // compute cost:
-    //
-    //   Heavy composable kernel (~30 µs/neuron, register-spilled): single-block
-    //   wins up to several thousand work items because multi-block SM utilization
-    //   is poor for small per-pool counts (e.g. CTX-BG-TH: 10 neurons/pool).
-    //
-    //   Light HH/Iz kernel (~1 µs/neuron): multi-block SM parallelism wins above
-    //   ~256 work items because compute cost shrinks faster than barrier cost.
-    // Single-block (no grid.sync, ~10ns __syncthreads) wins only when the
-    // network is too small to usefully fill multiple SMs. Above ~256 work
-    // items, multi-block's extra SMs outweigh the grid.sync cost — especially
-    // for fp64-transcendental-heavy composable models, which are throughput-
-    // bound on a single SM (consumer GPUs run fp64 at ~1/64 fp32 rate).
-    constexpr int kBlockSize           = 256;
-    const int single_block_max_work    = 256;
-    int work_items = static_cast<int>(n_neurons);
-    if (syn.n_synapses > work_items) work_items = syn.n_synapses;
-    if (stim.n_neurons > work_items) work_items = stim.n_neurons;
-    if (work_items < 1) work_items = 1;
-    // Single- vs multi-block decision is based on total work (work_items =
-    // max over neurons, synapses, stim). Synapse-heavy networks (e.g. all-to-all)
-    // would overwhelm a single SM, so they must take the multi-block path even
-    // when neuron count is small.
-    const bool use_single_block = (work_items <= single_block_max_work);
-
-    int    i_n_neurons   = static_cast<int>(n_neurons);
-    size_t sz_num_steps  = num_steps;
-    int    i_rec_iv      = static_cast<int>(record_interval);
-    int    i_n_rec       = static_cast<int>(n_rec);
-
-    int sb_threads = ((work_items + 31) / 32) * 32;
-    if (sb_threads < 32)         sb_threads = 32;
-    if (sb_threads > kBlockSize) sb_threads = kBlockSize;
-
-    void* args[] = {
-        &d_hh,         &n_hh,
-        &d_iz,         &n_iz,
-        &d_comp,       &n_comp,
-        &d_layout,
-        &syn,
-        &stim,
-        &d_V_cache,
-        &d_I_syn,
-        &d_V_out,
-        &d_spike_buf,
-        &i_n_neurons,
-        &sz_num_steps,
-        &dt,
-        &step_start,
-        &i_rec_iv,
-        &i_n_rec
-    };
-
-    // Composable pools are dispatched per-pool to fully-specialized unrolled
-    // kernels inside the kernel (composable_step_dispatch), so the launch itself
-    // is no longer templated on gate/channel/substance counts.
-    if (use_single_block) {
-        simulate_all_kernel_single<<<1, sb_threads, 0, stream>>>(
-            d_hh, n_hh, d_iz, n_iz, d_comp, n_comp, d_layout, syn, stim,
-            d_V_cache, d_I_syn, d_V_out, d_spike_buf,
-            i_n_neurons, sz_num_steps, dt, step_start, i_rec_iv, i_n_rec);
-        ck(cudaGetLastError(), "simulate_all_steps: single-block launch");
-    } else {
-        int supports_coop = 0;
-        ck(cudaDeviceGetAttribute(&supports_coop, cudaDevAttrCooperativeLaunch, device),
-           "simulate_all_steps: cudaDeviceGetAttribute cooperative");
-        if (!supports_coop)
-            throw std::runtime_error("simulate_all_steps: GPU does not support cooperative kernel launch");
-        int sm_count = 0, max_blocks_sm = 0;
-        ck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device),
-           "simulate_all_steps: SM count");
-        ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-               &max_blocks_sm, (const void*)simulate_all_kernel_multi, kBlockSize, 0),
-           "simulate_all_steps: occupancy");
-        const int blocks_needed = (work_items + kBlockSize - 1) / kBlockSize;
-        const int total_blocks  = std::min(blocks_needed, sm_count * max_blocks_sm);
-        if (total_blocks <= 0)
-            throw std::runtime_error("simulate_all_steps: 0 cooperative blocks");
-        ck(cudaLaunchCooperativeKernel(
-               reinterpret_cast<void*>(simulate_all_kernel_multi),
-               dim3(total_blocks), dim3(kBlockSize),
-               args, 0, stream),
-           "simulate_all_steps: cudaLaunchCooperativeKernel");
-    }
-
+    SimAllPlan plan = simulate_all_plan_create(
+        hh_descs_h, n_hh, iz_descs_h, n_iz, comp_descs_h, n_comp,
+        n_neurons, syn.n_synapses, stim.n_neurons);
+    simulate_all_launch(plan, syn, stim, d_V_cache, d_I_syn, d_V_out, d_spike_buf,
+                        n_neurons, num_steps, dt, step_start, record_interval, n_rec, stream);
     ck(cudaStreamSynchronize(stream), "simulate_all_steps: stream sync");
-
-    // Free temp device descriptor arrays
-    if (d_hh)     cudaFree(d_hh);
-    if (d_iz)     cudaFree(d_iz);
-    if (d_comp)   cudaFree(d_comp);
-    if (d_layout) cudaFree(d_layout);
+    simulate_all_plan_destroy(plan);
 }
 
 } // namespace hodgkin_huxley

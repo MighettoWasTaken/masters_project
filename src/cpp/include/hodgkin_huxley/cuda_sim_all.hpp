@@ -142,6 +142,39 @@ void simulate_all_steps(
     size_t                     n_rec,
     cudaStream_t               stream);
 
+// ---------------------------------------------------------------------------
+// Split form of simulate_all_steps for chunked / pipelined recording.
+//   plan_create : upload pool descriptors + decide launch config — call ONCE.
+//   launch      : enqueue one kernel launch (no sync, no free) — call per chunk.
+//   plan_destroy: free the descriptor arrays — call ONCE after all launches.
+// (simulate_all_steps above is now a thin create→launch→sync→destroy wrapper.)
+// ---------------------------------------------------------------------------
+struct SimAllPlan {
+    CudaHHDesc*         d_hh   = nullptr; int n_hh   = 0;
+    CudaIzDesc*         d_iz   = nullptr; int n_iz   = 0;
+    CudaComposableDesc* d_comp = nullptr; int n_comp = 0;
+    void*               d_layout = nullptr;  // opaque NeuronSlot* (file-scope type in .cu)
+    bool use_single_block = false;
+    int  sb_threads   = 0;   // single-block thread count
+    int  total_blocks = 0;   // cooperative grid size
+    int  device       = 0;
+};
+
+SimAllPlan simulate_all_plan_create(
+    const CudaHHDesc* hh_descs, int n_hh,
+    const CudaIzDesc* iz_descs, int n_iz,
+    const CudaComposableDesc* comp_descs, int n_comp,
+    size_t n_neurons, int n_synapses, int stim_n_neurons);
+
+void simulate_all_launch(
+    const SimAllPlan& plan,
+    DeviceSynapseRaw syn, CudaStimRaw stim,
+    double* d_V_cache, double* d_I_syn, double* d_V_out, uint8_t* d_spike_buf,
+    size_t n_neurons, size_t num_steps, double dt, size_t step_start,
+    size_t record_interval, size_t n_rec, cudaStream_t stream);
+
+void simulate_all_plan_destroy(SimAllPlan& plan);
+
 } // namespace hodgkin_huxley
 
 #endif // HH_USE_CUDA
