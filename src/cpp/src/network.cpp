@@ -4,6 +4,7 @@
 #  include <cuda_runtime_api.h>
 #  include "hodgkin_huxley/cuda_sim_all.hpp"
 #endif
+#include <deque>
 #include <stdexcept>
 #include <cmath>
 #include <cstdlib>
@@ -1913,50 +1914,205 @@ void Network::simulate_with_descriptors_parallel(
         if (pit != group_pools.end()) g.pool_names = pit->second;
     }
 
-    // Partition synapse type lists by pre-neuron group
-    // (uses pre_decoded_ — sa_.pre was cleared by build_neuron_connectivity)
-    auto assign_pre = [&](const std::vector<size_t>& src, std::vector<size_t> GroupDef::* member) {
-        for (size_t k : src) {
-            auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
-            if (it != neuron_gid.end())
-                (groups[it->second].*member).push_back(k);
+    // -------------------------------------------------------------------------
+    // Two-tier routing setup (§26.3)
+    //
+    // Per ordered pair (A→B), classify as queue-routed if ALL cross-group
+    // synapses are spike-driven (EXP_DECAY / ALPHA_FUNC / DOUBLE_EXP, or
+    // CUSTOM_EXPR without a PUSH_DEP in dS_dt_vm/dA_dt_vm).  Voltage-gated
+    // types (TANH_GATE, BOLTZMANN_GATE, ALPHA_BETA, and CUSTOM_EXPR that
+    // reads Vpre) fall back to the original shared-g path for that pair.
+    // -------------------------------------------------------------------------
+
+    // Returns true if synapse k can be delivered via event queue (no Vpre dependency)
+    auto is_spike_driven = [&](size_t k) -> bool {
+        using UF  = SynapseSpec::UpdateForm;
+        using VOP = VmOp;
+        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+        switch (spec.update_form) {
+            case UF::EXP_DECAY:
+            case UF::ALPHA_FUNC:
+            case UF::DOUBLE_EXP:
+                return true;
+            case UF::CUSTOM_EXPR:
+                for (const auto& ins : spec.dS_dt_vm.instructions)
+                    if (ins.op == VOP::PUSH_DEP) return false;
+                for (const auto& ins : spec.dA_dt_vm.instructions)
+                    if (ins.op == VOP::PUSH_DEP) return false;
+                return true;
+            default:  // TANH_GATE, BOLTZMANN_GATE, ALPHA_BETA
+                return false;
         }
     };
-    assign_pre(syn_groups_.exp_decay,      &GroupDef::pre_exp_decay);
-    assign_pre(syn_groups_.alpha_func,     &GroupDef::pre_alpha_func);
-    assign_pre(syn_groups_.double_exp,     &GroupDef::pre_double_exp);
-    assign_pre(syn_groups_.voltage_gated,  &GroupDef::pre_voltage_gated);
 
-    // Build pre_all (union of all pre-synapse type lists) for spike detection Phase 1
+    // pair_is_queue[a][b] = true  →  all cross-group synapses A→B are spike-driven
+    std::vector<std::vector<bool>> pair_is_queue(n_groups, std::vector<bool>(n_groups, true));
     for (size_t k = 0; k < sa_.size(); ++k) {
-        auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
-        if (it != neuron_gid.end())
-            groups[it->second].pre_all.push_back(k);
+        auto pre_it  = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
+        auto post_it = neuron_gid.find(static_cast<size_t>(post_decoded_[k]));
+        if (pre_it == neuron_gid.end() || post_it == neuron_gid.end()) continue;
+        int a = pre_it->second, b = post_it->second;
+        if (a == b) continue;  // intra-group
+        if (!is_spike_driven(k)) pair_is_queue[a][b] = false;
+    }
+    // Pairs with no cross-group synapses should not be treated as queue-routed
+    // (they simply have no relationship). Mark them false to avoid empty queues.
+    {
+        std::vector<std::vector<bool>> has_cross(n_groups, std::vector<bool>(n_groups, false));
+        for (size_t k = 0; k < sa_.size(); ++k) {
+            auto pre_it  = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
+            auto post_it = neuron_gid.find(static_cast<size_t>(post_decoded_[k]));
+            if (pre_it == neuron_gid.end() || post_it == neuron_gid.end()) continue;
+            int a = pre_it->second, b = post_it->second;
+            if (a != b) has_cross[a][b] = true;
+        }
+        for (int a = 0; a < (int)n_groups; ++a)
+            for (int b = 0; b < (int)n_groups; ++b)
+                if (!has_cross[a][b]) pair_is_queue[a][b] = false;
     }
 
-    // Build post_syn (synapse indices where post[k] in this group) — I_syn accumulation
+    // Allocate one CrossGroupQueue per queue-routed ordered pair.
+    // std::deque is used so that push_back does not move existing elements —
+    // GroupDef holds raw pointers that must remain stable.
+    std::deque<CrossGroupQueue> queues;
+    for (int a = 0; a < (int)n_groups; ++a) {
+        for (int b = 0; b < (int)n_groups; ++b) {
+            if (!pair_is_queue[a][b]) continue;
+            queues.emplace_back();
+            CrossGroupQueue* q = &queues.back();
+            // Pre-allocate one slot per step so the producer can run ahead without
+            // overwriting data the consumer hasn't read yet.
+            q->fired_per_step.assign(num_steps, {});
+            groups[a].queue_consumer_ids.push_back(b);
+            groups[a].outgoing_queues.push_back(q);
+            groups[b].queue_src_ids.push_back(a);
+            groups[b].incoming_queues.push_back(q);
+        }
+    }
+
+    // Build sharedg_src_ids / sharedg_consumer_ids for pairs NOT using queue routing
+    for (int b = 0; b < (int)n_groups; ++b) {
+        std::unordered_set<int> srcs;
+        for (size_t k : groups[b].post_syn) {  // post_syn not built yet — defer below
+            (void)k;  // placeholder: built after post_syn
+        }
+    }
+
+    // Build post_syn (synapse indices where post[k] ∈ this group) — I_syn accumulation
     for (size_t k = 0; k < sa_.size(); ++k) {
         auto it = neuron_gid.find(static_cast<size_t>(post_decoded_[k]));
         if (it != neuron_gid.end())
             groups[it->second].post_syn.push_back(k);
     }
 
-    // Build src_group_ids for each group
-    for (auto& g : groups) {
+    // Build sharedg_src_ids using post_syn (cross-group, non-queue pairs only)
+    for (int b = 0; b < (int)n_groups; ++b) {
         std::unordered_set<int> srcs;
-        for (size_t k : g.post_syn) {
+        for (size_t k : groups[b].post_syn) {
             auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
-            if (it != neuron_gid.end() && it->second != g.id)
-                srcs.insert(it->second);
+            if (it == neuron_gid.end() || it->second == b) continue;
+            int a = it->second;
+            if (!pair_is_queue[a][b]) srcs.insert(a);
         }
-        g.src_group_ids.assign(srcs.begin(), srcs.end());
+        groups[b].sharedg_src_ids.assign(srcs.begin(), srcs.end());
+    }
+    // sharedg_consumer_ids = inverse of sharedg_src_ids
+    for (int b = 0; b < (int)n_groups; ++b)
+        for (int src : groups[b].sharedg_src_ids)
+            groups[src].sharedg_consumer_ids.push_back(b);
+
+    // -------------------------------------------------------------------------
+    // Assign synapse ownership and build injection tables
+    // -------------------------------------------------------------------------
+
+    // pre_all: intra + shared-g cross-group synapse indices (pre-group owned)
+    // cross_pre_*: queue-routed cross-group synapse indices (post-group owned)
+    // local_post_from[n]: SynapseRefs for intra + shared-g cross-group (used in Phase U1)
+    // cross_post_from[src][n]: SynapseRefs for queue-routed cross-group (used in Phase QI)
+
+    const size_t N = neurons_.size();
+    for (auto& grp : groups) {
+        grp.local_post_from.assign(N, {});
     }
 
-    // Build consumer_group_ids (groups that read this group's g[k] values)
-    // Inverse of src_group_ids: if B has A in src_group_ids, then A has B in consumer_group_ids
-    for (int b = 0; b < (int)n_groups; ++b)
-        for (int src : groups[b].src_group_ids)
-            groups[src].consumer_group_ids.push_back(b);
+    for (size_t k = 0; k < sa_.size(); ++k) {
+        auto pre_it  = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
+        auto post_it = neuron_gid.find(static_cast<size_t>(post_decoded_[k]));
+        if (pre_it == neuron_gid.end()) continue;
+        int a = pre_it->second;
+        size_t n = static_cast<size_t>(pre_decoded_[k]);
+        SynapseRef ref{ static_cast<uint32_t>(k),
+                        static_cast<uint32_t>(delay_steps_[k]) };
+
+        if (post_it == neuron_gid.end()) {
+            // Post-neuron not in any group — treat as pre-owned
+            groups[a].pre_all.push_back(k);
+            groups[a].local_post_from[n].push_back(ref);
+            continue;
+        }
+        int b = post_it->second;
+
+        if (a == b) {
+            // Intra-group: pre-owned as before
+            groups[a].pre_all.push_back(k);
+            groups[a].local_post_from[n].push_back(ref);
+        } else if (!pair_is_queue[a][b]) {
+            // Shared-g cross-group: pre-owned, inject in Phase U1 as before
+            groups[a].pre_all.push_back(k);
+            groups[a].local_post_from[n].push_back(ref);
+        } else {
+            // Queue-routed cross-group: post-group owned
+            using UF = SynapseSpec::UpdateForm;
+            const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+            switch (spec.update_form) {
+                case UF::EXP_DECAY:
+                    groups[b].cross_pre_exp_decay.push_back(k); break;
+                case UF::ALPHA_FUNC:
+                    groups[b].cross_pre_alpha_func.push_back(k); break;
+                default:  // DOUBLE_EXP and spike-driven CUSTOM_EXPR
+                    groups[b].cross_pre_double_exp.push_back(k); break;
+            }
+            // Add to post-group's cross_post_from for Phase QI injection
+            auto& cpf = groups[b].cross_post_from[a];
+            if (cpf.empty()) cpf.assign(N, {});
+            cpf[n].push_back(ref);
+        }
+    }
+
+    // Assign spike-driven type lists for pre-owned synapses (intra + shared-g)
+    for (size_t k : syn_groups_.exp_decay) {
+        auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
+        if (it == neuron_gid.end()) continue;
+        auto post_it = neuron_gid.find(static_cast<size_t>(post_decoded_[k]));
+        int a = it->second;
+        int b = (post_it != neuron_gid.end()) ? post_it->second : -1;
+        if (b == -1 || b == a || !pair_is_queue[a][b])
+            groups[a].pre_exp_decay.push_back(k);
+        // queue-routed case already added to cross_pre_exp_decay above
+    }
+    for (size_t k : syn_groups_.alpha_func) {
+        auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
+        if (it == neuron_gid.end()) continue;
+        auto post_it = neuron_gid.find(static_cast<size_t>(post_decoded_[k]));
+        int a = it->second;
+        int b = (post_it != neuron_gid.end()) ? post_it->second : -1;
+        if (b == -1 || b == a || !pair_is_queue[a][b])
+            groups[a].pre_alpha_func.push_back(k);
+    }
+    for (size_t k : syn_groups_.double_exp) {
+        auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
+        if (it == neuron_gid.end()) continue;
+        auto post_it = neuron_gid.find(static_cast<size_t>(post_decoded_[k]));
+        int a = it->second;
+        int b = (post_it != neuron_gid.end()) ? post_it->second : -1;
+        if (b == -1 || b == a || !pair_is_queue[a][b])
+            groups[a].pre_double_exp.push_back(k);
+    }
+    for (size_t k : syn_groups_.voltage_gated) {
+        auto it = neuron_gid.find(static_cast<size_t>(pre_decoded_[k]));
+        if (it != neuron_gid.end())
+            groups[it->second].pre_voltage_gated.push_back(k);
+    }
 
     // Build intra_syn: synapses where both pre and post are in the same group
     for (size_t k = 0; k < sa_.size(); ++k) {
@@ -1973,19 +2129,38 @@ void Network::simulate_with_descriptors_parallel(
                                             g.hh_local_indices,
                                             g.iz_local_indices);
 
-    // Build per-group forward-injection structures (task26)
+    // Build pre_neurons (for Phase U1 spike detection + Phase Q fired-neuron collection):
+    // union of all neurons in this group that are pre for ANY synapse (owned or queue-sender).
     for (auto& grp : groups) {
-        // Collect unique pre-neuron indices for this group's pre-synapses
-        std::unordered_set<size_t> pre_neuron_set;
+        std::unordered_set<size_t> pnset;
+        // From owned pre_all (intra + shared-g)
         for (size_t k : grp.pre_all)
-            pre_neuron_set.insert(static_cast<size_t>(pre_decoded_[k]));
-        grp.pre_neurons.assign(pre_neuron_set.begin(), pre_neuron_set.end());
+            pnset.insert(static_cast<size_t>(pre_decoded_[k]));
+        // From cross-group queue synapses where this group is the SENDER (pre ∈ this group)
+        for (size_t qi = 0; qi < grp.outgoing_queues.size(); ++qi) {
+            int dst = grp.queue_consumer_ids[qi];
+            // Scan cross_post_from on the dst group to find relevant pre-neurons
+            auto cpf_it = groups[dst].cross_post_from.find(grp.id);
+            if (cpf_it == groups[dst].cross_post_from.end()) continue;
+            for (size_t n = 0; n < cpf_it->second.size(); ++n)
+                if (!cpf_it->second[n].empty()) pnset.insert(n);
+        }
+        grp.pre_neurons.assign(pnset.begin(), pnset.end());
+    }
 
-        // Size event buffer to cover max delay among this group's synapses
+    // Size event_slots to cover max delay across all synapses this group injects:
+    // local_post_from (Phase U1) + cross_post_from (Phase QI, on the receiver side).
+    for (auto& grp : groups) {
         size_t max_delay = 0;
+        // Local injections (Phase U1)
         for (size_t n : grp.pre_neurons)
-            for (const auto& ref : post_from_[n])
+            for (const auto& ref : grp.local_post_from[n])
                 if (ref.delay_steps > max_delay) max_delay = ref.delay_steps;
+        // Cross-group injections this group receives (Phase QI)
+        for (auto& kv : grp.cross_post_from)
+            for (size_t n = 0; n < kv.second.size(); ++n)
+                for (const auto& ref : kv.second[n])
+                    if (ref.delay_steps > max_delay) max_delay = ref.delay_steps;
         grp.event_slots.assign(max_delay + 1, {});
     }
 
@@ -2026,12 +2201,14 @@ void Network::simulate_with_descriptors_parallel(
             std::vector<double> grp_I_stim_cache(n_neurons, 0.0);
             // Thread-local spike-event accumulator (intra-group only)
             std::vector<double> grp_spike_accum(n_neurons, 0.0);
+            // Thread-local fired neuron list for Phase Q (outgoing queues)
+            std::vector<uint32_t> fired_this_step;
 
             for (size_t t = 0; t < num_steps; ++t) {
 
-                // Phase W: wait for source groups to complete step t-1
-                // (ensures g[k] for inter-group synapses is from step t-1)
-                for (int src : grp.src_group_ids) {
+                // Phase W: wait for shared-g source groups to complete step t-1
+                // (ensures g[k] for shared-g inter-group synapses is from step t-1)
+                for (int src : grp.sharedg_src_ids) {
                     while (step_done[src].load(std::memory_order_acquire) < t)
                         std::this_thread::yield();
                 }
@@ -2136,37 +2313,74 @@ void Network::simulate_with_descriptors_parallel(
                 pool_mgr_.scatter_voltages_for_hh(grp.hh_local_indices, V_cache);
                 pool_mgr_.scatter_voltages_for_iz(grp.iz_local_indices, V_cache);
 
-                // Phase U1: forward injection + event dispatch (task26)
-                // Clear spike_detected_ for own pre-synapses
+                // Phase U1: forward injection + event dispatch
+                // Clear spike_detected_ for owned pre-synapses (intra + shared-g cross)
                 for (size_t k : grp.pre_all) spike_detected_[k] = 0;
-                // Detect spikes at neuron level; inject into future slots
+                // Clear spike_detected_ for cross-group queue-routed synapses owned by this group
+                for (size_t k : grp.cross_pre_exp_decay)  spike_detected_[k] = 0;
+                for (size_t k : grp.cross_pre_alpha_func) spike_detected_[k] = 0;
+                for (size_t k : grp.cross_pre_double_exp) spike_detected_[k] = 0;
+
+                // Detect spikes; inject into local event_slots via local_post_from.
+                // Collect fired neuron indices for Phase Q (outgoing queues).
+                fired_this_step.clear();
                 for (size_t n : grp.pre_neurons) {
                     double V = V_cache[n];
                     bool spiked = (V > spike_threshold_) && (V_prev_[n] <= spike_threshold_);
                     V_prev_[n] = V;
                     if (!spiked) continue;
-                    for (const SynapseRef& ref : post_from_[n]) {
+                    fired_this_step.push_back(static_cast<uint32_t>(n));
+                    for (const SynapseRef& ref : grp.local_post_from[n]) {
                         size_t slot = (t + ref.delay_steps) % grp.event_slots.size();
                         grp.event_slots[slot].push_back(ref.syn_idx);
                     }
                 }
-                // Dispatch events due this step
+
+                // Phase Q: push fired neuron indices to each queue-routed consumer group.
+                // Write to the per-step slot so the producer can run ahead of the consumer
+                // without overwriting unread data.
+                for (CrossGroupQueue* q : grp.outgoing_queues) {
+                    q->fired_per_step[t] = fired_this_step;
+                    q->spike_done.fetch_add(1, std::memory_order_release);
+                }
+
+                // Dispatch intra-group events due this step
                 const size_t cur_slot = t % grp.event_slots.size();
                 for (size_t k : grp.event_slots[cur_slot])
                     spike_detected_[k] = 1;
                 grp.event_slots[cur_slot].clear();
 
-                // Spike-event accumulation: count intra-group spike arrivals
-                // (inter-group spikes omitted — spike_detected_ from other groups
-                //  is not safe to read without additional synchronization)
+                // Phase QW + QI: receive cross-group spike events from queue sources.
+                // Wait for each source's spike detection to complete, then inject
+                // received neuron indices into this group's event_slots.
+                for (size_t qi = 0; qi < grp.queue_src_ids.size(); ++qi) {
+                    CrossGroupQueue* q = grp.incoming_queues[qi];
+                    while (q->spike_done.load(std::memory_order_acquire) < t + 1)
+                        std::this_thread::yield();
+                    int src_gid = grp.queue_src_ids[qi];
+                    const auto& cpf = grp.cross_post_from.at(src_gid);
+                    for (uint32_t n : q->fired_per_step[t]) {
+                        if (n >= cpf.size()) continue;
+                        for (const SynapseRef& ref : cpf[n]) {
+                            size_t slot = (t + ref.delay_steps) % grp.event_slots.size();
+                            grp.event_slots[slot].push_back(ref.syn_idx);
+                        }
+                    }
+                }
+
+                // Spike-event accumulation: count intra-group arrivals.
+                // Queue-routed cross-group arrivals will be dispatched in future steps
+                // (delay >= 1 enforced by validation), so spike_detected_ is not yet
+                // set for them here — intra_syn remains safe to read.
                 if (spike_event_buf) {
                     for (size_t k : grp.intra_syn)
                         if (spike_detected_[k]) grp_spike_accum[post_arr[k]] += 1.0;
                 }
 
-                // Phase W2: wait until all consumer groups have finished reading g[k]
-                // (read_done[consumer] >= t+1) before overwriting g[k] in Phase U2
-                for (int cid : grp.consumer_group_ids) {
+                // Phase W2: wait for shared-g consumer groups to finish reading g[k]
+                // before overwriting in Phase U2.  Queue-routed consumers own their
+                // own g[k] update, so no W2 barrier is needed for them.
+                for (int cid : grp.sharedg_consumer_ids) {
                     while (read_done[cid].load(std::memory_order_acquire) < t + 1)
                         std::this_thread::yield();
                 }
@@ -2314,7 +2528,93 @@ void Network::simulate_with_descriptors_parallel(
                     }
                 }
 
-                // Phase D: signal this step complete
+                // Phase U2e: cross-group EXP_DECAY (queue-routed, post-group owned)
+                for (size_t k : grp.cross_pre_exp_decay) {
+                    if (spike_detected_[k] && !sa_.is_active[k]) {
+                        sa_.is_active[k] = true;
+                        grp.active_cross_pre_exp_decay.push_back(k);
+                    }
+                }
+                {
+                    size_t pos = 0;
+                    while (pos < grp.active_cross_pre_exp_decay.size()) {
+                        const size_t k = grp.active_cross_pre_exp_decay[pos];
+                        const auto& cache = synapse_spec_caches_[sa_.spec_idx[k]];
+                        if (spike_detected_[k]) sa_.S[k] += cache.delta_S;
+                        sa_.S[k] *= cache.decay_S;
+                        if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
+                        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                        sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+                        if (sa_.S[k] < kSynapseEpsilon) {
+                            sa_.g[k] = 0.0;
+                            sa_.is_active[k] = false;
+                            grp.active_cross_pre_exp_decay[pos] = grp.active_cross_pre_exp_decay.back();
+                            grp.active_cross_pre_exp_decay.pop_back();
+                        } else { ++pos; }
+                    }
+                }
+
+                // Phase U2f: cross-group ALPHA_FUNC
+                for (size_t k : grp.cross_pre_alpha_func) {
+                    if (spike_detected_[k] && !sa_.is_active[k]) {
+                        sa_.is_active[k] = true;
+                        grp.active_cross_pre_alpha_func.push_back(k);
+                    }
+                }
+                {
+                    size_t pos = 0;
+                    while (pos < grp.active_cross_pre_alpha_func.size()) {
+                        const size_t k = grp.active_cross_pre_alpha_func[pos];
+                        const auto& cache = synapse_spec_caches_[sa_.spec_idx[k]];
+                        if (spike_detected_[k]) sa_.A[k] += cache.delta_A;
+                        double dS  = (sa_.A[k] - sa_.S[k]) * cache.inv_tau_A;
+                        double dA  = -sa_.A[k] * cache.inv_tau_A;
+                        sa_.S[k] += dt * dS;
+                        sa_.A[k] += dt * dA;
+                        if (sa_.S[k] < 0.0) sa_.S[k] = 0.0;
+                        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                        sa_.g[k] = spec.g * sa_.weight[k] * sa_.S[k];
+                        if (sa_.S[k] < kSynapseEpsilon && sa_.A[k] < kSynapseEpsilon) {
+                            sa_.g[k] = 0.0;
+                            sa_.is_active[k] = false;
+                            grp.active_cross_pre_alpha_func[pos] = grp.active_cross_pre_alpha_func.back();
+                            grp.active_cross_pre_alpha_func.pop_back();
+                        } else { ++pos; }
+                    }
+                }
+
+                // Phase U2g: cross-group DOUBLE_EXP (also covers spike-driven CUSTOM_EXPR)
+                for (size_t k : grp.cross_pre_double_exp) {
+                    if (spike_detected_[k] && !sa_.is_active[k]) {
+                        sa_.is_active[k] = true;
+                        grp.active_cross_pre_double_exp.push_back(k);
+                    }
+                }
+                {
+                    size_t pos = 0;
+                    while (pos < grp.active_cross_pre_double_exp.size()) {
+                        const size_t k = grp.active_cross_pre_double_exp[pos];
+                        const auto& cache = synapse_spec_caches_[sa_.spec_idx[k]];
+                        if (spike_detected_[k]) {
+                            sa_.S[k] += cache.delta_S;
+                            sa_.A[k] += cache.delta_A;
+                        }
+                        sa_.S[k] *= cache.decay_S;
+                        sa_.A[k] *= cache.decay_A;
+                        double g_eff = cache.norm * (sa_.S[k] - sa_.A[k]);
+                        if (g_eff < 0.0) g_eff = 0.0;
+                        const auto& spec = synapse_specs_[sa_.spec_idx[k]];
+                        sa_.g[k] = spec.g * sa_.weight[k] * g_eff;
+                        if (sa_.S[k] < kSynapseEpsilon && sa_.A[k] < kSynapseEpsilon) {
+                            sa_.g[k] = 0.0;
+                            sa_.is_active[k] = false;
+                            grp.active_cross_pre_double_exp[pos] = grp.active_cross_pre_double_exp.back();
+                            grp.active_cross_pre_double_exp.pop_back();
+                        } else { ++pos; }
+                    }
+                }
+
+                // Phase D: signal this step complete (shared-g consumers wait on this)
                 step_done[gid].fetch_add(1, std::memory_order_release);
             }
         }); // end thread lambda
