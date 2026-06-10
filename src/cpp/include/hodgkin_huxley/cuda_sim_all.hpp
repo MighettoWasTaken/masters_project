@@ -42,6 +42,9 @@ struct CudaComposableDesc {
     // no VM programs → eligible for the gate-major fast path (no per-thread
     // local-memory scratch). 0 = fall back to the generic per-neuron interpreter.
     int fast_path;
+    // Host-side mirror of d_gate_descs (set by fill_coop_desc). Used in
+    // simulate_all_plan_create to build the GateSlot array without a device read.
+    const CudaGateDesc* h_gate_descs = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -153,8 +156,11 @@ struct SimAllPlan {
     CudaHHDesc*         d_hh   = nullptr; int n_hh   = 0;
     CudaIzDesc*         d_iz   = nullptr; int n_iz   = 0;
     CudaComposableDesc* d_comp = nullptr; int n_comp = 0;
-    void*               d_layout = nullptr;  // opaque NeuronSlot* (file-scope type in .cu)
+    void*               d_layout      = nullptr;  // opaque NeuronSlot* (file-scope type in .cu)
+    void*               d_gate_layout = nullptr;  // opaque GateSlot* (file-scope type in .cu)
+    int                 n_gate_slots  = 0;
     bool use_single_block = false;
+    bool use_float32      = true;  // float32 (default) or float64 compute precision
     int  sb_threads   = 0;   // single-block thread count
     int  total_blocks = 0;   // cooperative grid size
     int  device       = 0;
@@ -164,7 +170,8 @@ SimAllPlan simulate_all_plan_create(
     const CudaHHDesc* hh_descs, int n_hh,
     const CudaIzDesc* iz_descs, int n_iz,
     const CudaComposableDesc* comp_descs, int n_comp,
-    size_t n_neurons, int n_synapses, int stim_n_neurons);
+    size_t n_neurons, int n_synapses, int stim_n_neurons,
+    bool use_float32 = true);
 
 void simulate_all_launch(
     const SimAllPlan& plan,

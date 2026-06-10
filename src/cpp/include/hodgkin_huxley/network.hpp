@@ -213,7 +213,8 @@ public:
         uint8_t* spike_buf_uint8,
         size_t  interval,
         size_t  n_rec,
-        double  spike_threshold = 0.0
+        double  spike_threshold = 0.0,
+        bool    use_float32     = true
     );
 
     /// Phase 2 parallel simulate: each GroupDef runs in its own std::thread.
@@ -237,6 +238,12 @@ public:
         size_t  n_rec,
         double  spike_threshold = 0.0
     );
+
+    // Forward-injection spike delivery (task26); syn_idx narrow to uint32_t (task27.3)
+    struct SynapseRef {
+        uint32_t syn_idx;       // index into SynArrays — uint32_t saves 8 bytes/syn via padding removal
+        uint32_t delay_steps;   // precomputed: round(sa_.delay[i] / dt)
+    };
 
     // Compressed per-neuron connectivity (task27.2)
     struct NeuronConnectivity {

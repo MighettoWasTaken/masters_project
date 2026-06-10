@@ -25,282 +25,272 @@ inline void ck(cudaError_t e, const char* what) {
 }
 
 // ---------------------------------------------------------------------------
-// Scalar physics helpers (device-only, no global state)
+// Scalar physics helpers — templated on T (float or double).
+// Pool state arrays stay double* on device; T is the compute type only.
 // ---------------------------------------------------------------------------
 
-__device__ inline double hh_clamp01(double x) {
-    return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
+template <typename T>
+__device__ inline T hh_clamp01(T x) {
+    return x < T(0) ? T(0) : (x > T(1) ? T(1) : x);
 }
 
+template <typename T>
 __device__ inline void hh_derivs(
-    double V, double m, double h, double n,
-    double Cm, double gNa, double gK, double gL,
-    double ENa, double EK, double EL, double I,
-    double& dV, double& dm, double& dh, double& dn)
+    T V, T m, T h, T n,
+    T Cm, T gNa, T gK, T gL,
+    T ENa, T EK, T EL, T I,
+    T& dV, T& dm, T& dh, T& dn)
 {
-    const double Vp40 = V + 40.0;
-    const double am = (fabs(Vp40) < 1e-7)
-        ? 1.0
-        : 0.1 * Vp40 / (1.0 - exp(-0.1 * Vp40));
-    const double bm = 4.0 * exp(-(V + 65.0) / 18.0);
-    const double ah = 0.07 * exp(-0.05 * (V + 65.0));
-    const double bh = 1.0 / (1.0 + exp(-0.1 * (V + 35.0)));
-    const double Vp55 = V + 55.0;
-    const double an = (fabs(Vp55) < 1e-7)
-        ? 0.1
-        : 0.01 * Vp55 / (1.0 - exp(-0.1 * Vp55));
-    const double bn = 0.125 * exp(-0.0125 * (V + 65.0));
+    const T Vp40 = V + T(40);
+    const T am = (fabs(Vp40) < T(1e-7))
+        ? T(1)
+        : T(0.1) * Vp40 / (T(1) - exp(T(-0.1) * Vp40));
+    const T bm = T(4) * exp(-(V + T(65)) / T(18));
+    const T ah = T(0.07) * exp(T(-0.05) * (V + T(65)));
+    const T bh = T(1) / (T(1) + exp(T(-0.1) * (V + T(35))));
+    const T Vp55 = V + T(55);
+    const T an = (fabs(Vp55) < T(1e-7))
+        ? T(0.1)
+        : T(0.01) * Vp55 / (T(1) - exp(T(-0.1) * Vp55));
+    const T bn = T(0.125) * exp(T(-0.0125) * (V + T(65)));
     dV = (I - gNa*m*m*m*h*(V-ENa) - gK*n*n*n*n*(V-EK) - gL*(V-EL)) / Cm;
-    dm = am*(1.0-m) - bm*m;
-    dh = ah*(1.0-h) - bh*h;
-    dn = an*(1.0-n) - bn*n;
+    dm = am*(T(1)-m) - bm*m;
+    dh = ah*(T(1)-h) - bh*h;
+    dn = an*(T(1)-n) - bn*n;
 }
 
+template <typename T>
 __device__ inline void hh_step_single(
-    hodgkin_huxley::CudaHHDesc p, int i, double I, double dt)
+    hodgkin_huxley::CudaHHDesc p, int i, T I, T dt)
 {
-    const double Cm  = p.d_C_m[i],  gNa = p.d_g_Na[i], gK = p.d_g_K[i];
-    const double gL  = p.d_g_L[i],  ENa = p.d_E_Na[i], EK = p.d_E_K[i];
-    const double EL  = p.d_E_L[i];
-    double V = p.d_V[i], m = p.d_m[i], h = p.d_h[i], n = p.d_n[i];
-    double k1V,k1m,k1h,k1n, k2V,k2m,k2h,k2n, k3V,k3m,k3h,k3n, k4V,k4m,k4h,k4n;
-    hh_derivs(V,m,h,n,Cm,gNa,gK,gL,ENa,EK,EL,I,k1V,k1m,k1h,k1n);
-    hh_derivs(V+0.5*dt*k1V, hh_clamp01(m+0.5*dt*k1m), hh_clamp01(h+0.5*dt*k1h), hh_clamp01(n+0.5*dt*k1n),
-              Cm,gNa,gK,gL,ENa,EK,EL,I, k2V,k2m,k2h,k2n);
-    hh_derivs(V+0.5*dt*k2V, hh_clamp01(m+0.5*dt*k2m), hh_clamp01(h+0.5*dt*k2h), hh_clamp01(n+0.5*dt*k2n),
-              Cm,gNa,gK,gL,ENa,EK,EL,I, k3V,k3m,k3h,k3n);
-    hh_derivs(V+dt*k3V,     hh_clamp01(m+dt*k3m),     hh_clamp01(h+dt*k3h),     hh_clamp01(n+dt*k3n),
-              Cm,gNa,gK,gL,ENa,EK,EL,I, k4V,k4m,k4h,k4n);
-    const double d6 = dt/6.0;
-    p.d_V[i] = V + d6*(k1V+2.0*k2V+2.0*k3V+k4V);
-    p.d_m[i] = hh_clamp01(m + d6*(k1m+2.0*k2m+2.0*k3m+k4m));
-    p.d_h[i] = hh_clamp01(h + d6*(k1h+2.0*k2h+2.0*k3h+k4h));
-    p.d_n[i] = hh_clamp01(n + d6*(k1n+2.0*k2n+2.0*k3n+k4n));
+    const T Cm  = T(p.d_C_m[i]),  gNa = T(p.d_g_Na[i]), gK = T(p.d_g_K[i]);
+    const T gL  = T(p.d_g_L[i]),  ENa = T(p.d_E_Na[i]), EK = T(p.d_E_K[i]);
+    const T EL  = T(p.d_E_L[i]);
+    T V = T(p.d_V[i]), m = T(p.d_m[i]), h = T(p.d_h[i]), n = T(p.d_n[i]);
+    T k1V,k1m,k1h,k1n, k2V,k2m,k2h,k2n, k3V,k3m,k3h,k3n, k4V,k4m,k4h,k4n;
+    hh_derivs<T>(V,m,h,n,Cm,gNa,gK,gL,ENa,EK,EL,I,k1V,k1m,k1h,k1n);
+    hh_derivs<T>(V+T(0.5)*dt*k1V, hh_clamp01<T>(m+T(0.5)*dt*k1m), hh_clamp01<T>(h+T(0.5)*dt*k1h), hh_clamp01<T>(n+T(0.5)*dt*k1n),
+                 Cm,gNa,gK,gL,ENa,EK,EL,I, k2V,k2m,k2h,k2n);
+    hh_derivs<T>(V+T(0.5)*dt*k2V, hh_clamp01<T>(m+T(0.5)*dt*k2m), hh_clamp01<T>(h+T(0.5)*dt*k2h), hh_clamp01<T>(n+T(0.5)*dt*k2n),
+                 Cm,gNa,gK,gL,ENa,EK,EL,I, k3V,k3m,k3h,k3n);
+    hh_derivs<T>(V+dt*k3V, hh_clamp01<T>(m+dt*k3m), hh_clamp01<T>(h+dt*k3h), hh_clamp01<T>(n+dt*k3n),
+                 Cm,gNa,gK,gL,ENa,EK,EL,I, k4V,k4m,k4h,k4n);
+    const T d6 = dt / T(6);
+    p.d_V[i] = double(V + d6*(k1V+T(2)*k2V+T(2)*k3V+k4V));
+    p.d_m[i] = double(hh_clamp01<T>(m + d6*(k1m+T(2)*k2m+T(2)*k3m+k4m)));
+    p.d_h[i] = double(hh_clamp01<T>(h + d6*(k1h+T(2)*k2h+T(2)*k3h+k4h)));
+    p.d_n[i] = double(hh_clamp01<T>(n + d6*(k1n+T(2)*k2n+T(2)*k3n+k4n)));
 }
 
+template <typename T>
 __device__ inline void iz_step_single(
-    hodgkin_huxley::CudaIzDesc p, int i, double I, double dt)
+    hodgkin_huxley::CudaIzDesc p, int i, T I, T dt)
 {
-    double vi = p.d_v[i], ui = p.d_u[i];
-    const bool fired = vi >= p.threshold;
-    vi = fired ? p.d_c[i] : vi;
-    ui = fired ? ui + p.d_d[i] : ui;
-    const double dv = 0.04*vi*vi + 5.0*vi + 140.0 - ui + I;
-    const double du = p.d_a[i] * (p.d_b[i]*vi - ui);
+    T vi = T(p.d_v[i]), ui = T(p.d_u[i]);
+    const bool fired = vi >= T(p.threshold);
+    vi = fired ? T(p.d_c[i]) : vi;
+    ui = fired ? ui + T(p.d_d[i]) : ui;
+    const T dv = T(0.04)*vi*vi + T(5)*vi + T(140) - ui + I;
+    const T du = T(p.d_a[i]) * (T(p.d_b[i])*vi - ui);
     vi += dt * dv;
     ui += dt * du;
-    p.d_v[i] = vi > 100.0 ? 100.0 : vi;
-    p.d_u[i] = ui;
+    p.d_v[i] = double(vi > T(100) ? T(100) : vi);
+    p.d_u[i] = double(ui);
 }
 
-// Boltzmann / tau / rate helpers (mirrors cuda_composable_pool.cu)
-__device__ inline double sa_boltz(double x, const hodgkin_huxley::BoltzmannParams& p) {
-    double arg = -(x - p.v_half) / p.k;
-    if (arg > 500.0) return 0.0;
-    if (arg < -500.0) return 1.0;
-    return 1.0 / (1.0 + exp(arg));
+// Boltzmann / tau / rate helpers (mirrors cuda_composable_pool.cu), templated on T.
+// Explicit template args required at call sites that cannot deduce T (e.g. synapse
+// helpers that pass double and rely on the double overload).
+template <typename T>
+__device__ inline T sa_boltz(T x, const hodgkin_huxley::BoltzmannParams& p) {
+    T arg = -(x - T(p.v_half)) / T(p.k);
+    if (arg > T(500)) return T(0);
+    if (arg < T(-500)) return T(1);
+    return T(1) / (T(1) + exp(arg));
 }
-__device__ inline double sa_tau(double V, const hodgkin_huxley::TauParams& p) {
+template <typename T>
+__device__ inline T sa_tau(T V, const hodgkin_huxley::TauParams& p) {
     using F = hodgkin_huxley::TauParams::Form;
     switch (p.form) {
-        case F::CONSTANT:           return p.params[0];
+        case F::CONSTANT: return T(p.params[0]);
         case F::BOLTZMANN: {
-            double arg = fmax(-500.0, fmin(500.0, -(V-p.params[2])/p.params[3]));
-            return p.params[0] + p.params[1]/(1.0+exp(arg));
+            T arg = fmax(T(-500), fmin(T(500), -(V - T(p.params[2])) / T(p.params[3])));
+            return T(p.params[0]) + T(p.params[1]) / (T(1) + exp(arg));
         }
         case F::DOUBLE_EXP_SUM: {
-            double d = exp((V+p.params[2])/p.params[3]) + exp(-(V+p.params[5])/p.params[6]);
-            return p.params[0] + p.params[1]/fmax(d,1e-10);
+            T d = exp((V + T(p.params[2])) / T(p.params[3]))
+                + exp(-(V + T(p.params[5])) / T(p.params[6]));
+            return T(p.params[0]) + T(p.params[1]) / fmax(d, T(1e-10));
         }
         case F::OFFSET_DOUBLE_EXP: {
-            double x1=(V+p.params[2])/p.params[3], x2=(V+p.params[5])/p.params[6];
-            return p.params[0] + p.params[1]*exp(-x1*x1) + p.params[4]*exp(-x2*x2);
+            T x1 = (V + T(p.params[2])) / T(p.params[3]);
+            T x2 = (V + T(p.params[5])) / T(p.params[6]);
+            return T(p.params[0]) + T(p.params[1])*exp(-x1*x1) + T(p.params[4])*exp(-x2*x2);
         }
         case F::SCALED_EXP: {
-            double ch = cosh(fmax(-500.0,fmin(500.0,(V-p.params[1])/(2.0*p.params[2]))));
-            return p.params[0]/fmax(ch,1e-10);
+            T ch = cosh(fmax(T(-500), fmin(T(500), (V - T(p.params[1])) / (T(2) * T(p.params[2])))));
+            return T(p.params[0]) / fmax(ch, T(1e-10));
         }
         case F::COMPOUND_AB: {
-            double s = p.params[0]*exp((V+p.params[1])/p.params[2])
-                     + p.params[3]*exp((V+p.params[4])/p.params[5]);
-            return 1.0/fmax(s,1e-10);
+            T s = T(p.params[0])*exp((V + T(p.params[1])) / T(p.params[2]))
+                + T(p.params[3])*exp((V + T(p.params[4])) / T(p.params[5]));
+            return T(1) / fmax(s, T(1e-10));
         }
     }
-    return 1.0;
+    return T(1);
 }
-__device__ inline double sa_rate(double V, const hodgkin_huxley::RateFuncParams& p) {
+template <typename T>
+__device__ inline T sa_rate(T V, const hodgkin_huxley::RateFuncParams& p) {
     using F = hodgkin_huxley::RateFuncParams::Form;
     switch (p.form) {
         case F::LINEAR_OVER_EXP: {
-            double x=V+p.B, xc=x/p.C;
-            return fabs(xc)<1e-6 ? p.A*p.C*(1.0+xc*0.5) : p.A*x/(exp(xc)-1.0);
+            T x = V + T(p.B), xc = x / T(p.C);
+            return fabs(xc) < T(1e-6) ? T(p.A)*T(p.C)*(T(1)+xc*T(0.5)) : T(p.A)*x/(exp(xc)-T(1));
         }
         case F::EXP_DECAY:
-            return p.A*exp(fmax(-500.0,fmin(500.0,(V+p.B)/p.C)));
+            return T(p.A) * exp(fmax(T(-500), fmin(T(500), (V + T(p.B)) / T(p.C))));
         case F::LINEAR_OVER_EXPM1: {
-            double x=V+p.B, xc=x/p.C;
-            return fabs(xc)<1e-6 ? p.A*p.C*(1.0+xc*0.5) : p.A*x/(1.0-exp(-xc));
+            T x = V + T(p.B), xc = x / T(p.C);
+            return fabs(xc) < T(1e-6) ? T(p.A)*T(p.C)*(T(1)+xc*T(0.5)) : T(p.A)*x/(T(1)-exp(-xc));
         }
         case F::SIGMOID:
-            return p.A/(1.0+exp(fmax(-500.0,fmin(500.0,(V+p.B)/p.C))));
+            return T(p.A) / (T(1) + exp(fmax(T(-500), fmin(T(500), (V + T(p.B)) / T(p.C)))));
     }
-    return 0.0;
+    return T(0);
 }
-__device__ inline double sa_clamp01(double x) {
-    return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
+template <typename T>
+__device__ inline T sa_clamp01(T x) {
+    return x < T(0) ? T(0) : (x > T(1) ? T(1) : x);
 }
 
-// Lean, fully-specialized composable step (Stage 2). Templated on the EXACT
-// gate/channel/substance counts so loops are compile-time-bounded and unrolled,
-// and the per-thread scratch arrays are exactly sized. Handles only the
-// pattern-matched standard forms with NO modulations and NO VM programs — the
-// mod_* scratch arrays and the entire eval_vm_program path are gone, which is
-// what raises occupancy enough to hide the fp64 transcendental latency.
-// Dispatched per pool by composable_step_dispatch(); pools with modulations or
-// VM programs are routed away from the cooperative kernel entirely.
-template <int NG, int NC, int NS>
-__device__ void composable_step_unrolled(
-    hodgkin_huxley::CudaComposableDesc p, int i, double I_in, double dt)
+// P3b composable pass: reads gates already updated by P3a, resolves DERIVED gates,
+// computes channel currents, updates V, updates intracellular substances, writes back.
+// Templated on exact gate/channel/substance counts AND compute type T.
+// Gate kinetics (INF_TAU, ALPHA_BETA, INSTANT) are NOT recomputed here — P3a wrote them.
+template <int NG, int NC, int NS, typename T>
+__device__ void composable_channel_vupdate_unrolled(
+    hodgkin_huxley::CudaComposableDesc p, int i, T I_in, T dt)
 {
     using namespace hodgkin_huxley;
     const int stride = p.state_stride;
 
-    double v = p.d_V[i];
-    // I_in already carries external + synaptic current (d_I_syn, filled from the
-    // StimRaw constant/pulse/DBS terms in P1). Do NOT add p.d_I_ext here: the pool's
-    // d_I_ext array is only populated by the non-cooperative gather_currents() path;
-    // in the cooperative kernel it is never written and holds uninitialized garbage,
-    // which produced non-deterministic results for every composable model.
-    const double current = I_in;
+    T v = T(p.d_V[i]);
+    // I_in carries external + synaptic current from d_I_syn (see composable_step_unrolled
+    // comment about why p.d_I_ext is NOT used on the cooperative path).
+    const T current = I_in;
 
-    double gate_vals[NG];
-    double x_vals[NS > 0 ? NS : 1];
-    double e_nernst[NS > 0 ? NS : 1];
+    T gate_vals[NG];
+    T x_vals[NS > 0 ? NS : 1];
+    T e_nernst[NS > 0 ? NS : 1];
 
+    // Read gates updated by P3a. DERIVED gates still hold their previous-step value
+    // from d_gate_state; they'll be recomputed immediately below.
     #pragma unroll
     for (int g = 0; g < NG; ++g)
-        gate_vals[g] = p.d_gate_state[g * stride + i];
+        gate_vals[g] = T(p.d_gate_state[g * stride + i]);
     #pragma unroll
     for (int s = 0; s < NS; ++s) {
-        x_vals[s]   = p.d_substance_state[s * stride + i];
-        e_nernst[s] = p.d_nernst_state[s * stride + i];
+        x_vals[s]   = T(p.d_substance_state[s * stride + i]);
+        e_nernst[s] = T(p.d_nernst_state[s * stride + i]);
     }
 
-    // Gate update — standard forms only.
+    // Resolve DERIVED gates using this step's source gate values (now in gate_vals[]).
     #pragma unroll
     for (int g = 0; g < NG; ++g) {
         const auto& desc = p.d_gate_descs[g];
-        const double dep = (desc.dependency == 1 && desc.intracellular_idx >= 0
-                            && desc.intracellular_idx < NS)
-            ? x_vals[desc.intracellular_idx] : v;
-        switch (desc.update_form) {
-            case 0: { // INF_TAU
-                const double xi  = sa_boltz(dep, desc.inf);
-                const double tau = fmax(sa_tau(v, desc.tau), 1e-10);
-                gate_vals[g] = xi + (gate_vals[g] - xi) * exp(-dt * desc.scale / tau);
-                break;
-            }
-            case 1: { // ALPHA_BETA  (tau = 1/(al+be) → exp(-dt*(al+be)))
-                const double al = sa_rate(v, desc.alpha), be = sa_rate(v, desc.beta);
-                const double rt = fmax(al + be, 1e-10);
-                const double xi = al / rt;
-                gate_vals[g] = xi + (gate_vals[g] - xi) * exp(-dt * rt);
-                break;
-            }
-            case 2: // INSTANT
-                gate_vals[g] = sa_boltz(dep, desc.inf);
-                break;
-            case 3: // DERIVED
-                if (desc.derived_source_gate >= 0 && desc.derived_source_gate < NG)
-                    gate_vals[g] = desc.derived_a * (desc.derived_b
-                        + desc.derived_c * gate_vals[desc.derived_source_gate]);
-                break;
+        if (desc.update_form == 3) {  // DERIVED
+            if (desc.derived_source_gate >= 0 && desc.derived_source_gate < NG)
+                gate_vals[g] = T(desc.derived_a) * (T(desc.derived_b)
+                    + T(desc.derived_c) * gate_vals[desc.derived_source_gate]);
+            gate_vals[g] = sa_clamp01<T>(gate_vals[g]);
         }
-        gate_vals[g] = sa_clamp01(gate_vals[g]);
     }
 
     // Channel currents.
-    double I_total = 0.0;
+    T I_total = T(0);
     #pragma unroll
     for (int c = 0; c < NC; ++c) {
         const auto& ch = p.d_channel_descs[c];
-        double gate_prod = 1.0;
+        T gate_prod = T(1);
         for (int gi = 0; gi < ch.gate_ref_count; ++gi) {
             const auto& ref = p.d_channel_gate_refs[ch.gate_ref_start + gi];
             if (ref.gate_idx >= 0 && ref.gate_idx < NG)
                 for (int pp = 0; pp < ref.power; ++pp) gate_prod *= gate_vals[ref.gate_idx];
         }
-        const double E_rev = (ch.nernst_substance_idx >= 0 && ch.nernst_substance_idx < NS)
-            ? e_nernst[ch.nernst_substance_idx] : ch.E_rev;
-        const double I_ci = ch.is_ahp
-            ? ch.g * (x_vals[ch.ahp_substance_idx] / fmax(x_vals[ch.ahp_substance_idx] + ch.ahp_k1, 1e-10)) * (v - E_rev)
-            : ch.g * gate_prod * (v - E_rev);
+        const T E_rev = (ch.nernst_substance_idx >= 0 && ch.nernst_substance_idx < NS)
+            ? e_nernst[ch.nernst_substance_idx] : T(ch.E_rev);
+        const T I_ci = ch.is_ahp
+            ? T(ch.g) * (x_vals[ch.ahp_substance_idx] / fmax(x_vals[ch.ahp_substance_idx] + T(ch.ahp_k1), T(1e-10))) * (v - E_rev)
+            : T(ch.g) * gate_prod * (v - E_rev);
         I_total += I_ci;
     }
 
-    v += dt * (-I_total + current) / p.C_m;
+    v += dt * (-I_total + current) / T(p.C_m);
 
     // Intracellular substances — DECAY / DRIVEN_DECAY(_NERNST) standard forms.
+    // Recomputes source-channel currents at post-update V for correct Ca2+ driving
+    // force (see STN calcium post-update V memory note).
     #pragma unroll
     for (int s = 0; s < NS; ++s) {
         const auto& intr = p.d_intr_descs[s];
-        double dX;
+        T dX;
         if (intr.update_form == 0) {            // DECAY
-            dX = -intr.k_decay * x_vals[s];
+            dX = -T(intr.k_decay) * x_vals[s];
         } else {                                // DRIVEN_DECAY (_NERNST)
-            // Recompute source-channel currents at the post-update voltage so
-            // the Ca2+ driving force uses the new V (matches the reference
-            // model); reusing the pre-update current drifts Ca2+-dependent cells.
-            double I_src = 0.0;
+            T I_src = T(0);
             for (int sc = 0; sc < intr.source_count; ++sc) {
                 const int ci = p.d_intr_source_channels[intr.source_start + sc];
                 if (ci < 0 || ci >= NC) continue;
                 const auto& ch = p.d_channel_descs[ci];
-                double gate_prod = 1.0;
+                T gate_prod = T(1);
                 for (int gi = 0; gi < ch.gate_ref_count; ++gi) {
                     const auto& ref = p.d_channel_gate_refs[ch.gate_ref_start + gi];
                     if (ref.gate_idx >= 0 && ref.gate_idx < NG)
                         for (int pp = 0; pp < ref.power; ++pp) gate_prod *= gate_vals[ref.gate_idx];
                 }
-                const double E_rev = (ch.nernst_substance_idx >= 0 && ch.nernst_substance_idx < NS)
-                    ? e_nernst[ch.nernst_substance_idx] : ch.E_rev;
+                const T E_rev = (ch.nernst_substance_idx >= 0 && ch.nernst_substance_idx < NS)
+                    ? e_nernst[ch.nernst_substance_idx] : T(ch.E_rev);
                 I_src += ch.is_ahp
-                    ? ch.g * (x_vals[ch.ahp_substance_idx] / fmax(x_vals[ch.ahp_substance_idx] + ch.ahp_k1, 1e-10)) * (v - E_rev)
-                    : ch.g * gate_prod * (v - E_rev);
+                    ? T(ch.g) * (x_vals[ch.ahp_substance_idx] / fmax(x_vals[ch.ahp_substance_idx] + T(ch.ahp_k1), T(1e-10))) * (v - E_rev)
+                    : T(ch.g) * gate_prod * (v - E_rev);
             }
-            dX = intr.epsilon * (-I_src - intr.k_decay * x_vals[s]);
+            dX = T(intr.epsilon) * (-I_src - T(intr.k_decay) * x_vals[s]);
         }
-        x_vals[s] = fmax(0.0, x_vals[s] + dt * dX);
+        x_vals[s] = fmax(T(0), x_vals[s] + dt * dX);
         if (intr.nernst_enabled)
-            e_nernst[s] = (intr.nernst_R * intr.nernst_T) / (intr.nernst_z * intr.nernst_F)
-                * log(intr.nernst_Ca_o / fmax(x_vals[s], 1e-10));
+            e_nernst[s] = T(intr.nernst_R * intr.nernst_T) / T(intr.nernst_z * intr.nernst_F)
+                * log(T(intr.nernst_Ca_o) / fmax(x_vals[s], T(1e-10)));
     }
 
-    // Write back.
-    p.d_V[i] = v;
+    // Write back V, substances. Write DERIVED gate values so d_gate_state stays
+    // consistent for download_state() and the next step's P3b read.
+    // Non-DERIVED gates are already current in d_gate_state from P3a.
+    p.d_V[i] = double(v);
     p.d_synapse_g_scale[i] = 1.0;
     #pragma unroll
-    for (int g = 0; g < NG; ++g) p.d_gate_state[g * stride + i] = gate_vals[g];
+    for (int g = 0; g < NG; ++g) {
+        if (p.d_gate_descs[g].update_form == 3)
+            p.d_gate_state[g * stride + i] = double(gate_vals[g]);
+    }
     #pragma unroll
     for (int s = 0; s < NS; ++s) {
-        p.d_substance_state[s * stride + i] = x_vals[s];
-        p.d_nernst_state[s * stride + i]    = e_nernst[s];
+        p.d_substance_state[s * stride + i] = double(x_vals[s]);
+        p.d_nernst_state[s * stride + i]    = double(e_nernst[s]);
     }
 }
 
-// Per-pool dispatch on the exact structural signature. The bucket list MUST
-// stay in sync with is_known_composable_bucket() on the host — the cooperative
-// kernel is only launched when every composable pool matches a bucket here, so
-// the default is unreachable in practice.
-__device__ inline void composable_step_dispatch(
-    const hodgkin_huxley::CudaComposableDesc& cd, int i, double I_in, double dt)
+// Per-pool dispatch for P3b (channel + V + substance update), templated on T.
+// Bucket list MUST stay in sync with coop_fast_eligible() — same pools, same constraints.
+template <typename T>
+__device__ inline void composable_channel_vupdate_dispatch(
+    const hodgkin_huxley::CudaComposableDesc& cd, int i, T I_in, T dt)
 {
     const int g = cd.n_gates, c = cd.n_channels, s = cd.n_intracellulars;
-    if (g == 3  && c == 3 && s == 0) { composable_step_unrolled<3, 3, 0>(cd, i, I_in, dt);  return; }
-    if (g == 4  && c == 4 && s == 0) { composable_step_unrolled<4, 4, 0>(cd, i, I_in, dt);  return; }
-    if (g == 5  && c == 4 && s == 0) { composable_step_unrolled<5, 4, 0>(cd, i, I_in, dt);  return; }
-    if (g == 6  && c == 6 && s == 1) { composable_step_unrolled<6, 6, 1>(cd, i, I_in, dt);  return; }
-    if (g == 11 && c == 7 && s == 1) { composable_step_unrolled<11, 7, 1>(cd, i, I_in, dt); return; }
+    if (g == 3  && c == 3 && s == 0) { composable_channel_vupdate_unrolled<3, 3, 0, T>(cd, i, I_in, dt);  return; }
+    if (g == 4  && c == 4 && s == 0) { composable_channel_vupdate_unrolled<4, 4, 0, T>(cd, i, I_in, dt);  return; }
+    if (g == 5  && c == 4 && s == 0) { composable_channel_vupdate_unrolled<5, 4, 0, T>(cd, i, I_in, dt);  return; }
+    if (g == 6  && c == 6 && s == 1) { composable_channel_vupdate_unrolled<6, 6, 1, T>(cd, i, I_in, dt);  return; }
+    if (g == 11 && c == 7 && s == 1) { composable_channel_vupdate_unrolled<11, 7, 1, T>(cd, i, I_in, dt); return; }
     // Unreachable: routing guarantees only known buckets reach this kernel.
 }
 
@@ -340,8 +330,8 @@ __device__ inline void update_synapse_state_single(
         case 1: { if (arrived) a += desc.delta_A; double dS=(a-s)/desc.tau_A, dA=-a/desc.tau_A; s+=dt*dS; a+=dt*dA; if(s<0)s=0; break; }
         case 2: { if (arrived){s+=desc.delta_S;a+=desc.delta_A;} s*=exp(-dt/desc.tau_S); a*=exp(-dt/desc.tau_A); break; }
         case 3: { double ro=desc.tanh_amp*(1.0+tanh((v_pre-desc.tanh_vh)/desc.tanh_k)); double rt=ro+1.0/desc.tau_decay; double si=ro/rt; s=si+(s-si)*exp(-dt*rt); break; }
-        case 4: { double si=sa_boltz(v_pre,desc.s_inf); double tau=fmax(sa_tau(v_pre,desc.tau),1e-10); s=si+(s-si)*exp(-dt/tau); break; }
-        case 5: { double al=sa_rate(v_pre,desc.alpha),be=sa_rate(v_pre,desc.beta); double rt=al+be; double si=(rt>1e-10)?al/rt:s; s=si+(s-si)*exp(-dt*rt); break; }
+        case 4: { double si=sa_boltz<double>(v_pre,desc.s_inf); double tau=fmax(sa_tau<double>(v_pre,desc.tau),1e-10); s=si+(s-si)*exp(-dt/tau); break; }
+        case 5: { double al=sa_rate<double>(v_pre,desc.alpha),be=sa_rate<double>(v_pre,desc.beta); double rt=al+be; double si=(rt>1e-10)?al/rt:s; s=si+(s-si)*exp(-dt*rt); break; }
         case 6: {
             if (desc.dS_vm_idx >= 0) {
                 if (desc.dA_vm_idx >= 0) {
@@ -378,6 +368,45 @@ __device__ inline void update_synapse_state_single(
     syn.d_S[k] = s; syn.d_A[k] = a; syn.d_g[k] = g_eff;
 }
 
+// Per-(neuron,gate) helper for P3a. Handles INF_TAU (0), ALPHA_BETA (1),
+// INSTANT (2). Skips DERIVED (3) — those are cheap linear ops handled in P3b
+// after all source gates are visible. One thread per gate slot; no inner loops.
+template <typename T>
+__device__ inline void composable_gate_update_single(
+    const hodgkin_huxley::CudaComposableDesc& p, int i, int g, T v, T dt)
+{
+    using namespace hodgkin_huxley;
+    const auto& desc = p.d_gate_descs[g];
+
+    const T dep = (desc.dependency == 1 && desc.intracellular_idx >= 0
+                   && desc.intracellular_idx < p.n_intracellulars)
+        ? T(p.d_substance_state[desc.intracellular_idx * p.state_stride + i])
+        : v;
+
+    T val = T(p.d_gate_state[g * p.state_stride + i]);
+
+    switch (desc.update_form) {
+        case 0: { // INF_TAU
+            const T xi  = sa_boltz<T>(dep, desc.inf);
+            const T tau = fmax(sa_tau<T>(v, desc.tau), T(1e-10));
+            val = xi + (val - xi) * exp(-dt * T(desc.scale) / tau);
+            break;
+        }
+        case 1: { // ALPHA_BETA
+            const T al = sa_rate<T>(v, desc.alpha), be = sa_rate<T>(v, desc.beta);
+            const T rt = fmax(al + be, T(1e-10));
+            const T xi = al / rt;
+            val = xi + (val - xi) * exp(-dt * rt);
+            break;
+        }
+        case 2: // INSTANT
+            val = sa_boltz<T>(dep, desc.inf);
+            break;
+        default: return;  // DERIVED: skip, handled in P3b
+    }
+    p.d_gate_state[g * p.state_stride + i] = double(sa_clamp01<T>(val));
+}
+
 // ---------------------------------------------------------------------------
 // Barrier helper — switches between grid.sync() and __syncthreads()
 // depending on whether the launch is cooperative (multi-block) or single-block.
@@ -401,29 +430,50 @@ struct NeuronSlot {
     int local;  // neuron index within that pool
 };
 
+// One entry per (composable neuron, non-DERIVED gate) pair. Built on the host
+// in simulate_all_plan_create, uploaded once, reused every step. Lets P3a run
+// one gate update per thread — N_neurons*N_gates concurrent threads instead of
+// N_neurons, which is the main bottleneck for high-gate-count models (STN: 11).
+struct GateSlot {
+    int pool;   // index into comp_descs
+    int local;  // neuron index within that pool
+    int gate;   // gate index (0..n_gates-1); DERIVED gates (update_form==3) excluded
+};
+
 // ---------------------------------------------------------------------------
 // Main simulation kernel — templated on MultiBlock.
-// Phase fusion (Phase 1 optimization):
-//   P1 (stim + scatter V)                           [barrier]
-//   P2 (accumulate I_syn)                           [barrier]
-//   P3+P4+P5 fused (step + scatter V + detect)     [barrier]
-//   P6 (write spike ring)                           [barrier ONLY if min_delay=0]
-//   P7 (update synapse state)                       [barrier, end-of-step]
 //
-// P3→P4 and P4→P5 barriers are removed: each thread handles its own neuron
-// through all three operations with no cross-thread dependency.
+// PRE-LOOP (once per kernel invocation):
+//   Scatter pool V → d_V_cache; zero d_I_syn.               [barrier]
+//   Amortised over all steps — not counted in the per-step cost.
 //
-// P6→P7 barrier is elided when min_delay_steps >= 1, since write_slot
-// (step%R) differs from read_slot ((step-delay)%R). For typical networks,
-// barrier count is 4 per step (down from 7). With delay=0 it's 5.
+// Per-step phases:
+//   PHASE A  (all concurrent): record V from d_V_cache;
+//             stim → atomicAdd(d_I_syn); P2 atomicAdd(d_I_syn);
+//             P3a gate updates                               [barrier]
+//   PHASE B  (fused per-neuron): step → zero d_I_syn[nidx] →
+//             scatter V (→ d_V_cache) → detect spike         [barrier]
+//   PHASE C  P6 spike ring          [barrier ONLY if min_delay=0]
+//             P7 synapse state update                        [barrier, end-of-step]
+//
+// Phase A is fully concurrent because:
+//   - Record reads d_V_cache (written by Phase B of previous step; not touched by stim/P2/P3a).
+//   - Stim and P2 both write d_I_syn via atomicAdd (d_I_syn zeroed by Phase B of prev step;
+//     no assignment vs. atomicAdd race).
+//   - P3a reads cd.d_V / d_gate_state / d_substance_state, none of which are modified by
+//     stim, P2, or recording.
+//
+// Barrier count: 3 per step for typical networks (4 with min_delay_steps == 0).
 // ---------------------------------------------------------------------------
 
-template <bool MultiBlock>
+template <bool MultiBlock, typename T>
 __device__ void simulate_all_kernel_impl(
     hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,
     hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,
     hodgkin_huxley::CudaComposableDesc* comp_descs, int n_comp,
     const NeuronSlot*                   layout,
+    const GateSlot*                     gate_layout,
+    int                                 n_gate_slots,
     hodgkin_huxley::DeviceSynapseRaw    syn,
     hodgkin_huxley::CudaStimRaw         stim,
     double*   d_V_cache,
@@ -444,11 +494,43 @@ __device__ void simulate_all_kernel_impl(
     const int total = MultiBlock
         ? (gridDim.x * blockDim.x)
         : static_cast<int>(blockDim.x);
+    const T t_dt = T(dt);
+
+    // ---- Pre-loop init (once per kernel invocation) ----
+    // Populate d_V_cache from current pool voltages so Phase A of step 0 has valid
+    // pre-step voltages for recording and synaptic current computation.
+    // Zero d_I_syn so Phase A's atomicAdds start from 0.
+    // (For chunk j>0: the previous chunk's last Phase B already left d_V_cache current
+    // and d_I_syn zeroed — this is a cheap redundant write, not wrong.)
+    for (int p = 0; p < n_hh; ++p)
+        for (int i = tid; i < hh_descs[p].n; i += total)
+            d_V_cache[hh_descs[p].d_net_idx[i]] = hh_descs[p].d_V[i];
+    for (int p = 0; p < n_iz; ++p)
+        for (int i = tid; i < iz_descs[p].n; i += total)
+            d_V_cache[iz_descs[p].d_net_idx[i]] = iz_descs[p].d_v[i];
+    for (int p = 0; p < n_comp; ++p)
+        for (int i = tid; i < comp_descs[p].n; i += total)
+            d_V_cache[comp_descs[p].d_net_idx[i]] = comp_descs[p].d_V[i];
+    for (int i = tid; i < n_neurons; i += total)
+        d_I_syn[i] = 0.0;
+    sync_step<MultiBlock>(grid);
 
     for (size_t t = 0; t < num_steps; ++t) {
         const size_t step = step_start + t;
 
-        // ---- P1: compute stim (→ d_I_syn) and scatter V (→ d_V_cache) ----
+        // ---- PHASE A: record + stim + I_syn accumulation + gate updates ----
+        // All four run concurrently — no shared writes:
+        //   Record reads d_V_cache (valid from Phase B of previous step).
+        //   Stim and P2 both atomicAdd to d_I_syn (zeroed at end of previous Phase B).
+        //   P3a writes d_gate_state, reads cd.d_V — neither touched by the other work.
+
+        // Record pre-step voltage (CPU-matching semantics: V before the step)
+        if (d_V_out && record_interval > 0 && (int)(t % static_cast<size_t>(record_interval)) == 0) {
+            const int tr = static_cast<int>(t / static_cast<size_t>(record_interval));
+            for (int i = tid; i < n_neurons; i += total)
+                d_V_out[static_cast<size_t>(i) * static_cast<size_t>(n_rec) + static_cast<size_t>(tr)] = d_V_cache[i];
+        }
+        // Stim → atomicAdd to d_I_syn (concurrent with P2; both are atomicAdd, no race)
         for (int i = tid; i < stim.n_neurons; i += total) {
             double I = stim.d_I_const[i];
             for (int p = 0; p < stim.n_pulses; ++p) {
@@ -462,65 +544,57 @@ __device__ void simulate_all_kernel_impl(
                 const auto& dd = stim.d_dbs[d];
                 if (dd.isi_steps == 0) continue;
                 if (static_cast<uint32_t>(i) >= dd.neuron_start
-                    && static_cast<uint32_t>(i) < dd.neuron_end) {
+                    && static_cast<uint32_t>(i) < dd.neuron_end)
                     if (static_cast<uint32_t>(step % dd.isi_steps) < dd.pw_steps)
                         I += dd.amplitude;
-                }
             }
-            d_I_syn[i] = I;
+            atomicAdd(&d_I_syn[i], I);
         }
-        for (int p = 0; p < n_hh; ++p)
-            for (int i = tid; i < hh_descs[p].n; i += total)
-                d_V_cache[hh_descs[p].d_net_idx[i]] = hh_descs[p].d_V[i];
-        for (int p = 0; p < n_iz; ++p)
-            for (int i = tid; i < iz_descs[p].n; i += total)
-                d_V_cache[iz_descs[p].d_net_idx[i]] = iz_descs[p].d_v[i];
-        for (int p = 0; p < n_comp; ++p)
-            for (int i = tid; i < comp_descs[p].n; i += total)
-                d_V_cache[comp_descs[p].d_net_idx[i]] = comp_descs[p].d_V[i];
-        // Record pre-step voltage — matches CPU semantics (records V before stepping)
-        if (d_V_out && record_interval > 0 && (int)(t % static_cast<size_t>(record_interval)) == 0) {
-            const int tr = static_cast<int>(t / static_cast<size_t>(record_interval));
-            for (int i = tid; i < n_neurons; i += total)
-                d_V_out[static_cast<size_t>(i) * static_cast<size_t>(n_rec) + static_cast<size_t>(tr)] = d_V_cache[i];
-        }
-        sync_step<MultiBlock>(grid);
-
-        // ---- P2: accumulate synaptic currents (atomicAdd → d_I_syn) ----
+        // P2: accumulate synaptic currents
         for (int s = tid; s < syn.n_synapses; s += total)
             accumulate_isyn_single(syn, s, d_V_cache, d_I_syn);
+        // P3a: thread-per-gate update (non-DERIVED composable gates only)
+        for (int gs = tid; gs < n_gate_slots; gs += total) {
+            const GateSlot slot = gate_layout[gs];
+            const auto& cd = comp_descs[slot.pool];
+            composable_gate_update_single<T>(cd, slot.local, slot.gate,
+                                             T(cd.d_V[slot.local]), t_dt);
+        }
         sync_step<MultiBlock>(grid);
 
-        // ---- Fused P3+P4+P5: gather I_syn → step pool → scatter V → detect spike ----
-        // No barriers between substeps: each thread processes its own neuron only.
+        // ---- PHASE B: fused per-neuron step → scatter V → reset d_I_syn → detect spike ----
+        // Each thread owns exactly one neuron (nidx); it:
+        //   reads  d_I_syn[nidx] (fully accumulated by Phase A barrier)
+        //   reads  d_gate_state  (updated by P3a in Phase A)
+        //   steps  the neuron
+        //   writes d_I_syn[nidx] = 0.0  (reset for next step's Phase A atomicAdds)
+        //   writes d_V_cache[nidx] = v_new (pre-step V for next step's Phase A)
         const int tr_spike = (record_interval > 0)
             ? static_cast<int>(t / static_cast<size_t>(record_interval)) : 0;
         const bool record_spikes = (d_spike_buf != nullptr) && record_interval > 0 && tr_spike < n_rec;
 
-        // Flat fused pass over ALL neurons (model-layout fusion): one strided
-        // loop keeps up to `total` threads active concurrently, instead of a
-        // sequential per-pool loop that activates < 1 warp for small pools.
         for (int k = tid; k < n_neurons; k += total) {
             const NeuronSlot sl = layout[k];
             size_t nidx;
             double v_new;
-            if (sl.kind == 0) {                 // HH
+            if (sl.kind == 0) {
                 const auto& d = hh_descs[sl.pool];
                 nidx = d.d_net_idx[sl.local];
-                hh_step_single(d, sl.local, d_I_syn[nidx], dt);
+                hh_step_single<T>(d, sl.local, T(d_I_syn[nidx]), t_dt);
                 v_new = d.d_V[sl.local];
-            } else if (sl.kind == 1) {          // Izhikevich
+            } else if (sl.kind == 1) {
                 const auto& d = iz_descs[sl.pool];
                 nidx = d.d_net_idx[sl.local];
-                iz_step_single(d, sl.local, d_I_syn[nidx], dt);
+                iz_step_single<T>(d, sl.local, T(d_I_syn[nidx]), t_dt);
                 v_new = d.d_v[sl.local];
-            } else {                            // composable
+            } else {
                 const auto& d = comp_descs[sl.pool];
                 nidx = d.d_net_idx[sl.local];
-                composable_step_dispatch(d, sl.local, d_I_syn[nidx], dt);
+                composable_channel_vupdate_dispatch<T>(d, sl.local, T(d_I_syn[nidx]), t_dt);
                 v_new = d.d_V[sl.local];
             }
-            d_V_cache[nidx] = v_new;
+            d_I_syn[nidx]   = 0.0;   // reset: this thread owns nidx, no other Phase B thread touches it
+            d_V_cache[nidx] = v_new; // scatter: pre-step V for next step's Phase A
             if (syn.n_synapses > 0 || record_spikes) {
                 const double vp = syn.d_V_prev ? syn.d_V_prev[nidx] : v_new;
                 const uint8_t spiked = (v_new > syn.spike_threshold && vp <= syn.spike_threshold) ? 1u : 0u;
@@ -532,76 +606,57 @@ __device__ void simulate_all_kernel_impl(
         }
         sync_step<MultiBlock>(grid);
 
-        // ---- P6: update spike ring ----
-        // Per-NEURON ring: record each neuron's spike once (not once per outgoing
-        // synapse). Size n_neurons*ring_size instead of n_synapses*ring_size — for
-        // dense/delayed networks that is orders of magnitude less memory + traffic.
+        // ---- PHASE C: spike ring + synapse state update ----
         if (syn.n_synapses > 0) {
             const int write_slot = static_cast<int>(step % static_cast<size_t>(syn.ring_size));
             for (int i = tid; i < syn.n_neurons; i += total)
                 syn.d_spike_ring[i * syn.ring_size + write_slot] = syn.d_neuron_spiked[i] ? 1u : 0u;
         }
-        // P6→P7 barrier — only required when min_delay_steps == 0 (read_slot
-        // could equal write_slot). For typical networks with delay >= dt, the
-        // slots differ and we can elide this entire barrier.
-        if (syn.min_delay_steps < 1) {
+        // Barrier only required when min_delay_steps == 0 (read_slot == write_slot possible)
+        if (syn.min_delay_steps < 1)
             sync_step<MultiBlock>(grid);
-        }
 
-        // ---- P7: update synapse state ----
         for (int s = tid; s < syn.n_synapses; s += total)
             update_synapse_state_single(syn, s, d_V_cache, step, dt);
         sync_step<MultiBlock>(grid);
     }
 }
 
-__global__ void simulate_all_kernel_multi(
-    hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,
-    hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,
-    hodgkin_huxley::CudaComposableDesc* comp_descs, int n_comp,
-    const NeuronSlot*                   layout,
-    hodgkin_huxley::DeviceSynapseRaw    syn,
-    hodgkin_huxley::CudaStimRaw         stim,
-    double*   d_V_cache,
-    double*   d_I_syn,
-    double*   d_V_out,
-    uint8_t*  d_spike_buf,
-    int       n_neurons,
-    size_t    num_steps,
-    double    dt,
-    size_t    step_start,
-    int       record_interval,
-    int       n_rec)
-{
-    simulate_all_kernel_impl<true>(
-        hh_descs, n_hh, iz_descs, n_iz, comp_descs, n_comp, layout,
-        syn, stim, d_V_cache, d_I_syn, d_V_out, d_spike_buf,
-        n_neurons, num_steps, dt, step_start, record_interval, n_rec);
-}
+// Macro to avoid repeating the full parameter list 4 times.
+#define SIM_ALL_KERNEL_PARAMS \
+    hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,     \
+    hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,     \
+    hodgkin_huxley::CudaComposableDesc* comp_descs, int n_comp,   \
+    const NeuronSlot*                   layout,                   \
+    const GateSlot*                     gate_layout,              \
+    int                                 n_gate_slots,             \
+    hodgkin_huxley::DeviceSynapseRaw    syn,                      \
+    hodgkin_huxley::CudaStimRaw         stim,                     \
+    double*  d_V_cache, double* d_I_syn,                          \
+    double*  d_V_out,   uint8_t* d_spike_buf,                     \
+    int n_neurons, size_t num_steps, double dt,                   \
+    size_t step_start, int record_interval, int n_rec
 
-__global__ void simulate_all_kernel_single(
-    hodgkin_huxley::CudaHHDesc*         hh_descs,   int n_hh,
-    hodgkin_huxley::CudaIzDesc*         iz_descs,   int n_iz,
-    hodgkin_huxley::CudaComposableDesc* comp_descs, int n_comp,
-    const NeuronSlot*                   layout,
-    hodgkin_huxley::DeviceSynapseRaw    syn,
-    hodgkin_huxley::CudaStimRaw         stim,
-    double*   d_V_cache,
-    double*   d_I_syn,
-    double*   d_V_out,
-    uint8_t*  d_spike_buf,
-    int       n_neurons,
-    size_t    num_steps,
-    double    dt,
-    size_t    step_start,
-    int       record_interval,
-    int       n_rec)
-{
-    simulate_all_kernel_impl<false>(
-        hh_descs, n_hh, iz_descs, n_iz, comp_descs, n_comp, layout,
-        syn, stim, d_V_cache, d_I_syn, d_V_out, d_spike_buf,
-        n_neurons, num_steps, dt, step_start, record_interval, n_rec);
-}
+#define SIM_ALL_KERNEL_ARGS \
+    hh_descs, n_hh, iz_descs, n_iz, comp_descs, n_comp, layout,  \
+    gate_layout, n_gate_slots,                                    \
+    syn, stim, d_V_cache, d_I_syn, d_V_out, d_spike_buf,         \
+    n_neurons, num_steps, dt, step_start, record_interval, n_rec
+
+__global__ void simulate_all_kernel_multi_f64(SIM_ALL_KERNEL_PARAMS)
+{ simulate_all_kernel_impl<true,  double>(SIM_ALL_KERNEL_ARGS); }
+
+__global__ void simulate_all_kernel_multi_f32(SIM_ALL_KERNEL_PARAMS)
+{ simulate_all_kernel_impl<true,  float>(SIM_ALL_KERNEL_ARGS); }
+
+__global__ void simulate_all_kernel_single_f64(SIM_ALL_KERNEL_PARAMS)
+{ simulate_all_kernel_impl<false, double>(SIM_ALL_KERNEL_ARGS); }
+
+__global__ void simulate_all_kernel_single_f32(SIM_ALL_KERNEL_PARAMS)
+{ simulate_all_kernel_impl<false, float>(SIM_ALL_KERNEL_ARGS); }
+
+#undef SIM_ALL_KERNEL_PARAMS
+#undef SIM_ALL_KERNEL_ARGS
 
 } // anonymous namespace
 
@@ -675,10 +730,12 @@ SimAllPlan simulate_all_plan_create(
     const CudaHHDesc* hh_descs_h, int n_hh,
     const CudaIzDesc* iz_descs_h, int n_iz,
     const CudaComposableDesc* comp_descs_h, int n_comp,
-    size_t n_neurons, int n_synapses, int stim_n_neurons)
+    size_t n_neurons, int n_synapses, int stim_n_neurons,
+    bool use_float32)
 {
     SimAllPlan p;
     p.n_hh = n_hh; p.n_iz = n_iz; p.n_comp = n_comp;
+    p.use_float32 = use_float32;
     ck(cudaGetDevice(&p.device), "simulate_all_plan_create: cudaGetDevice");
 
     if (n_hh > 0) {
@@ -724,13 +781,37 @@ SimAllPlan simulate_all_plan_create(
         p.d_layout = d_layout;
     }
 
-    // Single-block vs cooperative decision — work_items is constant across chunks
-    // (neurons/synapses/stim don't change), so decide once.
+    // Gate-slot array: one entry per (composable neuron, non-DERIVED gate). Lets P3a
+    // run one gate-kinetics thread per slot — N_neurons*N_gates concurrent threads.
+    {
+        std::vector<GateSlot> gate_layout;
+        for (int q = 0; q < n_comp; ++q) {
+            const auto& cd = comp_descs_h[q];
+            if (!cd.h_gate_descs) continue;
+            for (int i = 0; i < cd.n; ++i)
+                for (int g = 0; g < cd.n_gates; ++g)
+                    if (cd.h_gate_descs[g].update_form != 3)  // skip DERIVED
+                        gate_layout.push_back({q, i, g});
+        }
+        p.n_gate_slots = static_cast<int>(gate_layout.size());
+        if (!gate_layout.empty()) {
+            GateSlot* d_gate_layout = nullptr;
+            ck(cudaMalloc(reinterpret_cast<void**>(&d_gate_layout),
+                          gate_layout.size() * sizeof(GateSlot)), "d_gate_layout alloc");
+            ck(cudaMemcpy(d_gate_layout, gate_layout.data(),
+                          gate_layout.size() * sizeof(GateSlot),
+                          cudaMemcpyHostToDevice), "d_gate_layout memcpy");
+            p.d_gate_layout = d_gate_layout;
+        }
+    }
+
+    // Single-block vs cooperative decision — work_items is constant across chunks.
     constexpr int kBlockSize        = 256;
     const int single_block_max_work = 256;
     int work_items = static_cast<int>(n_neurons);
-    if (n_synapses    > work_items) work_items = n_synapses;
+    if (n_synapses     > work_items) work_items = n_synapses;
     if (stim_n_neurons > work_items) work_items = stim_n_neurons;
+    if (p.n_gate_slots > work_items) work_items = p.n_gate_slots;
     if (work_items < 1) work_items = 1;
     p.use_single_block = (work_items <= single_block_max_work);
 
@@ -748,8 +829,11 @@ SimAllPlan simulate_all_plan_create(
         int sm_count = 0, max_blocks_sm = 0;
         ck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, p.device),
            "simulate_all_plan_create: SM count");
+        const void* occ_kernel = use_float32
+            ? (const void*)simulate_all_kernel_multi_f32
+            : (const void*)simulate_all_kernel_multi_f64;
         ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-               &max_blocks_sm, (const void*)simulate_all_kernel_multi, kBlockSize, 0),
+               &max_blocks_sm, occ_kernel, kBlockSize, 0),
            "simulate_all_plan_create: occupancy");
         const int blocks_needed = (work_items + kBlockSize - 1) / kBlockSize;
         p.total_blocks = std::min(blocks_needed, sm_count * max_blocks_sm);
@@ -772,39 +856,57 @@ void simulate_all_launch(
     constexpr int kBlockSize = 256;
 
     // Locals whose addresses feed the cooperative-launch arg list.
-    CudaHHDesc*         d_hh    = plan.d_hh;   int n_hh   = plan.n_hh;
-    CudaIzDesc*         d_iz    = plan.d_iz;   int n_iz   = plan.n_iz;
-    CudaComposableDesc* d_comp  = plan.d_comp; int n_comp = plan.n_comp;
-    NeuronSlot*         d_layout = static_cast<NeuronSlot*>(plan.d_layout);
+    CudaHHDesc*         d_hh         = plan.d_hh;   int n_hh   = plan.n_hh;
+    CudaIzDesc*         d_iz         = plan.d_iz;   int n_iz   = plan.n_iz;
+    CudaComposableDesc* d_comp       = plan.d_comp; int n_comp = plan.n_comp;
+    NeuronSlot*         d_layout     = static_cast<NeuronSlot*>(plan.d_layout);
+    GateSlot*           d_gate_layout = static_cast<GateSlot*>(plan.d_gate_layout);
+    int                 i_n_gate_slots = plan.n_gate_slots;
     int    i_n_neurons  = static_cast<int>(n_neurons);
     size_t sz_num_steps = num_steps;
     int    i_rec_iv     = static_cast<int>(record_interval);
     int    i_n_rec      = static_cast<int>(n_rec);
 
+    void* args[] = {
+        &d_hh, &n_hh, &d_iz, &n_iz, &d_comp, &n_comp, &d_layout,
+        &d_gate_layout, &i_n_gate_slots,
+        &syn, &stim, &d_V_cache, &d_I_syn, &d_V_out, &d_spike_buf,
+        &i_n_neurons, &sz_num_steps, &dt, &step_start, &i_rec_iv, &i_n_rec
+    };
     if (plan.use_single_block) {
-        simulate_all_kernel_single<<<1, plan.sb_threads, 0, stream>>>(
-            d_hh, n_hh, d_iz, n_iz, d_comp, n_comp, d_layout, syn, stim,
-            d_V_cache, d_I_syn, d_V_out, d_spike_buf,
-            i_n_neurons, sz_num_steps, dt, step_start, i_rec_iv, i_n_rec);
+        if (plan.use_float32) {
+            simulate_all_kernel_single_f32<<<1, plan.sb_threads, 0, stream>>>(
+                d_hh, n_hh, d_iz, n_iz, d_comp, n_comp, d_layout,
+                d_gate_layout, i_n_gate_slots,
+                syn, stim,
+                d_V_cache, d_I_syn, d_V_out, d_spike_buf,
+                i_n_neurons, sz_num_steps, dt, step_start, i_rec_iv, i_n_rec);
+        } else {
+            simulate_all_kernel_single_f64<<<1, plan.sb_threads, 0, stream>>>(
+                d_hh, n_hh, d_iz, n_iz, d_comp, n_comp, d_layout,
+                d_gate_layout, i_n_gate_slots,
+                syn, stim,
+                d_V_cache, d_I_syn, d_V_out, d_spike_buf,
+                i_n_neurons, sz_num_steps, dt, step_start, i_rec_iv, i_n_rec);
+        }
         ck(cudaGetLastError(), "simulate_all_launch: single-block launch");
     } else {
-        void* args[] = {
-            &d_hh, &n_hh, &d_iz, &n_iz, &d_comp, &n_comp, &d_layout,
-            &syn, &stim, &d_V_cache, &d_I_syn, &d_V_out, &d_spike_buf,
-            &i_n_neurons, &sz_num_steps, &dt, &step_start, &i_rec_iv, &i_n_rec
-        };
+        void* coop_kernel = plan.use_float32
+            ? reinterpret_cast<void*>(simulate_all_kernel_multi_f32)
+            : reinterpret_cast<void*>(simulate_all_kernel_multi_f64);
         ck(cudaLaunchCooperativeKernel(
-               reinterpret_cast<void*>(simulate_all_kernel_multi),
+               coop_kernel,
                dim3(plan.total_blocks), dim3(kBlockSize), args, 0, stream),
            "simulate_all_launch: cudaLaunchCooperativeKernel");
     }
 }
 
 void simulate_all_plan_destroy(SimAllPlan& plan) {
-    if (plan.d_hh)     cudaFree(plan.d_hh);
-    if (plan.d_iz)     cudaFree(plan.d_iz);
-    if (plan.d_comp)   cudaFree(plan.d_comp);
-    if (plan.d_layout) cudaFree(plan.d_layout);
+    if (plan.d_hh)          cudaFree(plan.d_hh);
+    if (plan.d_iz)          cudaFree(plan.d_iz);
+    if (plan.d_comp)        cudaFree(plan.d_comp);
+    if (plan.d_layout)      cudaFree(plan.d_layout);
+    if (plan.d_gate_layout) cudaFree(plan.d_gate_layout);
     plan = SimAllPlan{};
 }
 
@@ -830,7 +932,7 @@ void simulate_all_steps(
     if (num_steps == 0) return;
     SimAllPlan plan = simulate_all_plan_create(
         hh_descs_h, n_hh, iz_descs_h, n_iz, comp_descs_h, n_comp,
-        n_neurons, syn.n_synapses, stim.n_neurons);
+        n_neurons, syn.n_synapses, stim.n_neurons, /*use_float32=*/true);
     simulate_all_launch(plan, syn, stim, d_V_cache, d_I_syn, d_V_out, d_spike_buf,
                         n_neurons, num_steps, dt, step_start, record_interval, n_rec, stream);
     ck(cudaStreamSynchronize(stream), "simulate_all_steps: stream sync");

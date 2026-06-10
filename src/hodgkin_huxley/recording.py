@@ -356,7 +356,8 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
                    pop_info: dict | None = None,
                    detection_threshold: float | None = None,
                    stim_plan: "_StimPlan | None" = None,
-                   on_cuda: bool = False) -> MetricsResult:
+                   on_cuda: bool = False,
+                   use_float32: bool = True) -> MetricsResult:
     """
     Allocate output buffers, run simulation, build MetricsResult.
 
@@ -431,7 +432,8 @@ def _run_recording(network_core: _Network, duration: float, dt: float,
             duration, dt, stim_plan.I_const,
             stim_plan.pulses, stim_plan.dbs,
             V_buf, gate_buf, calcium_buf, u_buf, g_syn_buf, I_syn_buf,
-            spike_event_buf, spike_compact_buf, interval, det_thresh)
+            spike_event_buf, spike_compact_buf, interval, det_thresh,
+            use_float32)
     else:
         network_core._simulate_into_buffers(
             duration, dt, I_ext_list,

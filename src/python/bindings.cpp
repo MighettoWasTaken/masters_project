@@ -533,7 +533,8 @@ PYBIND11_MODULE(_core, m) {
                py::array_t<double> spike_event_buf,
                py::array_t<uint8_t> spike_buf_uint8,
                size_t interval,
-               double spike_threshold) {
+               double spike_threshold,
+               bool use_float32) {
                 StimPlan stim;
                 auto ic = I_const_arr.unchecked<1>();
                 stim.I_const.assign(ic.data(0), ic.data(0) + ic.shape(0));
@@ -562,14 +563,15 @@ PYBIND11_MODULE(_core, m) {
                     I_syn_buf.size()          ? I_syn_buf.mutable_data()          : nullptr,
                     spike_event_buf.size()    ? spike_event_buf.mutable_data()    : nullptr,
                     spike_buf_uint8.size()    ? spike_buf_uint8.mutable_data()    : nullptr,
-                    interval, n_rec, spike_threshold);
+                    interval, n_rec, spike_threshold, use_float32);
             },
             py::arg("duration"), py::arg("dt"), py::arg("I_const"),
             py::arg("pulses"), py::arg("dbs_events"),
             py::arg("V_buf"), py::arg("gate_buf"), py::arg("calcium_buf"),
             py::arg("u_buf"), py::arg("g_syn_buf"), py::arg("I_syn_buf"),
             py::arg("spike_event_buf"), py::arg("spike_buf_uint8"),
-            py::arg("interval"), py::arg("spike_threshold") = 0.0)
+            py::arg("interval"), py::arg("spike_threshold") = 0.0,
+            py::arg("use_float32") = true)
 
         // Python special methods
         .def("__repr__", [](const Network& net) {

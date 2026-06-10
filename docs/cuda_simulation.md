@@ -52,26 +52,53 @@ and all stimulators are `DBSStimulator`.
 Each timestep runs these phases inside the kernel:
 
 ```
-P1  compute stim → d_I_syn ; scatter pool V → d_V_cache ; record V        [barrier]
-P2  accumulate synaptic currents (atomicAdd → d_I_syn)                     [barrier]
-P3+P4+P5  FUSED per-neuron: gather I_syn → step → scatter V → detect spike [barrier]
-P6  write spike ring (d_neuron_spiked[pre] → d_spike_ring[s][step%R])      [barrier IF min_delay_steps==0]
-P7  update synapse state (S, A, g)                                         [barrier, end of step]
+PRE-LOOP (once):
+  scatter pool V → d_V_cache; zero d_I_syn                                  [barrier]
+
+PHASE A  (all concurrent):
+  record V from d_V_cache (pre-step semantics)
+  stim → atomicAdd(d_I_syn)
+  P2  accumulate synaptic currents (atomicAdd → d_I_syn)
+  P3a thread-per-gate: update composable gate values → d_gate_state         [barrier]
+
+PHASE B  (fused per-neuron):
+  resolve DERIVED gates → channel sum → V update → substance update
+  → zero d_I_syn[nidx] → scatter V (→ d_V_cache) → detect spike            [barrier]
+
+PHASE C  write spike ring                      [barrier IF min_delay_steps==0]
+         update synapse state (S, A, g)        [barrier, end of step]
 ```
 
 Key facts:
 
-- **P3/P4/P5 are fused** into one per-neuron pass — each thread steps its own
-  neuron, writes V, and detects its own spike, with no barriers between, because
-  there is no cross-thread dependency within a neuron.
-- **The P6→P7 barrier is elided** when `min_delay_steps >= 1` (the common case):
-  the ring write slot is `step % R` and the read slot is `(step − delay) % R`,
-  which differ whenever delay ≥ 1 step. Networks with a zero-delay synapse keep
-  the barrier.
-- Barrier count is therefore **4 per step** for typical networks (5 with a
-  zero-delay synapse), down from 7 in the original design.
+- **Phase A is fully concurrent.** Recording reads `d_V_cache` (written by Phase B
+  of the previous step — valid without any scatter in Phase A). Stim and P2 both
+  use `atomicAdd` to `d_I_syn` (which Phase B of the previous step zeroed);
+  no assignment-vs-atomic race. P3a reads `cd.d_V` / `d_gate_state` /
+  `d_substance_state` — none of which are written by recording, stim, or P2.
+  The result: **no barrier between stim, P2, P3a, and recording** — one combined
+  barrier at the end of Phase A suffices.
+- **Phase B scatter replaces Phase A scatter.** Each neuron thread writes
+  `d_V_cache[nidx] = v_new` and `d_I_syn[nidx] = 0.0` at the end of its step.
+  Since the layout assigns each `nidx` to exactly one thread, there are no races.
+  After Phase B's barrier, `d_V_cache` is valid for the next step's Phase A and
+  `d_I_syn` is zeroed for the next step's atomicAdds.
+- **P3a (thread-per-gate)** runs one thread per (composable neuron, non-DERIVED
+  gate) pair. For an STN pool with 11 gates, this is 11× more concurrent threads
+  than the former per-neuron approach, directly attacking the transcendental
+  bottleneck in INF_TAU / ALPHA_BETA gate kinetics. HH and Izhikevich are
+  unaffected — their update logic is unchanged in Phase B.
+- **DERIVED gates** (`update_form == 3`, cheap linear combinations of another
+  gate's value) are excluded from P3a and resolved at the start of Phase B, after
+  source gate values are safely in `d_gate_state`.
+- **The Phase C spike-ring→synapse barrier is elided** when `min_delay_steps >= 1`
+  (the common case).
+- Barrier count is therefore **3 per step** for typical networks (4 with a
+  zero-delay synapse). The pre-loop init pays one additional barrier once per
+  kernel invocation (amortised over all steps in the chunk).
 
-The fused P3-P5 pass is itself a **single flat loop over all neurons** — see §6.
+The P3a gate-slot array and the fused P3b pass are both **flat strided loops** —
+see §6.
 
 ---
 
@@ -168,31 +195,50 @@ scope here (a separate codegen track).
 
 ---
 
-## 6. Model-layout fusion (flat neuron pass)
+## 6. Model-layout fusion (flat neuron pass) and gate-slot array
 
-The fused P3-P5 step is **one flat strided loop over every neuron**, not a loop
+### Flat neuron pass (P3b)
+
+The fused P3b step is **one flat strided loop over every neuron**, not a loop
 per pool:
 
 ```cpp
 for (int k = tid; k < n_neurons; k += total) {
     const NeuronSlot sl = layout[k];      // {kind, pool, local}
-    // dispatch to hh_step_single / iz_step_single / composable_step_dispatch
+    // dispatch to hh_step_single / iz_step_single / composable_channel_vupdate_dispatch
     ...
 }
 ```
 
-`layout` is a `NeuronSlot[]` built on the host in `simulate_all_steps()`, ordered
-**HH → Izhikevich → composable-sorted-by-bucket** so same-type neurons are
-contiguous (minimizes warp divergence).
+`layout` is a `NeuronSlot[]` built on the host in `simulate_all_plan_create()`,
+ordered **HH → Izhikevich → composable-sorted-by-bucket** so same-type neurons are
+contiguous (minimizes warp divergence). See §6 history: this flat loop was the
+single biggest win for small heterogeneous models (CTX-BG-TH 10s → 7s) by
+eliminating the per-pool warp starvation tax.
 
-**Why this matters:** the old code looped *per pool* (`for p: for i in pool[p]`).
-For a model like CTX-BG-TH — 8 pools × 10 neurons — each pool pass activated only
-~10 of 256 threads (**less than one warp**) and the pools ran sequentially, so
-the SM had no concurrent warps to hide latency. Measured cost was ~3.9 µs per
-neuron per step at 10 neurons/pool versus ~0.34 µs at 500/pool — an ~11×
-starvation tax. The flat loop keeps all neurons' threads active in one pass, so
-latency overlaps across warps. This was the single biggest win for small
-heterogeneous models (CTX-BG-TH 10s → 7s).
+### Gate-slot array (P3a)
+
+P3a uses a parallel `GateSlot[]` array — one entry per `(composable neuron,
+non-DERIVED gate)` pair — built alongside `NeuronSlot[]` in `simulate_all_plan_create()`:
+
+```cpp
+struct GateSlot { int pool, local, gate; };
+// Built for all comp_descs[q] where h_gate_descs[g].update_form != 3
+```
+
+The gate-slot count is `sum_over_pools(n * n_non_derived_gates)`. For CTX-BG-TH
+this is ~370 slots vs 80 neuron slots — 4-11× more concurrent threads during the
+gate phase. This is the main lever for reducing GPU time on high-gate-count models:
+INF_TAU and ALPHA_BETA gate kinetics (dominant fp64 transcendental cost) now run
+fully in parallel across all neurons and gates simultaneously.
+
+The gate-slot count is included in the `work_items` calculation, so a network with
+many complex composable neurons and no synapses will correctly switch to multi-block
+even if the neuron count alone would fit in a single block.
+
+`h_gate_descs` in `CudaComposableDesc` is a host-side mirror of `d_gate_descs`,
+set by `fill_coop_desc()` and backed by `gate_descs_host_` in `CudaComposablePool`.
+It is used only at plan-create time and is not passed to the kernel.
 
 ---
 
@@ -216,20 +262,64 @@ heterogeneous models (CTX-BG-TH 10s → 7s).
   isolated populations (which match the CPU to ~1e-13).
 
 **Remaining levers (deliberately not taken here):**
-- fp32 / mixed precision for the gate math — ~32× the fp64 transcendental
-  throughput on consumer cards; would break exact CPU agreement.
 - Whole-model GPU codegen — generate one kernel specialized to the exact model,
   removing per-bucket dispatch and the occupancy ceiling. Belongs to the
   arbitrary-SymPy codegen track.
 
 ---
 
-## 8. Extending: adding a new composable bucket
+## 8. Floating-point precision
+
+The cooperative kernel is templated on a compute type `T` (`float` or `double`).
+All pool state arrays stay `double*` on device — `T` affects only the math, not
+the memory layout. At load time values are cast `double → T`; at store time they
+are cast back `T → double`.
+
+### Default: float32
+
+```python
+res = rn.simulate(duration=1000, dt=0.01)                      # float32 (default)
+res = rn.simulate(duration=1000, dt=0.01, precision='float64') # full precision
+```
+
+**Why float32 is the default:** On consumer GPUs (RTX 4080) fp64 throughput is
+~1/64 of fp32. The gate kinetics — INF_TAU, ALPHA_BETA, SCALED_EXP — are
+transcendental-heavy (`exp`, `cosh`). These dominate compute time for complex
+composable models. float32 transcendentals are ~32× faster, giving a large
+wall-clock speedup for composable-heavy models (STN, GPe, GPi).
+
+### Accuracy tradeoff
+
+| Precision | GPU vs CPU agreement | Speedup (composable-heavy) |
+|-----------|----------------------|---------------------------|
+| float64   | ~1e-13 (synapse-free) | baseline |
+| float32   | ~1e-6 relative | significant (~2–32×, model-dependent) |
+
+For aggregate statistics (firing rates, beta power) float32 produces
+biologically equivalent results. For spike-for-spike reproduction or
+numerical verification against the CPU, use `precision='float64'`.
+
+### What stays in double
+
+- `d_V_cache`, `d_I_syn` — shared accumulation buffers (atomicAdd in P2 is double)
+- P7 `update_synapse_state_single` — synapse state update (not the bottleneck)
+- Pool state arrays on device (`d_V`, `d_gate_state`, etc.) — load/store boundary
+
+### Four kernel variants
+
+`simulate_all_plan_create()` stores `use_float32` in `SimAllPlan`. At launch,
+`simulate_all_launch()` picks from four global kernels:
+`simulate_all_kernel_{single,multi}_{f32,f64}`. Occupancy is queried against the
+matching precision kernel since register usage differs between float and double.
+
+---
+
+## 9. Extending: adding a new composable bucket
 
 To make a new model shape run on the cooperative kernel:
 
-1. Add its `(NG, NC, NS)` case to `composable_step_dispatch()` in
-   `cuda_sim_all.cu` (calls `composable_step_unrolled<NG, NC, NS>`).
+1. Add its `(NG, NC, NS)` case to `composable_channel_vupdate_dispatch()` in
+   `cuda_sim_all.cu` (calls `composable_channel_vupdate_unrolled<NG, NC, NS, T>`).
 2. Add the **same** `(NG, NC, NS)` to `CudaComposablePool::coop_fast_eligible()`
    in `cuda_composable_pool.cu` (keep the two lists in sync).
 

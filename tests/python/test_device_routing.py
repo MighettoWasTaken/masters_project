@@ -100,7 +100,9 @@ class TestRegionalNetworkDevice:
 
         rn_gpu = _minimal_rn()
         rn_gpu.to(hh.Device.cuda(0))
-        gpu_V = _run(rn_gpu)["a"]
+        # Use float64 precision to get CPU-matching results; float32 (default)
+        # is faster but introduces ~1e-7 relative difference.
+        gpu_V = rn_gpu.simulate(5.0, 0.1, precision="float64")["a"]
 
         np.testing.assert_array_equal(cpu_V, gpu_V)
 

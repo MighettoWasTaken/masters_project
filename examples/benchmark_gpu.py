@@ -31,7 +31,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import hodgkin_huxley as hh
-from hodgkin_huxley import RegionalNetwork, SynapseSpec
+from hodgkin_huxley import RegionalNetwork, SynapseSpec, RecordingConfig
 
 from benchmark_network import TOPOLOGIES
 
@@ -98,16 +98,18 @@ def _build_rn(
 def _simulate_cpu(rn: RegionalNetwork, duration: float, dt: float, I_val: float) -> float:
     """Run on CPU and return wall time (s)."""
     rn.to(hh.Device.cpu())
+    record_cfg = RecordingConfig(["V"], interval=max(1, int(round(1.0 / dt))))
     start = time.perf_counter()
-    rn.simulate(duration, dt, {"E": I_val})
+    rn.simulate(duration, dt, {"E": I_val}, record=record_cfg)
     return time.perf_counter() - start
 
 
 def _simulate_gpu(rn: RegionalNetwork, duration: float, dt: float, I_val: float) -> float:
     """Run on GPU and return wall time (s)."""
     rn.to(hh.Device.cuda(0))
+    record_cfg = RecordingConfig(["V"], interval=max(1, int(round(1.0 / dt))))
     start = time.perf_counter()
-    rn.simulate(duration, dt, {"E": I_val})
+    rn.simulate(duration, dt, {"E": I_val}, record=record_cfg)
     return time.perf_counter() - start
 
 

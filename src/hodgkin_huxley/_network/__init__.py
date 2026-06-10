@@ -913,6 +913,7 @@ class RegionalNetwork:
         I_ext: "dict | ArrayLike | None" = None,
         record: "RecordingConfig | None" = None,
         detection_threshold: "float | None" = None,
+        precision: str = "float32",
     ) -> "dict[str, NDArray[np.float64]] | PopulationMetricsResult":
         """
         Run a network simulation.
@@ -937,6 +938,10 @@ class RegionalNetwork:
         detection_threshold : float, optional
             Voltage threshold (mV) used by the C++ hot loop to detect
             pre-synaptic spikes for synapse updates.
+        precision : str, optional
+            CUDA compute precision: ``'float32'`` (default, ~32× faster fp
+            transcendentals on consumer GPUs) or ``'float64'`` (matches CPU
+            to ~1e-13 for synapse-free runs). Silently ignored on CPU path.
 
         Returns
         -------
@@ -945,6 +950,9 @@ class RegionalNetwork:
         PopulationMetricsResult
             When record is a RecordingConfig.
         """
+        if precision not in ("float32", "float64"):
+            raise ValueError(f"precision must be 'float32' or 'float64', got {precision!r}")
+        _use_float32 = (precision == "float32")
         from .._dbs import DBSStimulator as _DBSStimulatorPy  # lazy — no circular import
 
         num_neurons = self._rnet.num_neurons
@@ -1119,6 +1127,7 @@ class RegionalNetwork:
             detection_threshold=detection_threshold,
             stim_plan=stim_plan,
             on_cuda=_on_cuda,
+            use_float32=_use_float32,
         )
 
         if record is None:

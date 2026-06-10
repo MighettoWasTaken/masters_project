@@ -153,6 +153,7 @@ private:
     int* d_intr_source_channels_ = nullptr;
     CudaIntracellularModDesc* d_mod_descs_ = nullptr;
 
+    std::vector<CudaGateDesc>    gate_descs_host_;  // host mirror for plan_create DERIVED-gate filtering
     std::vector<DeviceVmProgram> vm_programs_;
     DeviceVmProgram* d_vm_programs_ = nullptr;
 

@@ -626,6 +626,7 @@ void CudaComposablePool::upload_model_metadata() {
         }
     }
 
+    gate_descs_host_ = gate_descs;  // host mirror for plan_create DERIVED-gate filtering
     if (!gate_descs.empty()) {
         check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_gate_descs_),
                               gate_descs.size() * sizeof(CudaGateDesc)),
@@ -898,6 +899,7 @@ void CudaComposablePool::fill_coop_desc(CudaComposableDesc& out) const {
     // Gate-major fast path is valid only for pure pattern-matched models:
     // no VM programs (custom expressions) and no modulations.
     out.fast_path              = (!needs_vm_programs() && n_mods == 0) ? 1 : 0;
+    out.h_gate_descs           = gate_descs_host_.empty() ? nullptr : gate_descs_host_.data();
 }
 
 bool CudaComposablePool::needs_vm_programs() const {
